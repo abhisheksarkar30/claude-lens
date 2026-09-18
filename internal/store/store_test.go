@@ -1,0 +1,539 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+func newTestStore(t *testing.T) *Store {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "test.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	return st
+}
+
+func f64(v float64) *float64 { return &v }
+func str(v string) *string   { return &v }
+
+func fullEvent(requestID string) *Event {
+	return &Event{
+		RequestID:          requestID,
+		Source:             "proxy",
+		FirstSource:        "proxy",
+		StartedAt:          time.Unix(1700000000, 0),
+		AuthKind:           "api_key",
+		Account:            "acct1",
+		BillingMode:        "api",
+		ModelRequested:     "claude-sonnet-5",
+		ModelResolved:      "claude-sonnet-5",
+		InputTokens:        100,
+		OutputTokens:       50,
+		CacheWrite5mTokens: 10,
+		CacheWrite1hTokens: 5,
+		CacheReadTokens:    2,
+		ThinkingTokens:     3,
+		ServiceTier:        "standard",
+		Speed:              "fast",
+		StopReason:         "end_turn",
+		SessionID:          "s_1",
+		CostUSD:            f64(0.05),
+		CostSource:         "shipped",
+		PrefixHash:         str("abc123"),
+		CaptureComplete:    true,
+		Method:             "POST",
+		Path:               "/v1/messages",
+		Status:             200,
+		ReqHeaders:         `{"x-api-key":["[redacted]"]}`,
+		RespHeaders:        `{"content-type":["application/json"]}`,
+		ReqBody:            []byte(`{"model":"claude-sonnet-5"}`),
+		RespBody:           []byte(`{"usage":{}}`),
+	}
+}
+
+// Test 5: round trip, WAL, FK cascade, RedactCheck.
+func TestRoundTripAllFields(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	ev := fullEvent("req-1")
+	id, err := st.InsertEvent(ctx, ev)
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+
+	got, err := st.GetEvent(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+
+	if got.RequestID != ev.RequestID || got.Source != ev.Source || got.FirstSource != ev.FirstSource {
+		t.Errorf("identity fields = %+v, want request_id/source/first_source of %+v", got, ev)
+	}
+	if !got.StartedAt.Equal(ev.StartedAt) {
+		t.Errorf("StartedAt = %v, want %v", got.StartedAt, ev.StartedAt)
+	}
+	if got.InputTokens != ev.InputTokens || got.OutputTokens != ev.OutputTokens {
+		t.Errorf("tokens = %+v, want input=%d output=%d", got, ev.InputTokens, ev.OutputTokens)
+	}
+	if got.CostUSD == nil || *got.CostUSD != *ev.CostUSD {
+		t.Errorf("CostUSD = %v, want %v", got.CostUSD, ev.CostUSD)
+	}
+	if got.PrefixHash == nil || *got.PrefixHash != *ev.PrefixHash {
+		t.Errorf("PrefixHash = %v, want %v", got.PrefixHash, ev.PrefixHash)
+	}
+	if got.Method != ev.Method || got.Path != ev.Path || got.Status != ev.Status {
+		t.Errorf("proxy-only fields = %+v, unexpected", got)
+	}
+	if string(got.ReqBody) != string(ev.ReqBody) || string(got.RespBody) != string(ev.RespBody) {
+		t.Errorf("bodies = %+v, unexpected", got)
+	}
+
+	// WAL is on.
+	var mode string
+	if err := st.db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&mode); err != nil {
+		t.Fatalf("PRAGMA journal_mode: %v", err)
+	}
+	if !strings.EqualFold(mode, "wal") {
+		t.Errorf("journal_mode = %q, want wal", mode)
+	}
+
+	// FK cascade: attach a warning, delete the event, warning goes too.
+	if err := st.UpsertWarnings(ctx, id, []Warning{{Kind: "test_kind"}}); err != nil {
+		t.Fatalf("UpsertWarnings: %v", err)
+	}
+	if _, err := st.db.ExecContext(ctx, "DELETE FROM events WHERE id = ?", id); err != nil {
+		t.Fatalf("delete event: %v", err)
+	}
+	var count int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM warnings WHERE event_id = ?", id).Scan(&count); err != nil {
+		t.Fatalf("count warnings: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("warnings after cascade delete = %d, want 0", count)
+	}
+
+	// RedactCheck flags a planted x-api-key.
+	planted, _ := json.Marshal(map[string][]string{"X-Api-Key": {"sk-live-plaintext"}})
+	if err := RedactCheck(planted); err == nil {
+		t.Error("RedactCheck on unredacted x-api-key = nil error, want an error")
+	}
+	clean, _ := json.Marshal(map[string][]string{"X-Api-Key": {"[redacted]"}})
+	if err := RedactCheck(clean); err != nil {
+		t.Errorf("RedactCheck on redacted header = %v, want nil", err)
+	}
+}
+
+// Test 12a: derived total is the four-class sum on every row, regardless
+// of what the caller put in TotalPromptTokens.
+func TestDerivedPromptTotal(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	fixtures := []*Event{
+		fullEvent("req-a"),
+		fullEvent("req-b"),
+	}
+	fixtures[1].InputTokens, fixtures[1].CacheWrite5mTokens, fixtures[1].CacheWrite1hTokens, fixtures[1].CacheReadTokens = 200, 0, 0, 0
+	fixtures[1].TotalPromptTokens = 999999 // caller-supplied garbage must be ignored
+
+	for _, ev := range fixtures {
+		id, err := st.InsertEvent(ctx, ev)
+		if err != nil {
+			t.Fatalf("InsertEvent: %v", err)
+		}
+		got, err := st.GetEvent(ctx, id)
+		if err != nil {
+			t.Fatalf("GetEvent: %v", err)
+		}
+		want := got.InputTokens + got.CacheWrite5mTokens + got.CacheWrite1hTokens + got.CacheReadTokens
+		if got.TotalPromptTokens != want {
+			t.Errorf("request_id %s: TotalPromptTokens = %d, want %d", ev.RequestID, got.TotalPromptTokens, want)
+		}
+	}
+}
+
+// Test 12b: billing-mode invariants at the schema level.
+func TestBillingModeInvariants(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	cases := []struct {
+		name        string
+		ev          *Event
+		wantCostNil bool
+		wantApiNil  bool
+	}{
+		{
+			name: "subscription priced",
+			ev: func() *Event {
+				e := fullEvent("req-sub-priced")
+				e.BillingMode = "subscription"
+				e.CostUSD = nil
+				e.ApiEquivalentCostUSD = f64(0.10)
+				e.CostSource = "shipped"
+				return e
+			}(),
+			wantCostNil: true,
+			wantApiNil:  false,
+		},
+		{
+			name: "api priced",
+			ev: func() *Event {
+				e := fullEvent("req-api-priced")
+				e.BillingMode = "api"
+				e.CostUSD = f64(0.10)
+				e.ApiEquivalentCostUSD = nil
+				e.CostSource = "shipped"
+				return e
+			}(),
+			wantCostNil: false,
+			wantApiNil:  true,
+		},
+		{
+			name: "api unpriced",
+			ev: func() *Event {
+				e := fullEvent("req-api-unpriced")
+				e.BillingMode = "api"
+				e.CostUSD = nil
+				e.ApiEquivalentCostUSD = nil
+				e.CostSource = "unpriced"
+				return e
+			}(),
+			wantCostNil: true,
+			wantApiNil:  true,
+		},
+		{
+			name: "subscription unpriced",
+			ev: func() *Event {
+				e := fullEvent("req-sub-unpriced")
+				e.BillingMode = "subscription"
+				e.CostUSD = nil
+				e.ApiEquivalentCostUSD = nil
+				e.CostSource = "unpriced"
+				return e
+			}(),
+			wantCostNil: true,
+			wantApiNil:  true,
+		},
+	}
+
+	for _, tc := range cases {
+		id, err := st.InsertEvent(ctx, tc.ev)
+		if err != nil {
+			t.Fatalf("%s: InsertEvent: %v", tc.name, err)
+		}
+		got, err := st.GetEvent(ctx, id)
+		if err != nil {
+			t.Fatalf("%s: GetEvent: %v", tc.name, err)
+		}
+		if (got.CostUSD == nil) != tc.wantCostNil {
+			t.Errorf("%s: CostUSD = %v, want nil=%v", tc.name, got.CostUSD, tc.wantCostNil)
+		}
+		if (got.ApiEquivalentCostUSD == nil) != tc.wantApiNil {
+			t.Errorf("%s: ApiEquivalentCostUSD = %v, want nil=%v", tc.name, got.ApiEquivalentCostUSD, tc.wantApiNil)
+		}
+	}
+}
+
+// Session split: a mixed session (one api row, one subscription row) has
+// both totals non-NULL; an all-unpriced API session has total_cost_usd
+// NULL, never $0.00.
+func TestSessionCostSplit(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	mixed := "s_mixed"
+	api := fullEvent("req-mixed-api")
+	api.SessionID = mixed
+	api.BillingMode = "api"
+	api.CostUSD = f64(1.0)
+	api.ApiEquivalentCostUSD = nil
+	api.CostSource = "shipped"
+
+	sub := fullEvent("req-mixed-sub")
+	sub.SessionID = mixed
+	sub.BillingMode = "subscription"
+	sub.CostUSD = nil
+	sub.ApiEquivalentCostUSD = f64(2.0)
+	sub.CostSource = "shipped"
+
+	if err := st.UpsertSession(ctx, mixed, "", api.StartedAt); err != nil {
+		t.Fatalf("UpsertSession: %v", err)
+	}
+	for _, ev := range []*Event{api, sub} {
+		if _, err := st.InsertEvent(ctx, ev); err != nil {
+			t.Fatalf("InsertEvent: %v", err)
+		}
+	}
+	if err := st.ReconcileSession(ctx, mixed); err != nil {
+		t.Fatalf("ReconcileSession: %v", err)
+	}
+	gotMixed, err := st.GetSession(ctx, mixed)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if gotMixed.TotalCostUSD == nil || *gotMixed.TotalCostUSD != 1.0 {
+		t.Errorf("mixed session TotalCostUSD = %v, want 1.0", gotMixed.TotalCostUSD)
+	}
+	if gotMixed.TotalApiEquivalentCostUSD == nil || *gotMixed.TotalApiEquivalentCostUSD != 2.0 {
+		t.Errorf("mixed session TotalApiEquivalentCostUSD = %v, want 2.0", gotMixed.TotalApiEquivalentCostUSD)
+	}
+
+	allUnpriced := "s_unpriced"
+	u1 := fullEvent("req-unpriced-1")
+	u1.SessionID = allUnpriced
+	u1.BillingMode = "api"
+	u1.CostUSD = nil
+	u1.ApiEquivalentCostUSD = nil
+	u1.CostSource = "unpriced"
+	if err := st.UpsertSession(ctx, allUnpriced, "", u1.StartedAt); err != nil {
+		t.Fatalf("UpsertSession: %v", err)
+	}
+	if _, err := st.InsertEvent(ctx, u1); err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+	if err := st.ReconcileSession(ctx, allUnpriced); err != nil {
+		t.Fatalf("ReconcileSession: %v", err)
+	}
+	gotUnpriced, err := st.GetSession(ctx, allUnpriced)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if gotUnpriced.TotalCostUSD != nil {
+		t.Errorf("all-unpriced session TotalCostUSD = %v, want nil (never $0.00)", *gotUnpriced.TotalCostUSD)
+	}
+	if gotUnpriced.UnpricedCount != 1 {
+		t.Errorf("all-unpriced session UnpricedCount = %d, want 1", gotUnpriced.UnpricedCount)
+	}
+}
+
+// Warning upsert: the same (event_id, kind) attached twice leaves one row,
+// and warning_count re-derives to COUNT(DISTINCT kind).
+func TestWarningUpsertIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	ev := fullEvent("req-warn")
+	ev.SessionID = "s_warn"
+	if err := st.UpsertSession(ctx, "s_warn", "", ev.StartedAt); err != nil {
+		t.Fatalf("UpsertSession: %v", err)
+	}
+	id, err := st.InsertEvent(ctx, ev)
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+
+	if err := st.UpsertWarnings(ctx, id, []Warning{{Kind: "cache_miss", Detail: "first"}}); err != nil {
+		t.Fatalf("UpsertWarnings 1: %v", err)
+	}
+	if err := st.UpsertWarnings(ctx, id, []Warning{{Kind: "cache_miss", Detail: "second"}}); err != nil {
+		t.Fatalf("UpsertWarnings 2: %v", err)
+	}
+
+	warnings, err := st.ListWarnings(ctx, id)
+	if err != nil {
+		t.Fatalf("ListWarnings: %v", err)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %d, want 1", len(warnings))
+	}
+	if warnings[0].Detail != "second" {
+		t.Errorf("Detail = %q, want %q (the upsert should win)", warnings[0].Detail, "second")
+	}
+
+	if err := st.ReconcileSession(ctx, "s_warn"); err != nil {
+		t.Fatalf("ReconcileSession: %v", err)
+	}
+	sess, err := st.GetSession(ctx, "s_warn")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.WarningCount != 1 {
+		t.Errorf("WarningCount = %d, want 1", sess.WarningCount)
+	}
+}
+
+// Test 20 (store half): a second UPSERT of the same admin natural key
+// updates in place rather than duplicating.
+func TestAdminUpsertIdempotent(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	day := AdminUsageDay{
+		DayStart:     time.Unix(1700000000, 0),
+		WindowStart:  time.Unix(1700000000, 0),
+		WindowEnd:    time.Unix(1700086400, 0),
+		Model:        "claude-sonnet-5",
+		WorkspaceID:  "ws1",
+		InputTokens:  100,
+		OutputTokens: 50,
+		FetchedAt:    time.Unix(1700100000, 0),
+	}
+	if err := st.UpsertAdminUsageDays(ctx, []AdminUsageDay{day}); err != nil {
+		t.Fatalf("UpsertAdminUsageDays 1: %v", err)
+	}
+	day.InputTokens = 999 // refetch with an updated count
+	if err := st.UpsertAdminUsageDays(ctx, []AdminUsageDay{day}); err != nil {
+		t.Fatalf("UpsertAdminUsageDays 2: %v", err)
+	}
+
+	var count, inputTokens int
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*), MAX(input_tokens) FROM admin_usage_days WHERE day_start = ? AND model = ? AND workspace_id = ?",
+		day.DayStart.UnixNano(), day.Model, day.WorkspaceID).Scan(&count, &inputTokens); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("row count = %d, want 1 (no duplicate)", count)
+	}
+	if inputTokens != 999 {
+		t.Errorf("input_tokens = %d, want 999 (updated in place)", inputTokens)
+	}
+
+	costDay := AdminCostDay{
+		DayStart:    time.Unix(1700000000, 0),
+		WindowStart: time.Unix(1700000000, 0),
+		WindowEnd:   time.Unix(1700086400, 0),
+		Model:       "claude-sonnet-5",
+		Description: "input tokens",
+		AmountUSD:   1.23,
+		Currency:    "USD",
+		FetchedAt:   time.Unix(1700100000, 0),
+	}
+	if err := st.UpsertAdminCostDays(ctx, []AdminCostDay{costDay}); err != nil {
+		t.Fatalf("UpsertAdminCostDays 1: %v", err)
+	}
+	costDay.AmountUSD = 4.56
+	if err := st.UpsertAdminCostDays(ctx, []AdminCostDay{costDay}); err != nil {
+		t.Fatalf("UpsertAdminCostDays 2: %v", err)
+	}
+	var costCount int
+	var amount float64
+	if err := st.db.QueryRowContext(ctx, "SELECT COUNT(*), MAX(amount_usd) FROM admin_cost_days WHERE day_start = ? AND model = ? AND description = ? AND currency = ?",
+		costDay.DayStart.UnixNano(), costDay.Model, costDay.Description, costDay.Currency).Scan(&costCount, &amount); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if costCount != 1 {
+		t.Errorf("cost row count = %d, want 1 (no duplicate)", costCount)
+	}
+	if amount != 4.56 {
+		t.Errorf("amount_usd = %v, want 4.56 (updated in place)", amount)
+	}
+}
+
+func TestPurge(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	old := fullEvent("req-old")
+	old.StartedAt = time.Unix(1000, 0)
+	recent := fullEvent("req-recent")
+	recent.StartedAt = time.Unix(2000000000, 0)
+	unpriced := fullEvent("req-unpriced")
+	unpriced.StartedAt = time.Unix(2000000000, 0)
+	unpriced.CostSource = "unpriced"
+	unpriced.CostUSD = nil
+
+	for _, ev := range []*Event{old, recent, unpriced} {
+		if _, err := st.InsertEvent(ctx, ev); err != nil {
+			t.Fatalf("InsertEvent: %v", err)
+		}
+	}
+
+	cutoff := time.Unix(1500000000, 0)
+	n, err := st.CountPurgeable(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("CountPurgeable: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("CountPurgeable = %d, want 1", n)
+	}
+	deleted, err := st.PurgeOlderThan(ctx, cutoff)
+	if err != nil {
+		t.Fatalf("PurgeOlderThan: %v", err)
+	}
+	if deleted != 1 {
+		t.Errorf("PurgeOlderThan deleted = %d, want 1", deleted)
+	}
+	remaining, err := st.CountEvents(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("CountEvents: %v", err)
+	}
+	if remaining != 2 {
+		t.Fatalf("remaining events = %d, want 2", remaining)
+	}
+
+	deletedUnpriced, err := st.PurgeUnpriced(ctx)
+	if err != nil {
+		t.Fatalf("PurgeUnpriced: %v", err)
+	}
+	if deletedUnpriced != 1 {
+		t.Errorf("PurgeUnpriced deleted = %d, want 1", deletedUnpriced)
+	}
+	remaining, err = st.CountEvents(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("CountEvents: %v", err)
+	}
+	if remaining != 1 {
+		t.Errorf("remaining events after both purges = %d, want 1", remaining)
+	}
+
+	if err := st.Vacuum(ctx); err != nil {
+		t.Errorf("Vacuum: %v", err)
+	}
+}
+
+// -race clean with concurrent readers during a write batch.
+func TestConcurrentReadersDuringWriteBatch(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			ev := fullEvent("req-concurrent-" + strconv.Itoa(i))
+			if _, err := st.InsertEvent(ctx, ev); err != nil {
+				t.Errorf("InsertEvent: %v", err)
+				return
+			}
+		}
+	}()
+
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				if _, err := st.CountEvents(ctx, EventFilter{}); err != nil {
+					if err != sql.ErrNoRows {
+						t.Errorf("CountEvents: %v", err)
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	time.Sleep(50 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
