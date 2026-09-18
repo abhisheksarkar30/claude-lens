@@ -1,0 +1,13 @@
+{
+  "model": "claude-sonnet-5",
+  "stop_reason": "end_turn",
+  "usage": {
+    "input_tokens": 100,
+    "output_tokens": 50,
+    "cache_creation": {
+      "ephemeral_5m_input_tokens": 30,
+      "ephemeral_1h_input_tokens": 20
+    },
+    "cache_read_input_tokens": 10
+  }
+}
