@@ -1,6 +1,6 @@
 # GI-1 — claude-lens v1
 
-<!-- version=5 status=converged -->
+<!-- version=6 status=converged -->
 
 Ticket: [issue #1](https://github.com/abhisheksarkar30/claude-lens/issues/1) · Branch: `GI-1-claude-lens-v1` (off `main`; no `develop` exists yet) · Module: `github.com/abhisheksarkar30/claude-lens`
 
@@ -783,9 +783,12 @@ Admin API key. That is a real expansion of the blast radius and it is handled ex
       org-wide Admin key on disk under the permissive `%USERPROFILE%` ACL while the plan claims
       otherwise. A control that fails open is worse than no control, because `doctor` then reports
       protection that is not there.
-    - The `golang.org/x/sys/windows` ACL API is the fallback if shelling out is unavailable (the one
-      path that would add a dependency; `icacls` is stdlib, so the "exactly one non-stdlib
-      dependency" claim survives the default choice).
+    - The `golang.org/x/sys/windows` ACL API is the fallback if shelling out is unavailable. It adds
+      **no new module**: `golang.org/x/sys` is **already** an indirect dependency (via
+      `modernc.org/sqlite`), so this fallback only promotes an indirect dependency to a direct one.
+      The `icacls`-avoids-a-dependency argument is therefore **weaker** than an earlier draft stated
+      — `icacls` is preferred because it needs no new import, not because the fallback would enlarge
+      the dependency set.
   - **Stated plainly: on Windows, permission bits alone are not a control.** This file holds an
     org-wide Admin key and a full-account `sessionKey`, so the ACL is the control that matters, and
     the plan no longer claims a mode it does not set. The testable consequences are two: after a
@@ -822,23 +825,45 @@ question, unchanged here).
 
 ## Infrastructure
 
-- **Governance**, identical to deepseek-lens: `.githooks/commit-msg` rejects any commit not
+- **Governance**, carried over from deepseek-lens: `.githooks/commit-msg` rejects any commit not
   starting with `GI#<n>`; `.githooks/pre-commit` delegates to the machine-wide secret scan and
   refuses every commit until it is installed; `branch-guard.yml` and `main-guard.yml` enforce the
-  PR flow. This repo has no `develop` yet, so v1 lands on `main` via a `GI-1-…` branch, and
-  `develop` is introduced when a second story needs it. **This is a deviation from deepseek-lens's
-  branch policy and is recorded in the decision log.**
+  PR flow. **One caveat, checked against the committed workflows:** the reference `branch-guard.yml`
+  hard-gates PRs into `main` on the head branch being exactly `develop`
+  (`if [ "${{ github.head_ref }}" != "develop" ]`, `.github/workflows/branch-guard.yml:18`), and
+  `main-guard.yml` verifies each landed commit arrived via a merged `develop → main` PR
+  (`.github/workflows/main-guard.yml:32-33`). This repo has no `develop` yet, so v1 lands on `main`
+  via a `GI-1-…` branch — which those guards, kept verbatim, would reject. The v1 guards must
+  therefore be adapted for the initial `GI-1-…` → `main` landing (or `develop` created first); once
+  `develop` exists they apply unchanged. **This is a deviation from deepseek-lens's branch policy and
+  is recorded in the decision log.**
 - **`.gitignore`**: `*.db`, `*.db-wal`, `*.db-shm`, `config.toml`, `accounts.toml`,
   `secrets.toml`, `/**/*review*/`, and the built binary.
 - **CI**: the two workflow guards only — no test CI, matching deepseek-lens. `go build ./...`,
   `go test ./...`, and `go vet ./...` are the developer's own gate before every PR.
-- **Dependencies**: Go 1.24 stdlib plus `modernc.org/sqlite` (pure Go, no cgo). The collectors use
-  raw `net/http` rather than an SDK because the Admin usage/cost report endpoints are **explicitly
-  not covered by any Anthropic SDK** — they are documented as curl-only. This is recorded so a
-  future reader does not "fix" it into an SDK dependency. The Windows credential ACL uses `icacls`
-  through stdlib `os/exec`, so `modernc.org/sqlite` remains the **only** non-stdlib dependency; the
-  `x/sys/windows` ACL fallback is the single alternative that would add a second, and is noted as
-  such rather than as the default.
+- **Dependencies**: Go 1.24 stdlib plus **three** direct dependencies, matching the reference
+  project's committed `go.mod` (`D:\github\deepseek-lens\go.mod`): `modernc.org/sqlite` (pure Go, no
+  cgo — the storage/DB layer), `github.com/andybalholm/brotli` (the `br` `Content-Encoding` decode),
+  and `github.com/klauspost/compress` (the `zstd` `Content-Encoding` decode). Go 1.24's stdlib ships
+  `compress/gzip`, `compress/flate`, and `compress/zlib` but **not** brotli or zstd, so keeping the
+  `Content-Encoding` decode of `br`/`zstd` — a *kept* carried-over feature (Claude Code sends
+  `Accept-Encoding: gzip, deflate, br, zstd`) — genuinely requires the latter two. "sqlite is the
+  only non-stdlib dependency" and "we decode `br`/`zstd`" cannot both be true; this is the corrected
+  statement. `golang.org/x/sys` appears in the reference `go.mod` as an **indirect** dependency (via
+  `modernc.org/sqlite`), not among the three direct ones.
+- **Separate claim — raw HTTP, not an SDK.** The collectors use raw `net/http` rather than an SDK
+  because the Admin usage/cost report endpoints are **explicitly not covered by any Anthropic SDK** —
+  they are documented as curl-only. This is recorded so a future reader does not "fix" it into an SDK
+  dependency. This justification is **independent of the dependency count above**: it is about which
+  HTTP client the collectors use, not about how many modules the module requires.
+- **The Windows credential ACL and the dependency count.** The ACL is applied by `icacls` through
+  stdlib `os/exec`, which adds no module. The `golang.org/x/sys/windows` ACL fallback is the
+  documented alternative if shelling out is unavailable — and it too adds **no new module**, because
+  `golang.org/x/sys` is **already** an indirect dependency (via `modernc.org/sqlite`); choosing it
+  would only promote an indirect dependency to a direct one. The `icacls`-avoids-a-dependency
+  argument is therefore **weaker** than an earlier draft stated — `icacls` is preferred because it
+  needs no new *import* and no build-time change, not because the alternative would enlarge the
+  dependency set — and it is recorded here at its true weight rather than overstated.
 - **No network egress** beyond `api.anthropic.com`, `claude.ai`, and the configured upstream.
 
 ---
@@ -1059,7 +1084,8 @@ branches hang off the store: `06 → 11`, `06,07 → 12`, `06,07 → 13`, conver
 | `cost_usd` provenance | Computed locally, verified against the Admin cost report | Trusting the local table — `cost_drift` detects staleness **for API accounts**; subscription accounts have no billed counterpart and are guarded by `model_catalog` refresh + `unpriced`/`approximate` labels instead |
 | Write-route seams | Function values injected at the composition root (`SetCredentialWriter` → `secret.Save`, `SetAccountWriter`, `SetIngestTrigger`), `503` when unwired | Direct import of `secret`/`config`/`ingest` by `internal/api` — breaks the stated import-direction guarantee that keeps credentials out of the API and web layers |
 | Dashboard charts | Hand-rolled inline SVG, no CDN, no build step | Chart.js from a CDN (the tech plan's choice) — adds a third-party network load and an offline failure mode to a loopback tool that holds every prompt |
-| Credential storage | `~/.clens/secrets.toml`, outside the DB, readable only by `internal/secret` — POSIX `0600`/`0700` on Unix; on Windows an explicit `icacls` ACL (`/inheritance:r` + `/grant:r`, principal resolved in Go and passed as an `exec` arg — never a shell string) applied to a same-directory temp file whose DACL is read back and verified before an atomic rename over the live file, so it **fails closed** without ever clobbering an existing file's permissions (`x/sys/windows` fallback) | In the DB (a copied backup leaks it) / in the environment only (unusable from a scheduled task) / relying on `0600` on Windows, where Go's `perm` argument is a no-op / a shell-string `"${USERNAME}"` that `os/exec` never expands, so the ACL silently never runs / applying `icacls` on the live file with the destructive `/inheritance:r` before `/grant:r`, which strands an existing `secrets.toml` with a zero-ACE DACL if the grant fails |
+| Credential storage | `~/.clens/secrets.toml`, outside the DB, readable only by `internal/secret` — POSIX `0600`/`0700` on Unix; on Windows an explicit `icacls` ACL (`/inheritance:r` + `/grant:r`, principal resolved in Go and passed as an `exec` arg — never a shell string) applied to a same-directory temp file whose DACL is read back and verified before an atomic rename over the live file, so it **fails closed** without ever clobbering an existing file's permissions (`x/sys/windows` fallback, which adds **no
+new module** — `golang.org/x/sys` is already an indirect dependency via `modernc.org/sqlite`) | In the DB (a copied backup leaks it) / in the environment only (unusable from a scheduled task) / relying on `0600` on Windows, where Go's `perm` argument is a no-op / a shell-string `"${USERNAME}"` that `os/exec` never expands, so the ACL silently never runs / applying `icacls` on the live file with the destructive `/inheritance:r` before `/grant:r`, which strands an existing `secrets.toml` with a zero-ACE DACL if the grant fails |
 | Bedrock/Vertex/Foundry | Out of scope; classified and stored as `auth_kind=cloud`, not priced | Priced — partner rates differ from first-party and are not verifiable from here |
 | Branch policy | v1 lands on `main` via `GI-1-…`; `develop` introduced when a second story needs it | Creating an empty `develop` immediately — a branch with no purpose yet |
 | Migrations | None in v1 | A framework from day one |
@@ -1102,7 +1128,9 @@ Applied every finding and nit from `review/round-1/critique.md`. The changes tha
   explicit admin `ingest_state` semantic; idempotence test added (test 20).
 - **F6** — the credential file's control is now the platform that applies it: POSIX modes on Unix, an
   explicit Windows ACL (`icacls`, stdlib) on Windows, with the plan stating that permission bits alone
-  are not a control on Windows; `doctor` reports the real protection level; dependency claim held.
+  are not a control on Windows; `doctor` reports the real protection level. *(The "exactly one
+  non-stdlib dependency" claim made in this v2 entry was **false** — corrected in v6: the project
+  carries three direct dependencies; see v6.)*
 - **F7** — a belt-and-braces fallback for an absent TTL split, worded as unobserved (not the refuted
   "older logs lack it" claim), with a fixture.
 - **F8** — recursive `**/*.jsonl` discovery, `is_sidechain` populated from the `subagents/` path, test
@@ -1238,3 +1266,37 @@ implementer can **test**.
   re-derive by reading the analyzer code. **Test 11(a) is extended** to assert each finding kind
   appears **once** and the session's `warning_count` equals the distinct-kind count — an assertion a
   test that only checked the row count would miss, and one that would have failed on v4.
+
+### v6 — round-6 post-convergence fix (REOPEN) (2026-09-18)
+
+One finding, F6.1 — the same defect class as round-2's F2.6: an asserted fact with no citation,
+contradicted by a verifiable manifest. The loop reopened from `status=converged`; the header is set
+back to `status=draft`.
+
+- **F6.1 (MAJOR) — "sqlite is the only non-stdlib dependency" is false.** Verified against
+  `D:\github\deepseek-lens\go.mod`: the reference module declares **three** direct dependencies —
+  `github.com/andybalholm/brotli v1.2.4`, `github.com/klauspost/compress v1.19.2`,
+  `modernc.org/sqlite v1.46.0` — with `golang.org/x/sys v0.37.0` present as an **indirect** dep (via
+  `modernc.org/sqlite`). Go 1.24's stdlib has gzip/flate/zlib but **not** brotli or zstd, so the
+  *kept* `br`/`zstd` `Content-Encoding` decode genuinely needs the two decompression modules. Every
+  occurrence of the claim is corrected: the **Infrastructure / Dependencies** paragraph now names
+  all **three** direct deps and what each is for (sqlite = storage/DB; brotli = `br` decode;
+  klauspost/compress = `zstd` decode); the **F6 credential-ACL bullet** in Security posture and the
+  **Decision-log credential row** are reconciled; and the v2 change-history line "dependency claim
+  held" is marked superseded. The **raw-HTTP/SDK** justification is kept, and kept **separate** from
+  the dependency-count justification — the two are independent claims, not one argument.
+- **F6.1 (corollary, opposite direction) — the `x/sys/windows` reasoning is corrected the other
+  way.** Because `golang.org/x/sys` is *already* an indirect dependency (via `modernc.org/sqlite`),
+  the ACL fallback adds **no new module** — it would only promote an indirect dep to a direct one —
+  so the `icacls`-avoids-a-dependency argument is **weaker** than the earlier draft stated. Stated
+  plainly rather than overstated.
+- **Sibling sweep (bounded, same defect class).** Re-checked the plan's manifest-verifiable claims
+  about the reference repos against `go.mod`/`go.sum`, both CI workflows, `.githooks/*`, and
+  `.gitignore`. One further correction: the reference **`branch-guard.yml`** hard-gates PRs into
+  `main` on the head branch being exactly `develop` (`.github/workflows/branch-guard.yml:18`), and
+  `main-guard.yml` verifies each landed commit arrived via a merged `develop → main` PR
+  (`.github/workflows/main-guard.yml:32-33`) — so the guards, kept verbatim, would **reject** the
+  stated v1 `GI-1-…` → `main` landing. The Governance bullet now says the v1 guards must be adapted
+  for that landing (or `develop` created first); "identical to deepseek-lens" is replaced by
+  "carried over from". The `.githooks` claims, the "two workflow guards only — no test CI" claim, and
+  the `.gitignore` list were checked and hold.
