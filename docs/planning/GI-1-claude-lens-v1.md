@@ -1,6 +1,6 @@
 # GI-1 — claude-lens v1
 
-<!-- version=2 status=draft -->
+<!-- version=5 status=converged -->
 
 Ticket: [issue #1](https://github.com/abhisheksarkar30/claude-lens/issues/1) · Branch: `GI-1-claude-lens-v1` (off `main`; no `develop` exists yet) · Module: `github.com/abhisheksarkar30/claude-lens`
 
@@ -75,7 +75,7 @@ Every v1 feature lands with a recorded disposition — including the ones delibe
 | Incremental SSE parse + non-stream JSON | **kept** — plus Claude-specific extras (`stop_reason`, `stop_details`, `usage.*`) |
 | Batch-grouped consumer, per-call panic containment | **kept** — pipeline order unchanged |
 | Session grouping (prefix hash + gap, `x-lens-session`) | **kept** — header renamed `x-clens-session` |
-| Price table, `lens prices --set/--unset/--edit`, live reload | **kept** — table ships populated only with documented rates |
+| Price table, `lens prices --set/--unset/--edit`, live reload | **kept** — table ships populated with documented rates, plus `provisional` rows for models the bundle lists but does not price (see *Cost engine*) |
 | Per-call cost with provenance (`cost_source`) | **kept** — extended to 6 token classes + speed/tier |
 | Analyzer rule engine + kinds + README-consistency test | **kept** — rule catalogue replaced with Claude-relevant rules |
 | Replay (`--replay` opt-in, Origin/Host guard, cost gate, `--set`/`--diff`/`--dump`) | **kept verbatim** |
@@ -238,7 +238,17 @@ flowchart LR
    store's append-only `requests` table**: it introduces the first `UPDATE` on `events` (the merge
    path below), where a row the `jsonlogs` writer created may be updated by the proxy writer. It is
    the store's job to make that one serialized statement, and it is called out so nobody reads
-   "one writer" as "append-only".
+   "one writer" as "append-only". **The merge also re-derives the affected session's totals, not
+   merely increments them** — because it can rewrite a row's token columns, the owning session's
+   incrementally maintained totals would otherwise drift, so the merge `UPDATE`, the analyzer warning
+   **upsert**, and the session re-derivation run in the **same transaction**, and the re-derivation
+   wins over the incremental fold for that session: the token/cost totals are reconstructed from
+   `events`, and `warning_count` from `warnings` — never from `events` and never by an increment,
+   because the findings live in their own table, written by the analyzer step. **The warning ledger
+   carries the same drift risk the token ledger did**, and the same fix: `warnings` is keyed
+   `UNIQUE(event_id, kind)` and the analyzer attach is an upsert, so re-running the seam on a merged
+   row updates its finding of that kind instead of appending a duplicate. This is the one place the
+   two statements are reconciled, rather than asserted separately.
 4. **`input_tokens` is the uncached remainder only.** Total prompt size is
    `input_tokens + cache_write_5m_tokens + cache_write_1h_tokens + cache_read_tokens`. A row that
    reports `input_tokens` alone as the prompt size is wrong, and `store` maintains the derived total
@@ -264,11 +274,30 @@ flowchart LR
 ### Cold-path pipeline (order is fixed; feature beads plug into named seams)
 
 `ExtractMeta`/`ExtractUsage` → resolve session → resolve account/`auth_kind` → compute cost →
-`InsertEvent` → run analyzers → session fold.
+`InsertEvent` → run analyzers (**upsert** each finding by `(event_id, kind)`) → **re-derive the
+owning session's totals — tokens/cost from `events`, `warning_count` from `warnings` — in the same
+transaction as the merge `UPDATE`** → session fold.
 
 Session resolution, account resolution, and costing populate columns on the row so they run
-**before** insert. Warning analyzers attach by row id so they run **after**. The `Analyzer` seam is
-unchanged from deepseek-lens:
+**before** insert. Warning analyzers attach by row id so they run **after** the insert and **inside
+its transaction** — they must, because the `warning_count` re-derivation below reads `warnings` and
+has to see the merged row's final finding set. **The re-derivation runs in the same transaction as
+the merge `UPDATE`**: a merge can *rewrite* a row's token (and therefore cost) columns, so the owning
+session's incrementally maintained totals cannot be a plain add — when a merge touches a session's
+rows, that session's totals are recomputed from `events` in that transaction, and the recomputation
+(not the increment) is the value that stands. **The merge ledger has the same shape on the warning
+side, and the plan names the warning semantics it was silent on:** a call observed by both sources
+runs the analyzer seam twice on one `event_id`, so the attach is an **upsert keyed by
+`(event_id, kind)`**, not an append — the second run updates the row's finding of that kind rather
+than adding a second copy. `UNIQUE(event_id, kind)` (schema below) is the mechanism, not a
+replace-on-merge `DELETE` — chosen because the pipeline runs the analyzer seam after **every** insert
+and has no "this was a merge" branch to hang a delete on, and because a delete-and-reattach would
+drop a kind the first source's run raised if the merged row does not re-raise it, losing the union
+the merge exists to produce. `warning_count` is then `COUNT` over that deduped ledger and **cannot be
+inflated by the double run**. It is **re-derived from `warnings` on every write that touches the
+session, never added by the fold**: it is not derivable from `events` (the findings live in their own
+table, written by the analyzer step), which is exactly how an incremental counter drifts. The
+`Analyzer` seam is unchanged from deepseek-lens:
 
 ```go
 Analyze(meta parse.Meta, usage parse.Usage, ev *store.Event) []store.Warning
@@ -307,10 +336,27 @@ id, so the key is always present:
 - `jsonl:<sessionId>:<uuid>` for a JSONL line with no `requestId`.
 - An insert that collides **merges** rather than duplicates: `source_refs` gains the new source,
   `first_source` is preserved, and token counts are **not** re-added. Sources are complementary for
-  the same row — A contributes bodies, B contributes nothing new — so the merge is a union of
-  columns, not a sum of numbers.
-- A merge whose token counts disagree is a parser bug and raises `source_mismatch` (error) rather
-  than silently picking a winner.
+  the same row — A contributes the bodies and the request-side material, B the JSONL-only metadata
+  and, when its capture is the complete one, the token counts — so the merge is a union of columns,
+  not a sum of numbers. **Which source is *complete* is the precedence rule, not which source
+  arrived first.** A is not always the source that carries the numbers: with body capture
+  `off`/`truncated` (the carried-over policy, 256 KB cap) or an unfinished SSE stream
+  (`stream_incomplete`), A's row has no or partial `usage` while B's JSONL `usage` is authoritative.
+  So on the token columns the **complete capture wins** — A when `capture_complete`, otherwise B.
+  This means a merge can **rewrite** a row's token (and therefore cost) columns, not merely add to
+  them, so the owning session's totals are **re-derived** from `events` in the same transaction as
+  that `UPDATE` (the cold-path order above and invariant 3). The merge does **not** rewrite
+  `session_id` — it is the row's grouping identity, not a token column — so the row keeps the session
+  it was first written under, and exactly that one session is the re-derivation target. The merge
+  **does** re-run the analyzer seam, and its findings join the row by **upsert keyed by
+  `(event_id, kind)`** (`UNIQUE(event_id, kind)`, schema above), so the second run contributes the
+  union of the two sources' findings with no duplicate kinds and no inflated `warning_count` — the
+  warning-ledger instance of the same rewrite-not-add rule that governs the token columns.
+- `source_mismatch` fires **only when two *complete* sources disagree** on the token counts — a real
+  parser bug — and **never** when one source simply has nothing to contribute (an absent or partial
+  A against a full B is a `0 vs N` non-disagreement, not a mismatch). The columns A structurally
+  cannot supply — `client_version`, `project`, `git_branch`, `is_sidechain`, `cli_entrypoint` — are
+  preserved from whichever writer supplied them, so B is not a no-op participant in the merge.
 
 This is why "a turn observed by more than one source is stored once" holds — *given* the key
 equivalence above, which the verification step is there to test rather than assume.
@@ -324,10 +370,10 @@ deepseek-lens. No migration framework in v1; the schema is created whole.
 
 | Table | Purpose | Key columns |
 |---|---|---|
-| `events` | one row per observed turn, from A or B | `request_id` UNIQUE, `source`, `source_refs`, `first_source`, `started_at`, `ended_at`, `auth_kind`, `account`, `billing_mode`, `model_requested`/`model_resolved`, `input_tokens`, `output_tokens`, `cache_write_5m_tokens`, `cache_write_1h_tokens`, `cache_read_tokens`, `thinking_tokens`, `total_prompt_tokens`, `service_tier`, `speed`, `effort`, `inference_geo`, `stop_reason`, `stop_category`, `is_sidechain`, `session_id`, `project`, `git_branch`, `client_version`, `cli_entrypoint`, **`cost_usd` (NULL when `billing_mode='subscription'`)**, **`api_equivalent_cost_usd` (populated only when `billing_mode='subscription'`)**, `cost_source`, `prefix_hash`, `replay_of`, `replay_edits`, `capture_complete` |
+| `events` | one row per observed turn, from A or B | `request_id` UNIQUE, `source`, `source_refs`, `first_source`, `started_at`, `ended_at`, `auth_kind`, `account`, `billing_mode`, `model_requested`/`model_resolved`, `input_tokens`, `output_tokens`, `cache_write_5m_tokens`, `cache_write_1h_tokens`, `cache_read_tokens`, `thinking_tokens`, `total_prompt_tokens`, `service_tier`, `speed`, `effort`, `inference_geo`, `stop_reason`, `stop_category`, `is_sidechain`, `session_id`, `project`, `git_branch`, `client_version`, `cli_entrypoint`, **`cost_usd` (NULL when `billing_mode='subscription'` OR when the row is `cost_source='unpriced'` — an unpriced API row is NOT `$0.00`)**, **`api_equivalent_cost_usd` (populated only when `billing_mode='subscription'`; NULL when the row is unpriced)**, `cost_source`, `prefix_hash`, `replay_of`, `replay_edits`, `capture_complete` |
 | `events` (proxy-only, nullable for B) | the request/response material only A has | `method`, `path`, `status`, `req_headers`, `resp_headers`, `req_body`, `resp_body` |
-| `sessions` | agentic-run grouping with incrementally maintained totals | `id` (`s_<unix-ms>_<8hex>`), `prefix_hash`, `first_seen`/`last_seen`, `request_count`, token totals, `priced_count`/`unpriced_count`, `model_set`, `warning_count` |
-| `warnings` | one analyzer finding per row | `event_id` FK → `events(id)` ON DELETE CASCADE, `kind`, `severity`, `detail`, `path`, `created_at` |
+| `sessions` | agentic-run grouping with incrementally maintained totals (re-derived in the same transaction whenever a cross-source merge rewrites one of its rows — token/cost totals from `events`, `warning_count` from `warnings`, never by increment; see invariant 3) | `id` (`s_<unix-ms>_<8hex>`), `prefix_hash`, `first_seen`/`last_seen`, `request_count`, token totals, `priced_count`/`unpriced_count`, `model_set`, `warning_count` (a `COUNT` over `warnings`, not over `events`), **`total_cost_usd` (sums API-billed rows only; NULL when the session has none, or when every API row it has is `unpriced`)**, **`total_api_equivalent_cost_usd` (sums subscription rows only; NULL when the session has none)** |
+| `warnings` | **at most one analyzer finding of each kind per event row**, enforced by the schema — not asserted | `event_id` FK → `events(id)` ON DELETE CASCADE, `kind`, `severity`, `detail`, `path`, `created_at`, **UNIQUE(`event_id`, `kind`)** |
 | `admin_usage_days` | source D, usage report | **UNIQUE(`day_start`, `model`, `workspace_id`)**, `day_start`, `window_start`/`window_end` (the fetched page's bounds), `model`, `workspace_id`, `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `raw`, `fetched_at` — collected by UPSERT |
 | `admin_cost_days` | source D, cost report (**separate table — different key**) | **UNIQUE(`day_start`, `model`, `description`, `currency`)**, `day_start`, `window_start`/`window_end`, `model`, `description`, `amount_usd`, `currency`, `raw`, `fetched_at` — collected by UPSERT |
 | `admin_rate_limits` | source D, org + workspace rate-limit reports | `scope`, `workspace_id`, `model`, `group_type`, `limit`, `fetched_at` |
@@ -356,10 +402,37 @@ dollars" figure that is the plan's only ground truth. Each row also stores the f
 idempotent by key alone, `ingest_state` for the admin collectors may be dropped — the constraint is
 the control; the cursor is an optimisation.
 
+**The `warnings` ledger is idempotent by `(event_id, kind)`, for the same reason.** The analyzer
+seam runs after *every* insert — a fresh row and a cross-source merge alike — so a call observed by
+both sources runs the rules **twice on one `event_id`**, and deepseek-lens's safety here rested on
+its `requests` table being append-only (`internal/store/schema.sql:72-81` has no `UNIQUE`, and
+`InsertWarnings` is a bare `INSERT`, `internal/store/store.go:238-246`) — a precondition claude-lens
+removes with the first `UPDATE` on `events`. `UNIQUE(event_id, kind)` with the upsert attach makes
+the second run an update, not a second row, so the two sources contribute the union of their
+complementary findings and `sessions.warning_count` (re-derived from this table) cannot be inflated
+by the merge. **By construction the seam emits at most one finding of a given `kind` per event row** —
+each rule owns its kind, and the one deepseek-lens rule that emitted several findings of one kind for
+a request (`unsupported_content_block`, `internal/analyze/rules.go:160-168`) is DeepSeek-specific and
+is not in the carried-over catalogue — so `(event_id, kind)` is the natural key rather than a lossy
+one. The constraint is what makes that claim **testable** instead of a property a reader has to
+re-derive from the analyzer code.
+
 **Why `quota_snapshots` is one row per window** rather than the tech plan's fixed
 `session_pct`/`weekly_pct` columns: the endpoint returns different window sets on different plans
 (5-hour, 7-day, and per-model 7-day windows). A fixed pair of columns would silently drop whichever
 windows the user's plan actually has.
+
+**A session total is split the same way an `events` row is.** A session is an agentic-run grouping,
+not a billing-mode grouping — one session can hold both `api`-billed and `subscription` rows (a mixed
+account) — so `sessions` carries the same two-column split `events` does: `total_cost_usd` sums only
+API-billed rows and `total_api_equivalent_cost_usd` sums only subscription rows, each **NULL** — never
+`$0.00` — when the session has no row of that model. A session whose API rows are all `unpriced`
+therefore reads **NULL** on `total_cost_usd` too, not `$0.00`; `unpriced_count` (shown alongside)
+disambiguates that from a session with no API row at all. `clens sessions` and `GET /api/sessions`
+therefore render **two labelled figures**, with `unpriced_count` shown alongside, and no read path
+emits a session total that mixes billing models or reports `$0.00` for a subscription or unpriced
+session. This is the per-session instance of invariant 5, and it is why F1 read "every aggregate
+surface": the session total was one of them.
 
 ### Reconciliation (the labelled comparison)
 
@@ -400,11 +473,15 @@ Six priced token classes plus two modifiers, because Claude bills them different
 |---|---|
 | `speed: "fast"` | Opus 5 / Opus 4.8 use their own rates ($10/$50 per MTok), not the standard Opus rates |
 | `service_tier: "batch"` | ×0.5 on every class |
-| `service_tier: "priority"` | at standard rates; Priority Tier has no per-token premium |
+| `service_tier: "priority"` | **no rate change applied, and none asserted.** The skill bundle states no per-token Priority rate — neither a premium nor "standard rates" — so the plan claims neither; the only documented Priority facts it carries are that Priority Tier is **unsupported** on Fable 5.1 / Mythos 5.1 (`shared/models.md:73`) and that Priority costs are not in the cost report (`shared/cost-optimization.md:39`). What Priority costs is left to the live usage endpoint's `service_tier` dimension, not guessed here. |
 
-Rounding is applied **per class, then summed** — never on the total after doubling — because the
-per-class version is the one that matches an invoice line. (deepseek-lens learned this the hard
-way; its `TestComputePeakRoundsSumNotTotal` is carried over as the equivalent test here.)
+Rounding is applied **per class, then summed** — never on the total after the modifiers are applied
+— because the per-class version is the one that matches an invoice line. (deepseek-lens learned this
+the hard way, but its `TestComputePeakRoundsSumNotTotal` pinned the **2× peak multiplier**, and Claude
+has no peak window (F9 dropped it). The carried-over test's subject therefore becomes the modifier
+that *does* exist here: **batch billing**, `service_tier: "batch"` ×0.5. It is ported as
+`TestComputeBatchRoundsPerClass` — the ×0.5 is applied per class *before* rounding, and rounding the
+discounted total instead would not match the invoice.)
 
 **Fallback when the TTL split is absent (belt-and-braces).** The cost engine reads the TTL from
 `usage.cache_creation.ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`. Every JSONL file on
@@ -420,33 +497,53 @@ both the split and the flat shape.
 
 ### Shipped price table
 
-Unlike deepseek-lens's deliberately-empty table, the v1 table **ships populated** with the
-first-party rates that are documented, because an authoritative rate is available and using it is
-strictly better than `unpriced`:
+Unlike deepseek-lens's deliberately-empty table, the v1 table **ships populated** — with a rate the
+skill bundle documents, or, for a model the first-party model list carries but the bundle does not
+price, a `provisional` figure with a named verification step. Using a documented rate is strictly
+better than `unpriced`; a *provisional* rate is a claim with a known gap, and is labelled as one:
 
-| Model | Input $/MTok | Output $/MTok | Cache read | Cache write 5m | Cache write 1h |
-|---|---|---|---|---|---|
-| `claude-fable-5-1` | 10.00 | 50.00 | 0.25 (0.025×) | 1.25× | 2× |
-| `claude-fable-5`, `claude-mythos-5` | 10.00 | 50.00 | 1.00 (0.1×) | 1.25× | 2× |
-| `claude-mythos-5-1` | 10.00 | 50.00 | 0.25 (0.025×) — **provisional** | 1.25× | 2× |
-| `claude-opus-5`, `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6` | 5.00 | 25.00 | 0.1× | 1.25× | 2× |
-| `claude-sonnet-5` | 2.00 | 10.00 | 0.1× | 1.25× | 2× |
-| `claude-sonnet-4-6` | 3.00 | 15.00 | 0.1× | 1.25× | 2× |
-| `claude-haiku-4-5` | 1.00 | 5.00 | 0.1× | 1.25× | 2× |
-| any other model | `unpriced` | — | — | — | — |
+| Model | Input $/MTok | Output $/MTok | Cache read | Cache write 5m | Cache write 1h | Rate source |
+|---|---|---|---|---|---|---|
+| `claude-fable-5-1` | 10.00 | 50.00 | 0.25 (0.025×) | 1.25× | 2× | `shared/models.md:73` |
+| `claude-fable-5`, `claude-mythos-5` | 10.00 | 50.00 | 1.00 (0.1×) | 1.25× | 2× | `shared/models.md:74` (cache read $1/MTok) |
+| `claude-mythos-5-1` | 10.00 | 50.00 | 0.25 (0.025×) | 1.25× | 2× | `shared/models.md:75` — same per-token pricing as Fable 5.1 |
+| `claude-opus-5`, `claude-opus-4-8` | 5.00 | 25.00 | 0.1× | 1.25× | 2× | `shared/models.md:76` (Opus 4.8's rate, stated there) |
+| `claude-opus-4-7`, `claude-opus-4-6` | 5.00 | 25.00 | 0.1× | 1.25× | 2× | **`provisional`** — no rate in the bundle (see below) |
+| `claude-sonnet-5` | 2.00 | 10.00 | 0.1× | 1.25× | 2× | `shared/model-migration.md:1291` |
+| `claude-sonnet-4-6` | 3.00 | 15.00 | 0.1× | 1.25× | 2× | `shared/model-migration.md:1291` |
+| `claude-haiku-4-5` | 1.00 | 5.00 | 0.1× | 1.25× | 2× | **`provisional`** — no rate in the bundle (see below) |
+| any other model | `unpriced` | — | — | — | — | — |
 
 **Cache-read rates are per-model, not per-tier.** `claude-fable-5` and `claude-mythos-5` are the
 *predécesseurs* of the 5.1 generation: they share `10.00`/`50.00` input/output, but their cache
-reads are **$1/MTok (0.1×)**, four times `claude-fable-5-1`'s **$0.25/MTok (0.025×)**
-(`claude-api/shared/models.md:74`). Conflating the two under-prices every predecessor cache read by
-4×, so they are separate rows. `claude-mythos-5` is an active model and would otherwise have priced
-as `unpriced`. `claude-mythos-5-1`'s per-token rates are granted Fable 5.1's by
-`shared/models.md:75`, but `shared/prompt-caching.md:144` calls its cache-read rate *"open at
-launch"* — the skill disagrees with itself, so the cell is marked **provisional** (a `source` note
-on the row records the conflict) rather than asserted.
+reads are **$1/MTok (0.1×)** (`claude-api/shared/models.md:74`), four times `claude-fable-5-1`'s
+**$0.25/MTok (0.025×)** (`shared/models.md:73`). Conflating the two under-prices every predecessor
+cache read by 4×, so they are separate rows; `claude-mythos-5` is an active model and would
+otherwise have priced as `unpriced`.
 
-Every row carries `effective_from` and `source = 'shipped'`. A user edit sets `source = 'user'` and
-wins; `cost_drift` reports when a shipped or user rate disagrees with reality. Fast-mode rates are
+`claude-mythos-5-1` is a **cited** row, not a provisional one: `shared/models.md:75` grants it the
+"same capabilities, limits, per-token pricing" as Fable 5.1, so its per-token rates are documented by
+reference to Fable 5.1's row above.
+
+**Three models across two rows are `provisional`, not asserted.** `claude-opus-4-7`,
+`claude-opus-4-6`, and `claude-haiku-4-5` appear in the first-party model list but carry **no
+per-token rate anywhere in the skill bundle** (searched: zero matches in `shared/*.md`). Their
+`$5/$25` and `$1/$5` figures are the historical first-party rates, not a documented v1 fact, so the
+row is marked `provisional` with a `source` note. Before such a row is treated as authoritative, the
+rate **must be checked against the Pricing URL in `shared/live-sources.md`** — the rule this table
+must honour, quoted from `shared/cost-optimization.md:233`: *"Per-model prices: always the Pricing URL
+in shared/live-sources.md, never remembered rates."* A provisional rate is a claim with a known gap,
+not a number the plan asserts.
+
+`claude-opus-5` and `claude-opus-4-8` are **not** provisional: `shared/models.md:76` states Opus 4.8's
+rate ($5/$25 per MTok) directly, naming it a drop-in upgrade — Opus 5 shares it, so the same line
+covers both rows. The three provisional models stay *priced* rather than `unpriced` because a
+labelled provisional figure is more useful than none, and `cost_drift` (API accounts) plus the
+`provisional` label surface any divergence.
+
+Every row carries `effective_from` and `source = 'shipped'` (a `provisional` row additionally carries
+that note in its `source`, so the gap is queryable, not just prose). A user edit sets `source = 'user'`
+and wins; `cost_drift` reports when a shipped or user rate disagrees with reality. Fast-mode rates are
 shipped for Opus 5/4.8 only. Anything not in this table is `unpriced`, never guessed — including
 Bedrock/Vertex/Foundry partner pricing, which is documented as *different* and is explicitly out of
 scope for v1.
@@ -553,7 +650,7 @@ was used in an earlier draft) is a build failure under that test.
 | `clens doctor` | Resolved config, PASS/WARN/FAIL checks, per-source health, port-collision check |
 | `clens ls` / `show` / `tail` | Call log, one call's detail, live follow |
 | `clens warnings` | Grouped by kind, `--detail` for one row per occurrence |
-| `clens sessions` | Sessions with turns, tokens, cost, warning counts |
+| `clens sessions` | Sessions with turns, tokens, the **two labelled cost figures** (API-billed / API-equivalent — never one mixed total, never `$0.00` for a subscription or unpriced session), warning counts |
 | `clens stats` | Window totals **split by `billing_mode`** (never one merged total), per-model split, unpriced count; `--by model\|day\|session\|project` (`project` added for the tech plan's *Breakdown by project (Code)*), `--period`, granularity as today |
 | `clens prices` | Effective table; `--set`, `--unset`, `--edit` |
 | `clens replay <id>` | Re-issue a captured call; `--set`, `--diff`, `--dump`, `--yes` |
@@ -570,9 +667,14 @@ was used in an earlier draft) is a build failure under that test.
 
 ## API surface and dashboard
 
-All 15 deepseek-lens routes are kept with their contracts intact (including the three pagination
-headers, the unpaginated `GET /api/warnings/summary`, the SSE `/api/stream`, and `/api/health`).
-**Eight routes are added (five GET, three POST).**
+All 15 deepseek-lens routes are kept (including the three pagination headers, the unpaginated
+`GET /api/warnings/summary`, the SSE `/api/stream`, and `/api/health`). **One kept contract is
+deliberately restated rather than silently changed:** `GET /api/sessions` no longer returns a single
+per-session `total_cost_usd` (the deepseek-lens `store.Session.total_cost_usd`); the per-session cost
+is split into `total_cost_usd` (API-billed) plus `total_api_equivalent_cost_usd` (subscription), each
+NULL when that side is empty, so the route can never return a figure that mixes billing models or
+`$0.00` for a subscription session (see *Storage schema*). **Eight routes are added (five GET, three
+POST).**
 
 | Method | Path | Guard | Purpose |
 |---|---|---|---|
@@ -636,20 +738,70 @@ Admin API key. That is a real expansion of the blast radius and it is handled ex
   - **Windows** (the target platform): the plan does **not** rely on permission bits, because Go's
     `os.Chmod` / `os.OpenFile` `perm` argument only toggles the read-only bit on Windows — a `0600`
     there is a **no-op**, not a control. Access is restricted by an explicit **ACL** applied with
-    `icacls` through `os/exec` — disable inheritance and grant the current user only
-    (`icacls <file> /inheritance:r /grant:r "${USERNAME}":F`) — or, if shelling out is unavailable,
-    the `golang.org/x/sys/windows` ACL API (the one path that would add a dependency; `icacls` is
-    stdlib, so the "exactly one non-stdlib dependency" claim survives the default choice).
+    `icacls` through `os/exec`. A control that does not run is worse than no control, so the
+    mechanism is spelled out:
+    - **The principal is resolved in Go and passed as an argument — never a shell string.** Go's
+      `os/exec` invokes no shell and expands no `${…}`, so a `"${USERNAME}"` argument would reach
+      `icacls` literal and fail with *"No mapping between account names and security IDs was done"*.
+      `secret.Save` resolves the account first (`os/user.Current()`, or the account SID;
+      `os.Getenv("USERNAME")` as a fallback) and passes the args as a slice, so the account resolves
+      or the command exits non-zero.
+    - **A newly created file *does* inherit its parent directory's ACEs — that is what inheritance
+      means — and `/inheritance:r` is what removes them.** The file does **not** "start with no ACEs
+      to inherit": it inherits `%USERPROFILE%`'s `SYSTEM` / `Administrators` / user ACEs at creation,
+      whether it is created directly in `~/.clens` or in a subdirectory `internal/secret` creates,
+      because that subdirectory *itself* inherits from `%USERPROFILE%`. So the ACL step is
+      `/inheritance:r` (drop the inherited ACEs, leaving a protected DACL) followed by
+      `/grant:r <user>:F` (install the single explicit owner ACE) — `/inheritance:r` is
+      load-bearing here, not redundant.
+    - **The complete ACL is applied to a temp file and verified *before* it is renamed into
+      place.** `secret.Save` writes a temp file in the **same directory** as `secrets.toml`, applies
+      `exec.Command("icacls", tmpPath, "/inheritance:r", "/grant:r", user+":F")`, reads the DACL back
+      (`icacls tmpPath`) and asserts the resulting principal set is exactly the intended one, and
+      only then `os.Rename`s it over `secrets.toml`. **This ordering is what makes fail-closed *true*
+      rather than merely asserted:** `icacls` applies its arguments in sequence, so had it run
+      directly on the live file, `/inheritance:r` would already be committed when a later `/grant:r`
+      failed to resolve the account — leaving an **empty DACL that denies everyone** and stranding an
+      existing `secrets.toml` unreadable, which the "does not overwrite an existing credential"
+      promise does not cover (its *permissions* would be clobbered before the grant is even
+      attempted). The temp-then-rename path removes that window: a failure at any step deletes the
+      temp and leaves the live file byte- and ACL-identical to before, and the rename is the
+      **single atomic commit point** — the credential and its verified ACL land together or not at
+      all. The rename replaces the live file's ACLs wholesale, which is also why no `/reset` pass is
+      needed (a freshly created temp file has only *inherited* ACEs, and `/inheritance:r` drops
+      those).
+    - **The one safe direct-on-target case is the file that does not yet exist.** When there is no
+      `secrets.toml` to strand, `secret.Save` may create it in place and apply the same ACL directly:
+      there is no prior credential and no prior permissions to lose. Every path where the file
+      already exists goes through temp-then-rename; the direct path is called out here precisely
+      because it is the only case where a mid-sequence failure has nothing to destroy.
+    - **The exit status is checked, and the failure is fail-**closed**.** A non-zero `icacls` exit —
+      or a read-back DACL that does not match the intended principal set — means the ACL was not
+      applied: `secret.Save` **refuses to write the credential** (and, when a file already exists,
+      does not overwrite it), the caller reports the failure, and `clens doctor` shows a **FAIL** in
+      plain words stating that the credential file is **not protected** — rather than leaving an
+      org-wide Admin key on disk under the permissive `%USERPROFILE%` ACL while the plan claims
+      otherwise. A control that fails open is worse than no control, because `doctor` then reports
+      protection that is not there.
+    - The `golang.org/x/sys/windows` ACL API is the fallback if shelling out is unavailable (the one
+      path that would add a dependency; `icacls` is stdlib, so the "exactly one non-stdlib
+      dependency" claim survives the default choice).
   - **Stated plainly: on Windows, permission bits alone are not a control.** This file holds an
     org-wide Admin key and a full-account `sessionKey`, so the ACL is the control that matters, and
-    the plan no longer claims a mode it does not set.
+    the plan no longer claims a mode it does not set. The testable consequences are two: after a
+    successful save, the DACL on `secrets.toml` contains **exactly** the one intended principal (the
+    same read-back the mechanism performs); and if the ACL cannot be applied — or the read-back does
+    not match — the credential is **not** stored, **not** used, and reported unprotected by `doctor`,
+    with any pre-existing file left untouched rather than silently downgraded or permission-clobbered.
 - `internal/secret` is the only package that reads or writes the file. `internal/api` and
   `internal/web` never import it — `POST /api/secrets` writes through the injected
   `SetCredentialWriter` seam, which the composition root wires to `secret.Save` (see *API surface*) —
   so the API can report *whether* a credential is present and when it last worked, and cannot return
   its value.
 - `clens doctor` reports the **actual** protection level it observes (the POSIX mode, or the Windows
-  ACL entries on the file) rather than asserting a mode that was never applied.
+  ACL entries on the file) rather than asserting a mode that was never applied. If the ACL step
+  failed, `doctor` shows a **FAIL** naming the file as **unprotected**, and no credential is used —
+  the fail-closed path above, not a silent downgrade.
 - Both are added to the redaction set, so an accidentally captured `sessionKey` header or
   `sk-ant-admin…` key is redacted before insert, and `RedactCheck` scans stored headers for both
   patterns at startup.
@@ -704,7 +856,9 @@ unchanged, because they guard the same invariants.
    drop counter reaches N.
 5. **Store round-trip** — write, read back, WAL confirmed, redaction verified, FK cascade verified.
 6. **Session keys** — same prefix within window groups; beyond window splits; header override wins.
-7. **Cost arithmetic** — per-class rounding, not on the total.
+7. **Cost arithmetic** — per-class rounding, not on the total, exercised through the batch modifier
+   (`service_tier: "batch"` ×0.5) — the ported `TestComputeBatchRoundsPerClass`. The peak-pricing test
+   it replaces had no subject here once F9 dropped the peak window.
 8. **JSONL dedup** — the regression test for a real, measured defect. On the authoring machine,
    **35 of 47 `requestId`s in a real Claude Code log carry two assistant lines with byte-identical
    `usage` objects**, because one line is written per content block. A naive sum inflates token
@@ -723,17 +877,33 @@ unchanged, because they guard the same invariants.
     (a) **Fixture-level merge test** — a fixture sourced from a real captured proxy/JSONL pair where
     one exists (otherwise built with an id *known* to be equal on both sides) asserts that an insert
     from each source yields one row, `first_source` preserved, `source_refs` listing both, tokens
-    **not** summed, and a disagreement raising `source_mismatch`. This exercises the *merge*, not the
-    id equivalence.
+    **not** summed, and a disagreement between two *complete* sources raising `source_mismatch`. A
+    second fixture where A is a **truncated** capture (`capture_complete = false`, empty or partial
+    `usage`) and B is complete asserts that **B's tokens become the row's tokens** and that **no**
+    `source_mismatch` fires — one source having nothing to contribute is not a disagreement. **The
+    same merge is asserted on the warning ledger** (F4.1): the fixture raises at least one finding
+    kind from each source, and the test asserts that after both inserts each kind appears **exactly
+    once** on the row (`COUNT(*) = COUNT(DISTINCT kind)` per `event_id`, and the `UNIQUE(event_id,
+    kind)` upsert is what makes it so) and that the session's `warning_count` **equals the distinct
+    kind count** — not the sum of the two analyzer runs. A test that only checked the row count would
+    pass on the buggy v4, which is why the assertion is on the kinds and the session count. This
+    exercises the *merge*, not the id equivalence.
     (b) **Live id-equivalence verification** — a prerequisite step (not a fixture), capturing one live
     response's `request-id` header and the matching Claude Code JSONL line and asserting equality, its
     result recorded in this plan. Until it runs, the equivalence is an assumption and the fallback key
     is primary (see *Cross-source identity*).
 12. **Prompt-total and billing-mode invariants** — (a) `total_prompt_tokens == input + cache_write_5m
     + cache_write_1h + cache_read` on every row, and the classic "input_tokens looks small so the call
-    was cheap" misreading is asserted against; (b) a subscription row has `cost_usd IS NULL` and
-    `api_equivalent_cost_usd IS NOT NULL`, an api row the reverse, and a mixed fixture passed through
-    `/api/stats` yields two labelled totals — never one merged `SUM(cost_usd)`.
+    was cheap" misreading is asserted against; (b) a subscription row has **`cost_usd IS NULL`
+    unconditionally**, and `api_equivalent_cost_usd IS NOT NULL` **unless** the row is `cost_source =
+    'unpriced'` — an unpriced subscription call legitimately carries NULL on *both* columns, which is
+    the labelled state the "no invented numbers" rule requires, not an invariant violation — and an
+    api row is the reverse **unless** it is `cost_source = 'unpriced'`, where `cost_usd` is NULL and
+    `api_equivalent_cost_usd` stays NULL (an unpriced API call is the same labelled state, never
+    `$0.00`); a mixed fixture passed through `/api/stats` yields two labelled totals,
+    never one merged `SUM(cost_usd)`, and the same mixed fixture read through `/api/sessions` yields
+    the two labelled **session** totals (F2.2) — never one mixed figure and never `$0.00` for the
+    subscription side.
 13. **Cache-invalidation detector** — a synthetic healthy loop (reads growing, writes small) raises
     nothing; a synthetic invalidator loop (writes ≈ full conversation every turn) raises
     `cache_prefix_invalidation`.
@@ -765,13 +935,13 @@ unchanged, because they guard the same invariants.
 
 | Risk | Mitigation |
 |---|---|
-| **Double-counting a turn seen by two sources** | `request_id` UNIQUE + merge-not-add semantics, tested against the measured 35/47 duplicate case, plus `source_mismatch` on disagreement; the header↔`requestId` equivalence is verified live before the merge is relied on, with a fallback key if it fails |
+| **Double-counting a turn seen by two sources** | `request_id` UNIQUE + merge-not-add semantics, tested against the measured 35/47 duplicate case, plus `source_mismatch` on disagreement; the header↔`requestId` equivalence is verified live before the merge is relied on, with a fallback key if it fails. The **warning** ledger carries the same guarantee: `warnings` is `UNIQUE(event_id, kind)`, the analyzer attach is an upsert, and `warning_count` is re-derived from `warnings` — so a merge that re-runs the seam cannot raise a finding kind twice or inflate the count (test 11a) |
 | **Summing subscription and API figures** | Enforced by column, not convention: subscription rows have `cost_usd` NULL and carry `api_equivalent_cost_usd`; `billing_mode` on every row; every aggregate surface groups by it (invariant 5, tested) |
-| **Inventing a plan limit or a price** | `unconfigured` / `unpriced` as first-class labelled states; shipped rates only where documented; limits learned from your own snapshots and confirmed, never assumed |
+| **Inventing a plan limit or a price** | `unconfigured` / `unpriced` as first-class labelled states; shipped rates cited to a skill file, or `provisional` with a named verification step — never silently remembered; limits learned from your own snapshots and confirmed, never assumed |
 | **Trusting the local price table** | `cost_drift` reconciles computed against Anthropic's actually-billed figure — but **only for API accounts**, where a billed figure exists. For subscription accounts (six of the seven shapes) there is no billed counterpart, and the guard is `model_catalog` refresh plus the `unpriced`/`approximate` labels, with an optional staleness signal |
 | **claude.ai's endpoint is undocumented and can change or break** | Tolerant, schema-agnostic window extraction; `status` recorded per snapshot; the other three sources unaffected; the Sources tab makes it visible (answers the tech plan's open question) |
 | **The cookie expires** | Explicit re-auth via `clens accounts` / `POST /api/secrets` **and** a visible degraded state — never a silent failure (answers the tech plan's open question) |
-| **The Admin key is org-wide** | Protected by the platform control that actually applies — POSIX `0600` on Unix, an explicit Windows ACL on Windows (never the `0600` token Go ignores on Windows) — outside the DB, redacted, never logged, never served; `doctor` reports the real protection level and the key's scope; storing one requires `--yes` |
+| **The Admin key is org-wide** | Protected by the platform control that actually applies — POSIX `0600` on Unix, an explicit Windows ACL on Windows (never the `0600` token Go ignores on Windows) — outside the DB, redacted, never logged, never served. On Windows the ACL (`/inheritance:r` + `/grant:r`) is applied to a same-directory temp file, the DACL read back and verified, and only then renamed over `secrets.toml`, so a mid-sequence failure leaves the live file untouched; the ACL step **fails closed** (ACL not applied, or read-back mismatch → credential not written, not used, `doctor` FAILs), and `doctor` reports the real protection level and the key's scope; storing one requires `--yes` |
 | **JSONL format changes between Claude Code versions** | Tolerant parser, unknown types counted not fatal, `client_version` recorded per row so a format break is attributable to a version |
 | **Buffering the stream to count tokens** | Invariant 1 + the TTFB hard gate |
 | **Hot-path stall on a full observer queue** | Bounded sink + drop counter, unchanged |
@@ -885,11 +1055,11 @@ branches hang off the store: `06 → 11`, `06,07 → 12`, `06,07 → 13`, conver
 | Cross-source identity | `request_id` UNIQUE, merge-not-add; the header↔`requestId` equivalence is an assumption **verified live** before the merge is relied on, with a fallback key if it fails | Row per (source, turn) with a dedup view — leaves the inflation bug reachable by any query that forgets the view |
 | Quota snapshots | One row per `(window)` | Fixed `session_pct`/`weekly_pct` columns (the tech plan's schema) — would silently drop the per-model windows some plans return |
 | Plan limits | Empty by default; learned from your own snapshots and confirmed | Shipped per-plan limit table — inventing a number is the failure mode deepseek-lens already named |
-| Price table | Ships populated with documented first-party rates | Empty by default (deepseek-lens's choice) — that choice was forced by having no authoritative source, which is no longer true |
+| Price table | Ships populated with documented (cited) first-party rates, plus `provisional` rows where the bundle lists a model but prices it nowhere — verification step named | Empty by default (deepseek-lens's choice) — that choice was forced by having no authoritative source, which is no longer true |
 | `cost_usd` provenance | Computed locally, verified against the Admin cost report | Trusting the local table — `cost_drift` detects staleness **for API accounts**; subscription accounts have no billed counterpart and are guarded by `model_catalog` refresh + `unpriced`/`approximate` labels instead |
 | Write-route seams | Function values injected at the composition root (`SetCredentialWriter` → `secret.Save`, `SetAccountWriter`, `SetIngestTrigger`), `503` when unwired | Direct import of `secret`/`config`/`ingest` by `internal/api` — breaks the stated import-direction guarantee that keeps credentials out of the API and web layers |
 | Dashboard charts | Hand-rolled inline SVG, no CDN, no build step | Chart.js from a CDN (the tech plan's choice) — adds a third-party network load and an offline failure mode to a loopback tool that holds every prompt |
-| Credential storage | `~/.clens/secrets.toml`, outside the DB, readable only by `internal/secret` — POSIX `0600`/`0700` on Unix, an explicit Windows ACL (`icacls`, or `x/sys/windows`) on Windows | In the DB (a copied backup leaks it) / in the environment only (unusable from a scheduled task) / relying on `0600` on Windows, where Go's `perm` argument is a no-op |
+| Credential storage | `~/.clens/secrets.toml`, outside the DB, readable only by `internal/secret` — POSIX `0600`/`0700` on Unix; on Windows an explicit `icacls` ACL (`/inheritance:r` + `/grant:r`, principal resolved in Go and passed as an `exec` arg — never a shell string) applied to a same-directory temp file whose DACL is read back and verified before an atomic rename over the live file, so it **fails closed** without ever clobbering an existing file's permissions (`x/sys/windows` fallback) | In the DB (a copied backup leaks it) / in the environment only (unusable from a scheduled task) / relying on `0600` on Windows, where Go's `perm` argument is a no-op / a shell-string `"${USERNAME}"` that `os/exec` never expands, so the ACL silently never runs / applying `icacls` on the live file with the destructive `/inheritance:r` before `/grant:r`, which strands an existing `secrets.toml` with a zero-ACE DACL if the grant fails |
 | Bedrock/Vertex/Foundry | Out of scope; classified and stored as `auth_kind=cloud`, not priced | Priced — partner rates differ from first-party and are not verifiable from here |
 | Branch policy | v1 lands on `main` via `GI-1-…`; `develop` introduced when a second story needs it | Creating an empty `develop` immediately — a branch with no purpose yet |
 | Migrations | None in v1 | A framework from day one |
@@ -956,3 +1126,115 @@ Applied every finding and nit from `review/round-1/critique.md`. The changes tha
   check noted; **N2** — `project` added to `clens stats --by`; **N3** — invariant 3 restated as
   "one writer package per source, serialized by the store's single write connection", with the new
   merge `UPDATE` path called out.
+
+### v3 — round-2 review triage (2026-09-18)
+
+Applied every round-2 finding (F2.1–F2.6, N2.1) under the conductor's binding overrides. As in v2,
+the fixes that make the plan *less* confident are deliberate; each corrected claim now names what a
+future implementer can **test**.
+
+- **F2.1 (MAJOR)** — the Windows credential ACL mechanism is now specified and **fails closed**: the
+  principal is resolved in Go and passed as an `exec` argument (never the unexpanded shell string
+  `"${USERNAME}"`, which `os/exec` does not expand), the file is created by `internal/secret` and the
+  ACL step leads with `/reset` before `/grant:r` so pre-existing *explicit* ACEs are stripped (not
+  just disinherited by `/inheritance:r`), and a non-zero `icacls` exit causes `secret.Save` to
+  **refuse to write the credential** and `doctor` to show a FAIL naming the file unprotected — never
+  a silent downgrade to an unprotected file. Security posture, the `doctor` bullet, the Risk table,
+  and the Decision-log credential row all updated.
+- **F2.2 (MAJOR)** — the per-session cost total is now split like `events`: `sessions` gains
+  `total_cost_usd` (API-billed only) and `total_api_equivalent_cost_usd` (subscription only), each
+  NULL when that side is empty; `clens sessions` / `GET /api/sessions` render two labelled figures;
+  the `GET /api/sessions` contract change is recorded in the API-surface section; test 12b gains the
+  mixed-fixture session assertion.
+- **F2.3 (MINOR)** — the rounding paragraph and test 7 no longer cite the peak test (its 2× subject
+  was dropped with the peak window in F9); the carried-over test's subject is now the live batch
+  modifier (×0.5), ported as `TestComputeBatchRoundsPerClass`.
+- **F2.4 (MINOR)** — the merge precedence is explicit: the **complete** capture wins the token
+  columns (A when `capture_complete`, else B); `source_mismatch` fires **only** when two *complete*
+  sources disagree, never when one source has nothing to contribute; B-owned metadata columns are
+  preserved from whichever writer supplied them. Test 11(a) gains a truncated-A / complete-B fixture.
+- **F2.5 (MINOR)** — test 12b no longer asserts `api_equivalent_cost_usd IS NOT NULL` universally:
+  a subscription row is `cost_usd IS NULL` unconditionally, and `api_equivalent_cost_usd IS NOT NULL`
+  unless the row is `cost_source = 'unpriced'` (an unpriced subscription call legitimately carries
+  NULL on both — the labelled state, not a violation).
+- **F2.6 (MINOR)** — the shipped price table is cited per row: `models.md:73/74/75/76`,
+  `model-migration.md:1291`. `claude-mythos-5-1` is **promoted from provisional to cited**
+  (`models.md:75` — the provisional label was on the wrong row); `claude-opus-4-7`, `claude-opus-4-6`
+  and `claude-haiku-4-5` are marked **`provisional`** (zero rate matches in the bundle) with the
+  verification step named — check the Pricing URL in `shared/live-sources.md`, per
+  `cost-optimization.md:233`.
+- **N2.1 (NIT)** — the modifier table no longer asserts "Priority Tier has no per-token premium"; it
+  now states only what the bundle documents (Priority unsupported on Fable 5.1 / Mythos 5.1,
+  `models.md:73`; Priority costs absent from the cost report, `cost-optimization.md:39`) and applies
+  no rate change.
+- **F13 (confirm-only)** — no edit. `cost_drift` is scoped to API accounts as a **stated limitation**
+  ("for API accounts only", "`cost_drift` can never fire" for subscriptions), not a hedge; confirmed,
+  not restated.
+
+### v4 — round-3 review triage (2026-09-18)
+
+Applied all four round-3 findings (F3.1–F3.4) under the conductor's binding overrides. As in v2/v3,
+the fixes that make the plan *less* confident are deliberate; each corrected claim now names what a
+future implementer can **test**.
+
+- **F3.1 (MINOR)** — the `events.cost_usd` NULL condition is now *both* cases, mirroring the
+  subscription carve-out F2.5 applied on the other side: NULL when `billing_mode='subscription'`
+  **or** when the row is `cost_source='unpriced'` — an unpriced API row is NOT `$0.00`. Test 12(b) no
+  longer asserts `cost_usd IS NOT NULL` for an api row unconditionally: an unpriced API row carries
+  NULL on **both** cost columns, the same labelled state, disambiguated by `unpriced_count`. The
+  `sessions` paragraph and row gain the matching note that an all-unpriced API session reads NULL on
+  `total_cost_usd`.
+- **F3.2 (MINOR)** — the Windows ACL step is **restructured, not reordered**. The false "starts with
+  no ACEs to inherit" premise is corrected: a newly created file **does** inherit its parent
+  directory's ACEs — that is what inheritance means — including at one directory of indirection, so
+  `/inheritance:r` is load-bearing and **kept**. The destructive-before-constructive ordering is fixed
+  structurally: the complete ACL (`/inheritance:r` + `/grant:r`; no `/reset`, since the rename
+  replaces the live file's ACLs wholesale) is applied to a **temp file in the same directory**, the
+  DACL read back and asserted to be exactly the intended principal set, and only then renamed into
+  place. The plan now states **why** this makes fail-closed *true* rather than merely asserted:
+  `icacls` applies its arguments in sequence, so a direct-on-target `/inheritance:r` followed by a
+  failing `/grant:r` would leave a zero-ACE DACL denying everyone — stranding an existing
+  `secrets.toml`, a state the "does not overwrite an existing credential" promise does not cover
+  (its *permissions* would be clobbered). Temp-then-rename leaves the live file byte- and
+  ACL-identical on any failure, with the rename as the single atomic commit point. The one safe
+  direct-on-target case (the file does not yet exist, nothing to strand) is called out as such.
+  Security posture, the Risk-table row, and the Decision-log credential row all updated.
+- **F3.3 (MINOR)** — the merge's token rewrite is reconciled with the incrementally maintained session
+  totals. The cold-path order gains an explicit **re-derive the owning session's totals** step, run
+  **in the same transaction as the merge `UPDATE`**; invariant 3 now says the merge **re-derives** the
+  session (the re-derivation wins over the incremental fold), not merely that sessions are maintained;
+  the merge bullet notes a merge **rewrites** token/cost columns and that `session_id` is **not**
+  rewritten — the row keeps the session it was first written under, so exactly one session is the
+  re-derivation target.
+- **F3.4 (NIT)** — the surviving "B contributes nothing new" phrase (which contradicted the precedence
+  paragraph ten lines below it) is replaced with the correct statement: A contributes the bodies and
+  the request-side material; B contributes the JSONL-only metadata and, when its capture is the
+  complete one, the token counts.
+
+### v5 — round-4 review triage (2026-09-18)
+
+Applied the one round-4 finding (F4.1) under the conductor's binding overrides. As in v2–v4, the fix
+that makes the plan *less* confident is deliberate; the corrected claim now names what a future
+implementer can **test**.
+
+- **F4.1 (MINOR)** — the warning ledger now carries the same rewrite-not-add rule F3.3 applied to the
+  token/cost ledger. The analyzer seam runs after *every* insert, so a call observed by both sources
+  runs it **twice on one `event_id`** — and the plan was silent on what the merge does to the
+  warnings, leaving a duplicate-finding/duplicate-`warning_count` path that is user-visible on
+  `GET /api/warnings/summary` and `clens sessions`. Fixed by **making the invariant enforced, not
+  asserted**: `warnings` gains **`UNIQUE(event_id, kind)`** and the attach becomes an **upsert** keyed
+  on it, so the second run updates the row's finding of that kind rather than appending a copy and the
+  two sources contribute the union of their complementary findings. **The phrasing was the defect and
+  is corrected**: the schema row no longer reads "one analyzer finding per row" (a claim nothing held
+  once the merge path could re-run the seam) but "at most one analyzer finding of each kind per event
+  row", enforced by the constraint. **`warning_count` is re-derived from `warnings`** — not from
+  `events`, and never by increment, since it is not derivable from `events` — **in the same
+  transaction as the merge**, alongside the F3.3 cost re-derivation; the cold-path order, invariant 3,
+  the `sessions` schema row, and the `warnings` schema paragraph all say so. The plan states
+  **explicitly that the seam is idempotent per `(event_id, kind)` by construction** (each rule owns its
+  kind; the one deepseek-lens rule that emitted several findings of one kind per request,
+  `unsupported_content_block`, is DeepSeek-specific and not carried over) and **keeps the constraint
+  anyway**, because the constraint is what makes the claim testable rather than a property to
+  re-derive by reading the analyzer code. **Test 11(a) is extended** to assert each finding kind
+  appears **once** and the session's `warning_count` equals the distinct-kind count — an assertion a
+  test that only checked the row count would miss, and one that would have failed on v4.
