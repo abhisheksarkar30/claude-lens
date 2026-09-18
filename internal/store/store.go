@@ -590,6 +590,47 @@ func (s *Store) Vacuum(ctx context.Context) error {
 	return nil
 }
 
+// IngestState is one collector's resume cursor -- a byte offset
+// (jsonlogs), a last-fetched window (adminrep), or a last-poll marker
+// (snapshot). Value is the collector's own encoding; Status/Error are
+// collector-defined progress signals for doctor/dashboard surfacing, never
+// interpreted by the store itself.
+type IngestState struct {
+	Value  string
+	Status string
+	Error  string
+}
+
+// GetIngestState reads key's stored cursor. ok is false when the key has
+// never been written -- a collector's first poll, not an error.
+func (s *Store) GetIngestState(ctx context.Context, key string) (IngestState, bool, error) {
+	var st IngestState
+	err := s.db.QueryRowContext(ctx, `SELECT value, status, error FROM ingest_state WHERE key = ?`, key).
+		Scan(&st.Value, &st.Status, &st.Error)
+	if err == sql.ErrNoRows {
+		return IngestState{}, false, nil
+	}
+	if err != nil {
+		return IngestState{}, false, fmt.Errorf("store: GetIngestState: %w", err)
+	}
+	return st, true, nil
+}
+
+// SetIngestState upserts key's cursor -- one row per collector-owned key
+// (e.g. "jsonl:<path>", "snapshot:<account>"), never appended history.
+func (s *Store) SetIngestState(ctx context.Context, key string, state IngestState) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO ingest_state (key, value, status, error, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET
+			value = excluded.value, status = excluded.status, error = excluded.error, updated_at = excluded.updated_at
+	`, key, state.Value, state.Status, state.Error, unixNano(time.Now()))
+	if err != nil {
+		return fmt.Errorf("store: SetIngestState: %w", err)
+	}
+	return nil
+}
+
 // InsertQuotaSnapshot records one quota_snapshots row (source C, one row
 // per window per poll).
 func (s *Store) InsertQuotaSnapshot(ctx context.Context, q QuotaSnapshot) error {

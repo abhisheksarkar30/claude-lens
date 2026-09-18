@@ -1,0 +1,17 @@
+{"type":"user","sessionId":"sess-tol","uuid":"u1"}
+{"type":"summary","sessionId":"sess-tol","uuid":"u2"}
+{"type":"system","sessionId":"sess-tol","uuid":"u3"}
+{"type":"tool-result","sessionId":"sess-tol","uuid":"u4"}
+{"type":"attachment","sessionId":"sess-tol","uuid":"u5"}
+{"type":"file-history-snapshot","sessionId":"sess-tol","uuid":"u6"}
+{"type":"atis-latch","sessionId":"sess-tol","uuid":"u7"}
+{"type":"file-history-delta","sessionId":"sess-tol","uuid":"u8"}
+{"type":"ai-title","sessionId":"sess-tol","uuid":"u9"}
+{"type":"last-prompt","sessionId":"sess-tol","uuid":"u10"}
+{"type":"queue-operation","sessionId":"sess-tol","uuid":"u11"}
+{"type":"mode","sessionId":"sess-tol","uuid":"u12"}
+{"type":"pr-link","sessionId":"sess-tol","uuid":"u13"}
+{"type":"some-future-type-not-yet-seen","sessionId":"sess-tol","uuid":"u14"}
+{this line is not valid json at all
+{"type":"assistant","sessionId":"sess-tol","uuid":"a1","requestId":"req_split","message":{"model":"claude-sonnet-5","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":20,"ephemeral_1h_input_tokens":0}}}}
+{"type":"assistant","sessionId":"sess-tol","uuid":"a2","requestId":"req_flat","message":{"model":"claude-sonnet-5","stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":20}}}

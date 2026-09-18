@@ -1,0 +1,1 @@
+{"type":"assistant","sessionId":"sess-parent-agent1","uuid":"a1","requestId":"req_sub","cwd":"/home/dev/proj1","gitBranch":"main","version":"2.1.272","timestamp":"2026-01-01T00:00:02Z","message":{"model":"claude-sonnet-5","stop_reason":"end_turn","usage":{"input_tokens":3,"output_tokens":3,"cache_read_input_tokens":0}}}

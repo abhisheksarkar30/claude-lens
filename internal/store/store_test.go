@@ -366,6 +366,42 @@ func TestWarningUpsertIdempotent(t *testing.T) {
 
 // Test 20 (store half): a second UPSERT of the same admin natural key
 // updates in place rather than duplicating.
+// IngestState is the resume-cursor slice jsonlogs (and later collectors)
+// persist through -- an upsert on key, not appended history, and a
+// never-seen key reports ok=false rather than a zero value that looks
+// like a real cursor.
+func TestIngestStateUpsert(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	if _, ok, err := st.GetIngestState(ctx, "jsonl:/tmp/does-not-exist.jsonl"); err != nil || ok {
+		t.Fatalf("GetIngestState on an unwritten key: ok=%v err=%v, want ok=false, err=nil", ok, err)
+	}
+
+	key := "jsonl:/tmp/a.jsonl"
+	if err := st.SetIngestState(ctx, key, IngestState{Value: "100", Status: "ok"}); err != nil {
+		t.Fatalf("SetIngestState: %v", err)
+	}
+	got, ok, err := st.GetIngestState(ctx, key)
+	if err != nil || !ok {
+		t.Fatalf("GetIngestState: ok=%v err=%v", ok, err)
+	}
+	if got.Value != "100" || got.Status != "ok" {
+		t.Errorf("got %+v, want Value=100 Status=ok", got)
+	}
+
+	if err := st.SetIngestState(ctx, key, IngestState{Value: "250", Status: "ok"}); err != nil {
+		t.Fatalf("SetIngestState (update): %v", err)
+	}
+	got, _, err = st.GetIngestState(ctx, key)
+	if err != nil {
+		t.Fatalf("GetIngestState: %v", err)
+	}
+	if got.Value != "250" {
+		t.Errorf("Value = %q after re-set, want 250 (upsert, not a second row)", got.Value)
+	}
+}
+
 func TestAdminUpsertIdempotent(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
