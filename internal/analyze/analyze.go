@@ -17,6 +17,16 @@ import (
 var perEventRules = []func(parse.Meta, parse.Usage, *store.Event) (store.Warning, bool){
 	ruleCacheBreakpointsExceeded,
 	ruleCachePrefixBelowMinimum,
+	ruleThinkingBudgetRejected,
+	ruleThinkingDisplayOmitted,
+	ruleMaxTokensTruncation,
+	ruleRefusal,
+	ruleStreamIncomplete,
+	ruleRateLimited,
+	ruleOverloaded,
+	ruleUpstreamErrorBody,
+	ruleAuthKindAnomaly,
+	ruleAPIEquivalentCost,
 }
 
 // sessionRules is the session-scoped rule table, run over one session's

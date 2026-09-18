@@ -92,13 +92,14 @@ func AllKinds() []KindInfo {
 
 // nonAnalyzeKinds names T1 kinds a README-consistency check should expect
 // without finding a corresponding rule in this package, because they are
-// emitted by another package entirely.
+// emitted by another package entirely. upstream_error has a rule here too
+// (br-GI-1-10, for an error object inside a 200 body) but is not listed
+// here, because the transport-failure trigger stays in consumer.go
+// (br-GI-1-08) rather than moving -- one kind, two triggers, only one of
+// which is per-event-pure enough to live in this package.
 var nonAnalyzeKinds = map[Kind]string{
 	KindAnalyzerPanic:          "consumer (panic recovery)",
 	KindSourceMismatch:         "store (cross-source merge)",
 	KindCostDrift:              "reconcile",
 	KindQuotaWindowApproaching: "quota",
-	KindRateLimited:            "collector/transport",
-	KindOverloaded:             "collector/transport",
-	KindUpstreamError:          "collector/transport",
 }

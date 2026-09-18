@@ -1,7 +1,11 @@
 package analyze
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/parse"
@@ -41,6 +45,161 @@ func ruleCachePrefixBelowMinimum(meta parse.Meta, usage parse.Usage, _ *store.Ev
 	}
 	return warning(KindCachePrefixBelowMinimum, SeverityWarn,
 		"a cache_control breakpoint was present but produced no cache write or read"), true
+}
+
+// ruleThinkingBudgetRejected fires when a request that sent
+// thinking.budget_tokens came back a 400 whose body actually mentions
+// thinking -- the direct analogue of deepseek-lens's budget_tokens_ignored,
+// except the newest generation fails loudly instead of silently dropping
+// the field.
+func ruleThinkingBudgetRejected(meta parse.Meta, _ parse.Usage, ev *store.Event) (store.Warning, bool) {
+	if !meta.HasThinking || meta.ThinkingBudget == nil {
+		return store.Warning{}, false
+	}
+	if ev.Status != 400 || !bytes.Contains(ev.RespBody, []byte("thinking")) {
+		return store.Warning{}, false
+	}
+	return warning(KindThinkingBudgetRejected, SeverityError,
+		"thinking.budget_tokens was rejected with a 400 by a model that no longer accepts it"), true
+}
+
+// ruleThinkingDisplayOmitted fires when thinking was requested and billed
+// (ThinkingTokens > 0) but the response contains no thinking or
+// redacted_thinking content block at all -- display defaulted to
+// "omitted" rather than "summarized", so the reasoning was paid for but
+// never delivered.
+func ruleThinkingDisplayOmitted(meta parse.Meta, usage parse.Usage, ev *store.Event) (store.Warning, bool) {
+	if !meta.HasThinking || usage.ThinkingTokens == 0 {
+		return store.Warning{}, false
+	}
+	if bytes.Contains(ev.RespBody, []byte(`"type":"thinking"`)) ||
+		bytes.Contains(ev.RespBody, []byte(`"type":"redacted_thinking"`)) {
+		return store.Warning{}, false
+	}
+	return warning(KindThinkingDisplayOmitted, SeverityInfo,
+		"thinking tokens were billed but no thinking content was returned (display: omitted)"), true
+}
+
+func ruleMaxTokensTruncation(_ parse.Meta, usage parse.Usage, _ *store.Event) (store.Warning, bool) {
+	if usage.StopReason != "max_tokens" {
+		return store.Warning{}, false
+	}
+	return warning(KindMaxTokensTruncation, SeverityWarn,
+		"stop_reason was max_tokens: the turn was cut off mid-thought"), true
+}
+
+func ruleRefusal(_ parse.Meta, usage parse.Usage, _ *store.Event) (store.Warning, bool) {
+	if usage.StopReason != "refusal" {
+		return store.Warning{}, false
+	}
+	detail := "stop_reason was refusal"
+	if usage.StopCategory != "" {
+		detail += " (" + usage.StopCategory + ")"
+	}
+	return warning(KindRefusal, SeverityWarn, detail), true
+}
+
+// ruleStreamIncomplete fires on a streamed response the store recorded as
+// an incomplete capture -- CaptureComplete is false exactly when the body
+// was truncated or the SSE stream ended without message_stop.
+func ruleStreamIncomplete(_ parse.Meta, usage parse.Usage, ev *store.Event) (store.Warning, bool) {
+	if !usage.IsStream || ev.CaptureComplete {
+		return store.Warning{}, false
+	}
+	return warning(KindStreamIncomplete, SeverityError,
+		"the SSE stream ended without a message_stop event"), true
+}
+
+func ruleRateLimited(_ parse.Meta, _ parse.Usage, ev *store.Event) (store.Warning, bool) {
+	if ev.Status != 429 {
+		return store.Warning{}, false
+	}
+	detail := "HTTP 429 rate limited"
+	h := parseRespHeaders(ev.RespHeaders)
+	if ra := h.Get("Retry-After"); ra != "" {
+		detail += fmt.Sprintf("; retry-after=%s", ra)
+	}
+	for k, v := range h {
+		if strings.HasPrefix(strings.ToLower(k), "anthropic-ratelimit-") && len(v) > 0 {
+			detail += fmt.Sprintf("; %s=%s", k, v[0])
+		}
+	}
+	return warning(KindRateLimited, SeverityWarn, detail), true
+}
+
+func ruleOverloaded(_ parse.Meta, _ parse.Usage, ev *store.Event) (store.Warning, bool) {
+	if ev.Status != 529 {
+		return store.Warning{}, false
+	}
+	return warning(KindOverloaded, SeverityError, "HTTP 529 overloaded"), true
+}
+
+// ruleUpstreamErrorBody covers one of upstream_error's two triggers: an
+// error object arriving inside an HTTP 200 body. The other trigger --
+// a transport failure -- has no per-event body to inspect and stays where
+// br-GI-1-08 already raises it, directly in consumer.go; both write the
+// same kind because they mean the same thing to the reader.
+func ruleUpstreamErrorBody(_ parse.Meta, _ parse.Usage, ev *store.Event) (store.Warning, bool) {
+	if ev.Status != 200 || len(ev.RespBody) == 0 {
+		return store.Warning{}, false
+	}
+	var probe struct {
+		Type  string `json:"type"`
+		Error *struct {
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(ev.RespBody, &probe) != nil {
+		return store.Warning{}, false
+	}
+	if probe.Type != "error" && probe.Error == nil {
+		return store.Warning{}, false
+	}
+	detail := "error object present in a 200 response body"
+	if probe.Error != nil && probe.Error.Message != "" {
+		detail += ": " + probe.Error.Message
+	}
+	return warning(KindUpstreamError, SeverityError, detail), true
+}
+
+// ruleAuthKindAnomaly fires when a credential was used against the wrong
+// plane: an admin credential against the Messages API, or an api_key
+// credential attributed to a subscription-billed account.
+func ruleAuthKindAnomaly(_ parse.Meta, _ parse.Usage, ev *store.Event) (store.Warning, bool) {
+	switch {
+	case ev.AuthKind == "admin" && ev.Path == "/v1/messages":
+		return warning(KindAuthKindAnomaly, SeverityWarn,
+			"an admin credential was used against the Messages API"), true
+	case ev.AuthKind == "api_key" && ev.BillingMode == "subscription":
+		return warning(KindAuthKindAnomaly, SeverityWarn,
+			"an api_key credential was observed on a subscription-billed account"), true
+	default:
+		return store.Warning{}, false
+	}
+}
+
+// ruleAPIEquivalentCost fires on every priced subscription row: what this
+// call would have cost at API rates, labelled hypothetical and never
+// contributing to cost_usd (invariant 5 -- this rule only ever reads
+// ApiEquivalentCostUSD, never writes either cost column).
+func ruleAPIEquivalentCost(_ parse.Meta, _ parse.Usage, ev *store.Event) (store.Warning, bool) {
+	if ev.BillingMode != "subscription" || ev.ApiEquivalentCostUSD == nil {
+		return store.Warning{}, false
+	}
+	return warning(KindAPIEquivalentCost, SeverityInfo,
+		fmt.Sprintf("hypothetical API-equivalent cost: $%.6f (not billed)", *ev.ApiEquivalentCostUSD)), true
+}
+
+func parseRespHeaders(raw string) http.Header {
+	if raw == "" {
+		return http.Header{}
+	}
+	var h http.Header
+	if json.Unmarshal([]byte(raw), &h) != nil || h == nil {
+		return http.Header{}
+	}
+	return h
 }
 
 // --- Session-scoped rules ---------------------------------------------
