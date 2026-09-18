@@ -1,0 +1,17 @@
+# Local database — never commit (may hold captured prompt content)
+*.db
+*.db-wal
+*.db-shm
+
+# Local config and credentials. The default config dir is ~/.clens/, outside the
+# repo; these rules are belt-and-braces for a config dir pointed inside it.
+config.toml
+accounts.toml
+secrets.toml
+
+# Cross-review artifacts
+/**/*review*/
+
+# Built binary
+/clens
+/clens.exe
