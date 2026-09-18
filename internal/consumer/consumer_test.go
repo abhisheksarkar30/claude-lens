@@ -11,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/analyze"
 	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/parse"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
+	"github.com/abhisheksarkar30/claude-lens/internal/session"
 	"github.com/abhisheksarkar30/claude-lens/internal/sink"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
@@ -32,6 +34,13 @@ func nonStreamBody(model string, inputTokens, outputTokens int) []byte {
 	return []byte(fmt.Sprintf(
 		`{"model":%q,"stop_reason":"end_turn","usage":{"input_tokens":%d,"output_tokens":%d}}`,
 		model, inputTokens, outputTokens,
+	))
+}
+
+func nonStreamBodyWithCacheWrite5m(model string, write5m int) []byte {
+	return []byte(fmt.Sprintf(
+		`{"model":%q,"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":%d}}}`,
+		model, write5m,
 	))
 }
 
@@ -226,6 +235,10 @@ func (f *failingStore) InsertEvent(ctx context.Context, ev *store.Event) (int64,
 
 func (f *failingStore) UpsertWarnings(ctx context.Context, eventID int64, warnings []store.Warning) error {
 	return f.inner.UpsertWarnings(ctx, eventID, warnings)
+}
+
+func (f *failingStore) SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error) {
+	return f.inner.SessionEvents(ctx, sessionID)
 }
 
 // A store error on one call does not stop processing subsequent calls.
@@ -429,6 +442,70 @@ func TestConsumerBillingModeSplit(t *testing.T) {
 				t.Errorf("api event = %+v, want BillingMode=api, ApiEquivalentCostUSD=nil, CostUSD set", e)
 			}
 		}
+	}
+}
+
+// Session-scoped rule: a finding attaches to the earlier row that
+// completed its pattern, not just whichever call triggered the pass, and
+// the session's warning_count reflects it.
+func TestConsumerSessionRuleAttachesFindingToEarlierRow(t *testing.T) {
+	st := newTestStore(t)
+	sk := sink.New(sink.DefaultCapacity)
+	resolver := session.New(st, 30)
+	c := New(sk, st, nil)
+	c.SetSessionResolver(resolver)
+	c.SetSessionAggregator(resolver)
+	c.SetSessionRule(analyze.Engine{})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go c.Run(ctx)
+	defer cancel()
+
+	sessionHeaders := http.Header{}
+	sessionHeaders.Set("x-clens-session", "sess-1")
+
+	first := basicCall("req-cache-write")
+	first.ReqHeaders = sessionHeaders
+	first.RespBody = nonStreamBodyWithCacheWrite5m("claude-sonnet-5", 1000)
+	sk.Submit(first)
+
+	second := basicCall("req-cache-follow-up")
+	second.ReqHeaders = sessionHeaders
+	sk.Submit(second)
+
+	evs := waitForEvents(t, st, 2)
+	var firstID int64
+	var sessionID string
+	for _, e := range evs {
+		if e.RequestID == "req-cache-write" {
+			firstID = e.ID
+			sessionID = e.SessionID
+		}
+	}
+	if firstID == 0 {
+		t.Fatal("could not find req-cache-write's event id")
+	}
+
+	warnings, err := st.ListWarnings(context.Background(), firstID)
+	if err != nil {
+		t.Fatalf("ListWarnings: %v", err)
+	}
+	found := false
+	for _, w := range warnings {
+		if w.Kind == string(analyze.KindCacheWriteNeverRead) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("cache write's own row missing %s: %v", analyze.KindCacheWriteNeverRead, warnings)
+	}
+
+	sess, err := st.GetSession(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.WarningCount == 0 {
+		t.Error("session warning_count did not pick up the session-scoped finding")
 	}
 }
 

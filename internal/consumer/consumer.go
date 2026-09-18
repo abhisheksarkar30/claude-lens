@@ -33,6 +33,7 @@ const (
 type Store interface {
 	InsertEvent(ctx context.Context, ev *store.Event) (int64, error)
 	UpsertWarnings(ctx context.Context, eventID int64, warnings []store.Warning) error
+	SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error)
 }
 
 // Consumer drains a sink.Sink, builds one store.Event per captured call,
@@ -48,6 +49,7 @@ type Consumer struct {
 	resolver     SessionResolver
 	aggregator   SessionAggregator
 	analyzers    []Analyzer
+	sessionRule  SessionRule
 	pricer       PriceComputer
 	bodyCapBytes int
 
@@ -83,6 +85,7 @@ func New(sk *sink.Sink, st Store, accounts []config.Account) *Consumer {
 func (c *Consumer) SetSessionResolver(r SessionResolver)     { c.resolver = r }
 func (c *Consumer) SetSessionAggregator(a SessionAggregator) { c.aggregator = a }
 func (c *Consumer) SetAnalyzers(analyzers ...Analyzer)       { c.analyzers = analyzers }
+func (c *Consumer) SetSessionRule(r SessionRule)             { c.sessionRule = r }
 func (c *Consumer) SetPriceTable(p PriceComputer)            { c.pricer = p }
 
 // SetBodyDecoding sets the decode cap applied to a captured response body
@@ -124,6 +127,16 @@ func (c *Consumer) Stats() Stats {
 type pendingEvent struct {
 	ev       *store.Event
 	warnings []store.Warning
+}
+
+// SessionRule runs a session-scoped analysis pass over a session's whole
+// row history (oldest first) and returns findings whose Warning.EventID
+// already names the row each finding completed on -- possibly not the
+// row that just triggered this pass. internal/analyze.Engine satisfies
+// this structurally; Consumer never imports analyze, the same seam
+// discipline as Analyzer (the composition root wires the two together).
+type SessionRule interface {
+	AnalyzeSession(rows []*store.Event) []store.Warning
 }
 
 // Run drains the sink until ctx is cancelled or the sink is closed,
@@ -196,8 +209,16 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 			}
 		}
 
+		warningCount := len(pe.warnings)
+		if c.sessionRule != nil && pe.ev.SessionID != "" {
+			warningCount += c.runSessionRule(ctx, pe.ev.SessionID)
+		}
+
+		// Run last, after the session-scoped pass, so warning_count's
+		// re-derivation (ReconcileSession) counts findings that pass
+		// attached to earlier rows in this same session too.
 		if c.aggregator != nil && pe.ev.SessionID != "" {
-			if err := c.aggregator.RecordCall(ctx, pe.ev.SessionID, pe.ev, len(pe.warnings)); err != nil {
+			if err := c.aggregator.RecordCall(ctx, pe.ev.SessionID, pe.ev, warningCount); err != nil {
 				log.Printf("consumer: record session call for %s: %v", pe.ev.SessionID, err)
 			}
 		}
@@ -205,6 +226,34 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 	if wrote {
 		c.lastWriteAt.Store(time.Now().UnixNano())
 	}
+}
+
+// runSessionRule runs the session-scoped analysis pass over sessionID's
+// whole row history and upserts each finding onto the row it names,
+// grouped so a row with several findings gets one call. It returns how
+// many warnings it wrote, folded into the aggregator's warningCount.
+func (c *Consumer) runSessionRule(ctx context.Context, sessionID string) int {
+	rows, err := c.st.SessionEvents(ctx, sessionID)
+	if err != nil {
+		log.Printf("consumer: session rows for %s: %v", sessionID, err)
+		return 0
+	}
+	grouped := map[int64][]store.Warning{}
+	for _, w := range c.sessionRule.AnalyzeSession(rows) {
+		if w.EventID == 0 {
+			continue
+		}
+		grouped[w.EventID] = append(grouped[w.EventID], w)
+	}
+	n := 0
+	for eventID, warnings := range grouped {
+		if err := c.st.UpsertWarnings(ctx, eventID, warnings); err != nil {
+			log.Printf("consumer: upsert session warnings for event %d: %v", eventID, err)
+			continue
+		}
+		n += len(warnings)
+	}
+	return n
 }
 
 // drainRemaining opportunistically drains whatever is already buffered in

@@ -172,6 +172,30 @@ func (s *Store) GetEvent(ctx context.Context, id int64) (*Event, error) {
 	return scanEvent(row)
 }
 
+// SessionEvents returns sessionID's rows oldest-first, for the
+// session-scoped analyzer pass (br-GI-1-09) that compares consecutive
+// calls. Unlike ListEvents it takes no pagination: a session's row count
+// is already bounded by the session resolver's own gap window, since a
+// call beyond the gap gets a fresh session id rather than joining this
+// one.
+func (s *Store) SessionEvents(ctx context.Context, sessionID string) ([]*Event, error) {
+	rows, err := s.db.QueryContext(ctx, eventSelectColumns+" FROM events WHERE session_id = ? ORDER BY started_at ASC", sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("store: SessionEvents: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*Event
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: SessionEvents: %w", err)
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
 // ListEvents returns events matching filter, newest first, paginated by
 // filter.Limit/Offset.
 func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]*Event, error) {
