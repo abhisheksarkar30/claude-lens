@@ -1,0 +1,127 @@
+name: Branch Guard
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  issues: read
+  pull-requests: read
+
+jobs:
+  guard-branch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require PRs into main to come from a GI-<n>-<slug> story branch
+        id: branch
+        env:
+          # Passed via env rather than interpolated into the shell: a branch name can
+          # contain $(...) or backticks, which would execute inside a double-quoted
+          # "${{ github.head_ref }}". The title/body steps below already do this.
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          set -e
+          # Adapted from deepseek-lens, which hard-gates on head_ref == 'develop'. This
+          # repo has no develop -- v1 lands on main via a GI-<n>- branch (see CLAUDE.md,
+          # Enforcement) -- so the provenance that check provided is recovered by step 4
+          # below, which requires the branch's issue number to be one the PR body closes.
+          if ! echo "$HEAD_REF" | grep -qE '^GI-[0-9]+-[a-z0-9-]+$'; then
+            echo "::error::Pull requests into main must come from a 'GI-<n>-<slug>' branch, e.g. 'GI-1-claude-lens-v1'. Got '$HEAD_REF'."
+            exit 1
+          fi
+          echo "OK: branch '$HEAD_REF' is a story branch"
+          echo "branch_num=$(echo "$HEAD_REF" | grep -oE '^GI-[0-9]+' | grep -oE '[0-9]+')" >> "$GITHUB_OUTPUT"
+
+      - name: Require PR title to be prefixed with a GitHub issue number
+        id: issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -e
+          ISSUE_NUM=$(echo "$TITLE" | grep -oiE '^GI#[0-9]+' | grep -oE '[0-9]+' || true)
+          if [ -z "$ISSUE_NUM" ]; then
+            echo "::error::PR title must start with 'GI#<issue-number>' referencing an existing GitHub issue, e.g. 'GI#12 Fix login crash'. Got: \"$TITLE\""
+            exit 1
+          fi
+
+          IS_ISSUE=$(gh api "repos/${{ github.repository }}/issues/$ISSUE_NUM" --jq 'if .pull_request then "false" else "true" end' 2>/dev/null || echo "false")
+          if [ "$IS_ISSUE" != "true" ]; then
+            echo "::error::GI#$ISSUE_NUM in the PR title is not a valid GitHub issue in this repo."
+            exit 1
+          fi
+
+          echo "OK: PR references issue #$ISSUE_NUM"
+          echo "issue_num=$ISSUE_NUM" >> "$GITHUB_OUTPUT"
+
+      - name: Require PR body to link the issue with a closing keyword
+        id: closed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BODY: ${{ github.event.pull_request.body }}
+          ISSUE_NUM: ${{ steps.issue.outputs.issue_num }}
+        run: |
+          set -e
+          if ! echo "$BODY" | grep -qiE "(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#${ISSUE_NUM}([^0-9]|$)"; then
+            echo "::error::PR body must link issue #$ISSUE_NUM with a closing keyword, e.g. 'Closes #$ISSUE_NUM', so GitHub cross-references (and can close) the issue."
+            exit 1
+          fi
+          echo "OK: PR body links issue #$ISSUE_NUM"
+
+          # A branch that accumulates more than one fix between main merges spans more than one
+          # issue (each fix keeps its own GI#<id> commit prefix from when it was made) --
+          # so collect every issue number the PR body closes, not just the title's, and validate
+          # each is a real issue. Commits below may use any of these prefixes.
+          CLOSED_NUMS=$(echo "$BODY" | grep -oiE "(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+" | grep -oE '[0-9]+' | sort -un)
+          for NUM in $CLOSED_NUMS; do
+            IS_ISSUE=$(gh api "repos/${{ github.repository }}/issues/$NUM" --jq 'if .pull_request then "false" else "true" end' 2>/dev/null || echo "false")
+            if [ "$IS_ISSUE" != "true" ]; then
+              echo "::error::PR body closes #$NUM, which is not a valid GitHub issue in this repo."
+              exit 1
+            fi
+          done
+          CLOSED_CSV=$(echo "$CLOSED_NUMS" | paste -sd, -)
+          echo "closed_nums=$CLOSED_CSV" >> "$GITHUB_OUTPUT"
+          echo "OK: PR body closes issue(s): $CLOSED_CSV"
+
+      - name: Require the branch's issue to be one this PR closes
+        env:
+          BRANCH_NUM: ${{ steps.branch.outputs.branch_num }}
+          CLOSED_NUMS: ${{ steps.closed.outputs.closed_nums }}
+        run: |
+          set -e
+          # The develop gate in deepseek-lens proved a PR had been through the story-branch
+          # flow. With one hop to main there is no integration branch to prove it, so bind
+          # the branch to the same set of issues the commits are already bound to.
+          if ! echo ",$CLOSED_NUMS," | grep -q ",$BRANCH_NUM,"; then
+            echo "::error::Branch is named for GI-$BRANCH_NUM, but the PR body closes only: $CLOSED_NUMS. Name the branch for an issue it closes, or add a closing keyword for #$BRANCH_NUM."
+            exit 1
+          fi
+          echo "OK: branch issue #$BRANCH_NUM is among the issues this PR closes"
+
+      - name: Require every commit message to start with a GI#<id> this PR closes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          CLOSED_NUMS: ${{ steps.closed.outputs.closed_nums }}
+        run: |
+          set -e
+          BAD=0
+          # Merge commits (2+ parents, e.g. GitHub's own "Merge pull request #N from ...") are
+          # excluded from this check by the jq filter below -- they're auto-generated and never
+          # carry a GI#<id> prefix, unlike every hand-authored commit in this repo's history.
+          while IFS=$'\t' read -r SHA MSG; do
+            COMMIT_NUM=$(echo "$MSG" | grep -oiE '^GI#[0-9]+' | grep -oE '[0-9]+' || true)
+            if [ -z "$COMMIT_NUM" ] || ! echo ",$CLOSED_NUMS," | grep -q ",$COMMIT_NUM,"; then
+              echo "::error::Commit $SHA does not start with a GI#<id> that this PR's body closes (closed: $CLOSED_NUMS): \"$MSG\""
+              BAD=1
+            fi
+          done < <(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/commits" --paginate \
+            --jq '.[] | select((.parents | length) < 2) | [.sha, (.commit.message | split("\n")[0])] | @tsv')
+
+          if [ "$BAD" -eq 1 ]; then
+            echo "::error::Every commit in this PR must start with 'GI#<id>' where <id> is one of the issues this PR's body closes: $CLOSED_NUMS."
+            exit 1
+          fi
+          echo "OK: all commits in PR #$PR_NUMBER reference an issue this PR closes"

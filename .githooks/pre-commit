@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Delegates to the machine-wide secret scan, which lives once in
+# agentic-ai-artifacts/git-hooks/ -- nothing is duplicated here.
+#
+# This is needed because the repo pins core.hooksPath to .githooks (see CLAUDE.md,
+# Setup), and a repo-local value beats the global one, so the global pre-commit
+# would otherwise never run here.
+#
+# Machine-local by nature: the scan it calls has to be installed per machine, so
+# this refuses every commit until it is.
+set -u
+
+scan="${XDG_CONFIG_HOME:-$HOME/.config}/git/hooks/pre-commit"
+
+if [ ! -x "$scan" ]; then
+  cat >&2 <<'MSG'
+pre-commit: the machine-wide secret scan is not installed.
+  Run git-hooks/install.sh from your agentic-ai-artifacts checkout.
+
+Refusing the commit rather than silently skipping the scan. Run `git config core.hooksPath .githooks`
+once per clone to arm this hook; there is no build step to do it for you.
+
+git commit --no-verify gets past it, but skips every hook in core.hooksPath -- including
+.githooks/commit-msg, the GI#<n> prefix gate that branch-guard.yml enforces at the merge
+to main. Keep it to a genuine emergency.
+MSG
+  exit 1
+fi
+
+exec "$scan" "$@"

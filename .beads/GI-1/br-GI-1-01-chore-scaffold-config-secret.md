@@ -108,7 +108,15 @@ via a `GI-1-…` branch), so both guards would reject exactly the workflow the p
 with this story's own PR. Adapt the `head_ref` predicate to accept the `GI-<n>-…` shape and drop the
 `develop -> main` provenance requirement (or introduce `develop`, which the plan explicitly defers).
 Keep the `GI#<n>` title-prefix check unchanged — that part is correct and is the reason the guards
-exist. The plan at v6 states this adaptation requirement; this bead is where it is discharged.
+exist. The plan at v6 states this adaptation requirement; **it was discharged ahead of this bead**,
+in the governance commit that landed `CLAUDE.md`, both workflow files, the two hooks, `.gitignore`
+and `LICENSE` (`GI#1 chore: adopt deepseek-lens repository governance conventions`). This bead
+therefore **verifies** those files rather than creating them, and arms the hooks with
+`git config core.hooksPath .githooks`. The adaptation actually taken: the `head_ref` predicate
+became `^GI-[0-9]+-[a-z0-9-]+$`, `main-guard`'s jq filter became `.head.ref | test("^GI-[0-9]+-")`,
+and — because one hop to `main` no longer proves a PR came through the story-branch flow the way
+`develop` did — `branch-guard` gained a fourth step requiring the branch's issue number to be one
+the PR body closes.
 
 ## Rationale
 
@@ -157,10 +165,11 @@ import it, and br-GI-1-18 asserts that.
 
 ## Files to Touch
 
-- `go.mod`, `.gitignore`, `LICENSE`, `README.md` (create)
+- `go.mod`, `README.md` (create)
+- `.gitignore`, `LICENSE`, `CLAUDE.md` (verify — already committed by the governance commit)
+- `.githooks/commit-msg`, `.githooks/pre-commit` (verify, then arm via `core.hooksPath`)
+- `.github/workflows/branch-guard.yml`, `.github/workflows/main-guard.yml` (verify — already adapted)
 - `cmd/clens/main.go` (create — dispatch map skeleton)
 - `internal/config/config.go`, `internal/config/config_test.go` (create)
 - `internal/secret/secret.go`, `internal/secret/secret_test.go` (create)
 - `internal/cli/doctor.go`, `internal/cli/doctor_test.go` (create)
-- `.githooks/commit-msg`, `.githooks/pre-commit` (create)
-- `.github/workflows/branch-guard.yml`, `.github/workflows/main-guard.yml` (create)

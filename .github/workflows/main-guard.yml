@@ -1,0 +1,52 @@
+name: Main Guard
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: read
+# main is the repo's default branch, so GitHub natively links/auto-closes
+# issues referenced via "Closes #N" in story-branch -> main PRs -- no manual step needed here.
+
+jobs:
+  verify-source:
+    runs-on: ubuntu-latest
+    if: github.event.before != '0000000000000000000000000000000000000000'
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Verify this commit landed via an approved story-branch PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -e
+          RESPONSE=$(gh api "repos/${{ github.repository }}/commits/$SHA/pulls")
+          # Adapted from deepseek-lens, which requires head.ref == 'develop'. This repo has
+          # no develop (see CLAUDE.md, Enforcement), so any merged PR from a GI-<n>-<slug>
+          # branch qualifies; branch-guard.yml is what constrains what such a PR may contain.
+          COUNT=$(echo "$RESPONSE" | jq '[.[] | select(.base.ref=="main" and (.head.ref | test("^GI-[0-9]+-")) and .merged_at != null)] | length')
+
+          if [ "$COUNT" -ge 1 ]; then
+            echo "OK: $SHA came from an approved story-branch -> main pull request."
+            exit 0
+          fi
+
+          echo "::error::Commit $SHA landed on main outside the story-branch PR flow. Reverting main to $BEFORE."
+          git reset --hard "$BEFORE"
+          git push --force origin HEAD:main
+
+          gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "main was pushed to outside the story-branch PR flow and was auto-reverted" \
+            --body "Commit \`$SHA\` (pushed by @${{ github.actor }}) landed on \`main\` without going through a merged \`GI-<n>-<slug>\` -> \`main\` pull request. It has been automatically reverted back to \`$BEFORE\`. Please make changes on a \`GI-<n>-<slug>\` branch and open a PR into \`main\` instead."
+
+          exit 1

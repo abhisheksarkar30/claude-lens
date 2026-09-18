@@ -1,17 +1,49 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/clens
+/clens.exe
+dist/
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Editor/IDE
+# .idea/
+# .vscode/
+
 # Local database — never commit (may hold captured prompt content)
 *.db
 *.db-wal
 *.db-shm
 
 # Local config and credentials. The default config dir is ~/.clens/, outside the
-# repo; these rules are belt-and-braces for a config dir pointed inside it.
+# repo, so gitignore has nothing to do there (a literal "~/..." pattern doesn't
+# expand to $HOME and would never match it anyway). These guard only a repo-local
+# override via --db-path, --config, or the equivalent prices path.
 config.toml
 accounts.toml
 secrets.toml
+prices.toml
 
-# Cross-review artifacts
+# Local cross-review artifacts (should never be committed)
 /**/*review*/
-
-# Built binary
-/clens
-/clens.exe
