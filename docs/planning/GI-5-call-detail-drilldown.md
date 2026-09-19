@@ -188,9 +188,9 @@ function reveal(view) {
 
 async function show(view) {
   reveal(view);
-  // Both details close on ANY tab click, unconditionally. A reset guarded by
-  // `view === 'calls'` would leave a detail open when the user leaves via
-  // Overview or Warnings -- and both of those render their own data-call links,
+  // Both details close on ANY tab click, unconditionally. A reset guarded by the
+  // tab's own name would leave a detail open when the user leaves via Overview
+  // or Warnings -- and both of those render their own data-call links,
   // so the next drill-down would reveal the previous call's request and response
   // bodies under a click for a different call until the fetch resolved.
   setCallDetail(false);
@@ -533,8 +533,19 @@ only its result discarded.
 | `internal/web/style.css` | `scroll-margin-top` on the two detail containers. |
 | `internal/web/assets_test.go` | The wiring guard (§5, T1–T3). |
 | `docs/context/dashboard.md` | Correct "click a row" and document the two modes per view (Phase 5.6). |
+| `docs/planning/GI-5-call-detail-drilldown.md` | New §10: the recorded manual run (T5), appended during implementation. |
 
 Nothing else. No Go handler, no store, no schema, no config, no dependency, no build step.
+
+The last row is the one file here that is not source: T5's run has to land somewhere, and §5 T5 says
+the story follows `docs/acceptance.md`'s precedent without naming a home. The **plan doc** is that
+home — recorded in §10 beside the runbook it reports on. `docs/acceptance.md` is the precedent for
+the *practice*, but its own header scopes it to br-GI-1-19's acceptance run and its Local-half /
+Live-half shape is a whole-product run, so a story-scoped UI click-through would be misfiled there
+(and would make [testing-and-quality.md:48](context/testing-and-quality.md#L48)'s "one recorded
+manual run" claim wrong). `docs/context/` cannot hold one at all — that tree is generated, and a
+hand-written runbook there is clobbered by the next refresh. Named here because §4's list is the
+contract Phase 3 derives beads from, and it was incomplete without it.
 
 ---
 
@@ -642,6 +653,15 @@ the *property*, not the substrings. Extract `show`'s body with `funcBody(js, "sh
 2. the body does **not** contain `view ===` — the unconditional-reset property, and the negative that
    catches a re-added guard around either reset.
 
+   This is a **raw-text** assertion, so the literal is banned from `show`'s body entirely, prose
+   included: it cannot tell a re-added guard from a comment that quotes one. D3's `show` comment is
+   worded around that on purpose ("a reset guarded by the tab's own name", never the comparison
+   itself) — see D3, and do not reword it to spell the comparison out. A future comment that
+   re-introduces the string fails this test: a false positive in principle, a loud one in practice,
+   and cheaper than the comment-stripping regex it would take to avoid. `reveal`'s body *does*
+   contain `b.dataset.view === view`, which is exactly why the assertion is scoped by
+   `funcBody(js, "show")` and not run over the file.
+
 Without assertion 2 a tab click can leave the user staring at a detail while the loader fetches a
 list behind it — precisely the pre-F2.1 bug, with both literals present.
 
@@ -667,7 +687,9 @@ pairs this repo runs under it ([build-and-run.md:16](../../docs/context/build-an
 ### T5 — recorded manual click-through
 
 No E2E harness exists; `docs/acceptance.md` is the precedent for a recorded manual run, and this
-story follows it rather than inventing a suite. The runbook, to be executed against
+story follows the practice rather than inventing a suite. **The run itself is recorded in §10 of
+this plan** — see §4's last row for why that is the home rather than `docs/acceptance.md` or the
+generated `docs/context/` tree. The runbook, to be executed against
 `go run ./cmd/clens serve` at `http://127.0.0.1:8798` with a populated store:
 
 | # | Step | Expected |
@@ -815,6 +837,13 @@ already loopback-bound.
 Beads 01–04 are one logical change split only where a reviewer would want a separate checkpoint;
 beads 06 and 07 are the guard and the docs. Whether 01–05 collapse into fewer beads is Phase 3's
 call — the split above is a sketch, not a commitment.
+
+**Phase 3 took that call: 01–05 landed as one bead (`br-GI-5-01`); 06 and 07 stayed separate, as
+`br-GI-5-02` (the wiring guard) and `br-GI-5-03` (the docs and the recorded run). The table above is
+the sketch, not the decomposition — `.beads/GI-5/` is the artifact of record.** The collapse went
+further than "one logical change": §9's 02 ships primitives that are inert until 03's renderers use
+them, and 01's `hidden` attributes leave the detail permanently invisible until 03 un-hides it — so
+the sketch's halves are unsafe in *either* landing order, not merely unverifiable alone.
 
 ---
 
@@ -1011,3 +1040,34 @@ the **§8 addition**. No finding rejected.
   `#calls-table` (`app.js:124-144`), so the residual is a stale status line and a redundant write to a
   possibly-hidden table, never a mode flip or a corrupted detail. Pre-existing and unchanged by this
   story — named, not fixed.
+
+### v6.1 — Phase 3/4 correction: the plan's code failed the plan's own test (2026-09-19)
+
+Not a review round — a defect found while polishing the beads Phase 3 derived from this plan, and
+found in **this document**, not in a bead. Three changes, no design change of any kind.
+
+- **D3's `show` comment contradicted §5 T3.** Both existed since v3 (the comment) and v4 (T3's
+  negative, F3.2), and no round caught that they cannot both hold: T3 asserts `show`'s body does not
+  contain the literal `view ===`, and D3's comment spelled the comparison out inside that very body.
+  An implementer copying D3 would have written code that fails T3 — a guard failing on *correct*
+  code, which is the one failure mode the review spent six rounds trying to eliminate in the other
+  direction. The comment now says "a reset guarded by the tab's own name", which carries the same
+  reason without the banned literal, and both D3 and T3 now state the constraint and why it exists
+  (a raw-text assertion cannot distinguish a re-added guard from a comment quoting one; the
+  alternative is comment-stripping regex no other test in the file has). `reveal`'s
+  `b.dataset.view === view` is unaffected — T3 is scoped by `funcBody(js, "show")`, which is what
+  the scoping was for.
+- **§4's "Files changed" contract omitted T5's home.** §5 T5 cites `docs/acceptance.md` as the
+  precedent for a recorded manual run and says this story follows it, but §4 listed only
+  `docs/context/dashboard.md` for documentation and never named where the run is written — the one
+  place Phase 3's bead author had to make a call this plan did not cover. Resolved in favour of a
+  new **§10 of this plan**, with §4 gaining the row and §5 T5 naming it: `docs/acceptance.md` is the
+  precedent for the *practice*, but its header scopes it to br-GI-1-19's acceptance run and its
+  Local-half / Live-half shape is a whole-product run, and `docs/context/` is generated so it cannot
+  hold a hand-written runbook at all.
+- **The §9 bead sketch's split was replaced, not edited.** Phase 3 collapsed §9's beads 01–05 into
+  one bead (its 02's primitives are inert without 03's renderers, and 01's `hidden` attributes make
+  the detail permanently invisible until 03 un-hides it — unsafe in *either* landing order, which is
+  a stronger argument than §9's own "one logical change"). §9 said this was Phase 3's call
+  explicitly, so nothing here was contradicted. Recorded because §9's table now describes a split
+  that does not exist; the beads are the artifact of record.
