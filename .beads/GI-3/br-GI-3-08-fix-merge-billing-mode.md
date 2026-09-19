@@ -1,6 +1,6 @@
 # Bead br-GI-3-08: `mergeEvents` moves `billing_mode` with the winning cost columns
 
-**Plan Reference**: `docs/planning/GI-3-deepseek-peak-pricing.md` — §3 D6/D7, §4 (`store/merge.go`, `store/store_test.go`), §5 T8/T9/T9b, §6 R7 (plan sketch §9 bead 6)
+**Plan Reference**: `docs/planning/GI-3-deepseek-peak-pricing.md` — §3 D6/D7 (fix as amended in **v9**), §4 (`store/merge.go`, `store/store_test.go`), §5 T8/T9/T9b/**T9c**, §6 R7 (plan sketch §9 bead 6)
 
 - **Bead ID**: br-GI-3-08
 - **Priority**: P0 (critical)
@@ -14,9 +14,19 @@
 
 `mergeEvents` (`internal/store/merge.go:144-212`) takes `winner = incoming` when both captures are
 complete, and the cost columns move with it (`merge.go:171-173`). But `account`/`billing_mode` use
-`preferNonEmpty(existing, incoming)` (`merge.go:185-187`). Since `existing.BillingMode` is
-**always** non-empty, **a merge can never correct `billing_mode` — while it does adopt the incoming
-cost.**
+`preferNonEmpty(existing, incoming)` (`merge.go:185-187`). `existing.BillingMode` is non-empty for
+every row reachable today, so **a merge could never correct `billing_mode` — while it does adopt the
+incoming cost.**
+
+> **Amended in plan v9 (Phase 5.5, round 1).** This bead originally said "**always** non-empty".
+> That universal is false: the column is `billing_mode TEXT NOT NULL DEFAULT ''`
+> (`schema.sql:15`), and `billingModeForAuthKind` returns `""` for a credential the classifier does
+> not recognize (`consumer.go:470-479`), which is what `ClassifyAuthKind` returns for anything that
+> is neither `x-api-key` nor a `Bearer sk-ant-oat…` token (`authkind.go:35-59`). A capture-complete
+> proxy row can therefore carry an empty mode, and an unconditional
+> `merged.BillingMode = winner.BillingMode` would **blank** a non-empty one — dropping the row out
+> of all three cost aggregates, which key on `billing_mode = 'api'`/`'subscription'`
+> (`store.go:500-501`, `store.go:1113-1114`, `store.go:1178`). The fix below handles it.
 
 Consequence once br-GI-3-07 lands: `clens ingest --rebuild` is the only re-pricing path (the store
 has **no** reprice function; `--rebuild` zeroes every `jsonl:` cursor so the next poll re-reads
@@ -25,14 +35,52 @@ merge would write that `cost_usd` onto a row still marked `billing_mode='subscri
 the pair invariant 5 forbids** — and `TestBillingModeInvariants` would not catch it, because it
 exercises the **insert** path only and never a merge (`internal/store/store_test.go:180`).
 
-**Fix — move `billing_mode` only onto `winner`:**
+**Fix — move `billing_mode` only onto `winner`, deriving it from the winner's cost column when the
+winner has no mode:**
 
 ```go
-merged.BillingMode = winner.BillingMode   // was preferNonEmpty(existing, incoming)
+// The ordinary case: the winner's mode labels its own cost columns.
+merged.BillingMode = winner.BillingMode
+// The winner's capture could not classify its credential, so it hands over no
+// mode. Invariant 5 carries a figure's billing model in the column it lives in,
+// so derive the label from the column the winner actually priced. Falling back
+// to the loser's mode instead would pair the winner's CostUSD with a
+// "subscription" label -- the exact illegal pair this change exists to remove,
+// and one that contributes 0 to both aggregates because the subscription sum
+// reads the very column now left NULL.
+if merged.BillingMode == "" {
+    switch {
+    case winner.CostUSD != nil:
+        merged.BillingMode = "api"
+    case winner.ApiEquivalentCostUSD != nil:
+        merged.BillingMode = "subscription"
+    default:
+        // The winner priced nothing, so there is no cost for a label to
+        // describe and nothing for the loser's mode to contradict. Keep the
+        // stored mode rather than blanking it -- an empty mode drops the row
+        // out of every billing_mode-keyed grouping for no gain.
+        merged.BillingMode = existing.BillingMode
+    }
+}
 ```
 
 `billing_mode` is the one column a cross-source merge is now expected to contradict (the JSONL
-tailer resolves it by model prefix, D5).
+tailer resolves it by model prefix, D5). The derivation matches what the writer already did: both
+cold-path pricers route cost by `switch ev.BillingMode { case "subscription": ApiEquivalentCostUSD
+…; default: CostUSD … }` (`consumer.go:317-320`, `jsonlogs.go:409-414`), so an empty mode already
+means "the money went to `cost_usd`". Read the rule as "the label follows the money".
+
+**The `default:` branch is not a retreat to the loser's mode.** It applies only when the winner
+priced nothing, so no cost column exists for the adopted label to contradict — the invariant-5 risk
+that rules the loser's mode out everywhere else is absent. It also gets this story's own case right:
+a DeepSeek call through the proxy with an unrecognized credential leaves the winner unpriced and
+modeless, and the stored JSONL row's prefix-derived `api` is the better answer to keep.
+
+**The rejected repair, recorded so it is not re-proposed.** Taking the *loser's* mode when the
+winner's is empty looks like the obvious minimal fix and is worse than the defect: it pairs the
+winner's `cost_usd` with the loser's `subscription` label, producing the exact invariant-5 pair this
+bead exists to remove, while contributing 0 to both aggregates anyway because the subscription sum
+reads `api_equivalent_cost_usd`, which the winner left NULL.
 
 **`Account` stays `preferNonEmpty(existing, incoming)`.** `Account` is a separate column the JSONL
 tailer structurally cannot supply: the JSONL line "carries no auth signal" (`jsonlogs.go:76-84`).
@@ -74,6 +122,9 @@ forever to protect a column from a value that is simply wrong.
 - A merge where the incoming side is **not** complete leaves `billing_mode` unchanged (T9).
 - A merge where the incoming JSONL side has an **empty** `account` preserves the non-empty proxy
   `account` (T9b).
+- A merge whose winner is capture-complete with `billing_mode == ''` and its cost in `cost_usd`
+  lands on `billing_mode='api'` with `cost_usd` intact — **not** blanked, and **not**
+  `subscription`+`cost_usd` (T9c).
 - `AuthKind` is still resolved by `preferNonEmpty`.
 - `TotalPromptTokens` after a merge still equals the sum of the four prompt classes (invariant 4).
 
@@ -93,6 +144,13 @@ forever to protect a column from a value that is simply wrong.
     `preferNonEmpty` by making the incoming side's value *different* and asserting the existing
     side's survives, with the incoming side's cost winning in the same merge — so a winner-based
     assignment cannot pass it by accident.
+  - **T9c** (plan v9): merge a capture-complete proxy row with `BillingMode == ""` and a non-nil
+    `CostUSD` over a stored `subscription` row. Assert the result is `BillingMode == "api"` with
+    `CostUSD` intact and `ApiEquivalentCostUSD` nil. Add the mirror case — winner `BillingMode == ""`
+    with `ApiEquivalentCostUSD` set → `"subscription"` — and the residual one — winner priced
+    nothing → the stored mode survives instead of being blanked, and `CostUSD` /
+    `ApiEquivalentCostUSD` both stay nil (the "subscription unpriced" / "api unpriced" shapes
+    `TestBillingModeInvariants` already declares legal).
 - Unit Tests (`internal/store/store_test.go`):
   - Extend `TestBillingModeInvariants` to cover the **merge** path, not just the insert path.
 - Integration Tests: none.

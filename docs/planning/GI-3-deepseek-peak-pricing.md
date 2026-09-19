@@ -1,6 +1,6 @@
 # GI-3 — DeepSeek peak/off-peak pricing and third-party rate support
 
-**Ticket**: GI#3 · **Branch**: `GI-3-deepseek-peak-pricing` · **Base**: `main` · **Plan version**: 8 · **Status**: converged
+**Ticket**: GI#3 · **Branch**: `GI-3-deepseek-peak-pricing` · **Base**: `main` · **Plan version**: 9 · **Status**: converged
 
 Problem statement: [issue #3](https://github.com/abhisheksarkar30/claude-lens/issues/3).
 
@@ -469,9 +469,26 @@ prefix-matched case only; the comment stays and is amended to say so.
 `mergeEvents` takes `winner = incoming` when both captures are complete, and the
 cost columns move with it ([merge.go:171-173](internal/store/merge.go#L171-L173)).
 But `account`/`billing_mode` use `preferNonEmpty(existing, incoming)`
-([merge.go:185-187](internal/store/merge.go#L185-L187)). Since
-`existing.BillingMode` is **always** non-empty, **a merge can never correct
+([merge.go:185-187](internal/store/merge.go#L185-L187)). `existing.BillingMode` is
+non-empty for every row reachable today, so **a merge could never correct
 `billing_mode` — while it does adopt the incoming cost.**
+
+> **v9 correction.** An earlier draft of this section said "**always**
+> non-empty". That universal is false, and the code does not rely on it — but a
+> false premise under a load-bearing assignment is how the next reader is misled,
+> so it is corrected rather than left standing. The column is
+> `billing_mode TEXT NOT NULL DEFAULT ''` ([schema.sql:15](internal/store/schema.sql#L15)),
+> and `billingModeForAuthKind` returns `""` for a credential the classifier does
+> not recognize ([consumer.go:470-479](internal/consumer/consumer.go#L470-L479)),
+> which `ClassifyAuthKind` returns for anything that is neither `x-api-key` nor a
+> `Bearer sk-ant-oat…` token ([authkind.go:35-59](internal/proxy/authkind.go#L35-L59)).
+> So a capture-complete proxy row **can** carry an empty mode, and assigning
+> `winner.BillingMode` unconditionally would blank a non-empty mode — dropping the
+> row out of all three cost aggregates, which key on
+> `billing_mode = 'api'`/`'subscription'`
+> ([store.go:500-501](internal/store/store.go#L500-L501),
+> [store.go:1113-1114](internal/store/store.go#L1113-L1114),
+> [store.go:1178](internal/store/store.go#L1178)). The fix below handles it.
 
 Consequence for this story: `clens ingest --rebuild` is the only re-pricing path
 (`insertOrMerge` via `--rebuild`, which zeroes every `jsonl:` cursor so the next
@@ -484,11 +501,48 @@ path and never a merge.
 
 **Fix**: move **`billing_mode` only** onto `winner` — the one column a cross-source
 merge is now expected to contradict (the JSONL tailer resolves it by model prefix,
-D5). `account` stays on `preferNonEmpty`.
+D5) — and **derive it from the winner's cost columns when the winner has no mode to
+hand over**. `account` stays on `preferNonEmpty`.
 
 ```go
-merged.BillingMode = winner.BillingMode   // was preferNonEmpty(existing, incoming)
+// The ordinary case: the winner's mode labels its own cost columns.
+merged.BillingMode = winner.BillingMode
+// The winner's capture could not classify its credential, so it hands over no
+// mode. Invariant 5 carries a figure's billing model in the column it lives in,
+// so derive the label from the column the winner actually priced. Falling back
+// to the loser's mode instead would pair the winner's CostUSD with a
+// "subscription" label -- the exact illegal pair this change exists to remove,
+// and one that contributes 0 to both aggregates because the subscription sum
+// reads the very column now left NULL.
+if merged.BillingMode == "" {
+    switch {
+    case winner.CostUSD != nil:
+        merged.BillingMode = "api"
+    case winner.ApiEquivalentCostUSD != nil:
+        merged.BillingMode = "subscription"
+    default:
+        // The winner priced nothing, so there is no cost for a label to
+        // describe and nothing for the loser's mode to contradict. Keep the
+        // stored mode rather than blanking it -- an empty mode drops the row
+        // out of every billing_mode-keyed grouping for no gain.
+        merged.BillingMode = existing.BillingMode
+    }
+}
 ```
+
+The derivation matches what the writer did: both cold-path pricers route cost by
+`switch ev.BillingMode { case "subscription": ApiEquivalentCostUSD …; default: CostUSD … }`
+([consumer.go:317-320](internal/consumer/consumer.go#L317-L320),
+[jsonlogs.go:409-414](internal/jsonlogs/jsonlogs.go#L409-L414)), so an empty mode
+already means "the money went to `cost_usd`".
+
+**The `default:` branch is not a retreat to the loser's mode.** It applies only when
+the winner priced nothing, so there is no cost column for the adopted label to
+contradict — the invariant-5 risk that rules the loser's mode out everywhere else is
+absent here. It also gets the story's own case right: a DeepSeek call through the
+proxy with an unrecognized credential leaves the winner unpriced and modeless, and
+the stored JSONL row's prefix-derived `api` is the better answer to keep. A
+mode-carrying winner still overrides it on the next merge.
 
 `Account` **stays `preferNonEmpty(existing, incoming)`**. The agreement argument
 above is about `billing_mode`; `account` is a separate column the JSONL tailer
@@ -505,7 +559,25 @@ row has nothing to contribute there either.
 sides disagree now takes the JSONL side's `billing_mode`. The "in practice they
 agree" argument holds **only** for a DeepSeek call that *also* passed through the
 proxy: it carries an `api_key` credential, so `auth_kind` resolves it to `api` and
-both sides already say `api`. The case where the two sides genuinely disagree — a
+both sides already say `api`.
+
+> **v9 — the agreement argument, checked against the real database.** It is
+> narrower than it reads. Querying `~/.clens/lens.db` read-only:
+>
+> | source | auth_kind | billing_mode | rows |
+> |---|---|---|---|
+> | jsonl | (empty) | subscription | 77,951 |
+> | proxy | api_key | api | 1 |
+>
+> All **60,963** DeepSeek rows are `source='jsonl'`; there is exactly **one**
+> proxy row in the entire database, and it is `api_key`/`api`. So the
+> disagreeing-merge case has **no traffic to fire on today** — it needs a second
+> capture-complete proxy row carrying an unrecognized credential — and the
+> backfill's merge is JSONL-incoming over a JSONL-existing row, both sides
+> non-empty. This makes D6's fix load-bearing for the ordinary backfill (the
+> merged mode must flip to `api` so the priced `cost_usd` counts) while the case
+> the correction above adds handling for stays latent. Recorded so the next
+> reader does not over- or under-read the guarantee. The case where the two sides genuinely disagree — a
 credential that resolves to `subscription` (i.e. `oauth`/`cloud`, per
 `billingModeForAuthKind`,
 [consumer.go:442-451](internal/consumer/consumer.go#L442-L451)) on a model whose
@@ -632,7 +704,7 @@ hide it.
 | `internal/cli/cli_test.go` | The `newTailer` guard case read through `Account()` (**T18**, br-GI-3-06 / bead 4b); **T14** read through `ModelBilling()` (br-GI-3-07) (D5, v7) |
 | `internal/api/prices.go` | The partial-`Rate` builder inherits write rates **only from a zero-write shipped row** (F2.2). **No `peak_multiplier`** field on the row or on `setPricesRequest` (F2.6 — `Peak` is config-derived, so the field would silently no-op *and* break the GET→POST round-trip, which decodes with `DisallowUnknownFields`) |
 | `internal/api/api_test.go`, `internal/api/prices_test.go` | `NewLoader` call-site updates (7 sites); plus a zero-write-inheritance behavioural case on the POST builder — a shipped zero-write row, not the no-shipped-row `claude-custom-1` fixture (T5, F5.3) |
-| `internal/store/merge.go` | D6 fix — `BillingMode` moves with `winner` (only) |
+| `internal/store/merge.go` | D6 fix — `BillingMode` moves with `winner`, derived from the winner's cost column when the winner has no mode (v9) |
 | `internal/store/store_test.go` | Extend `TestBillingModeInvariants` to cover the **merge** path |
 | `internal/consumer/consumer.go` | `PeakComputer` assertion + `peak_pricing` attach |
 | `internal/analyze/kinds.go` | `KindPeakPricing` + `nonAnalyzeKinds` entry |
@@ -661,6 +733,7 @@ interface beside it rather than widening it), `Table.Compute`'s signature,
 | T8 | **Merge the two**: insert a `subscription` DeepSeek row, merge a priced `api` DeepSeek row over it, assert the result has `cost_usd` set **and** `billing_mode='api'` **and** `api_equivalent_cost_usd` nil | D6 — the defect that is silent today |
 | T9 | Merge where the incoming side is *not* complete leaves `billing_mode` unchanged | D6 regression |
 | T9b | Merge where the incoming JSONL side has an **empty** `account` preserves the non-empty proxy `account` (D6 leaves `Account` on `preferNonEmpty`) | D6 `Account` non-regression |
+| T9c | Merge a capture-complete proxy row whose `billing_mode` is `''` and whose cost landed in `cost_usd` over a stored `subscription` row: the result is `billing_mode='api'` with `cost_usd` intact — **not** blanked, and **not** `subscription`+`cost_usd`. Mirrors: cost in `api_equivalent_cost_usd` → `subscription`; winner priced nothing → the stored mode survives rather than blanking. | D6 v9 — the empty-mode derivation |
 | T10 | Config: both keys parse from **file and env** (there are no flags for them); malformed date rejected by `Validate`; `none` yields a non-nil empty slice for either key while an unset key yields `nil`; and **`resolvedAPIPrefixes(cfg)`** resolves an unset `ApiModelPrefixes` to the shipped `{"deepseek-"}` while a non-nil list (`acme-`) **replaces** it wholesale — asserted on the helper, not on any unreachable wiring site (F2.1, F3.2) | D4 |
 | T11 | `peak_pricing` fires on a peak-billed priced row **via the `insert` path** ([jsonlogs.go:366-381](internal/jsonlogs/jsonlogs.go#L366-L381)) and via the consumer path, does **not** fire on the same row off-peak, and does **not** fire on an unpriced row at a peak instant (F2.7) | D8 |
 | T12 | `readme_test.go` passes unchanged — proving the new kind's spelling, severity, and emitted-by cell all agree | D8 bookkeeping |
@@ -732,6 +805,12 @@ All tests must pass with `go test ./...` and `go vet ./...` clean.
   proxy row is not blanked. The alternative — leaving `preferNonEmpty` and instead
   suppressing the incoming cost when modes disagree — is worse: it would leave 57k
   rows unpriced forever to protect a column from a value that is simply wrong.
+  **v9:** the one case the original fix got wrong was the winner having *no* mode
+  rather than a differing one. Handing the loser's mode back (the obvious repair)
+  is worse than the disease — it pairs the winner's `cost_usd` with a
+  `subscription` label and contributes 0 to both aggregates anyway. Deriving the
+  label from the winner's populated cost column is what invariant 5 actually
+  says; see D6.
 
 ### As a QA engineer
 
@@ -808,7 +887,7 @@ Ordering is load-bearing: **the merge fix (D6) must land before the backfill (D7
 
     — into one helper, homed beside the D4 helpers, **taking the root as an explicit parameter** — `newTailer(cfg, root, st)` — because `runIngest`'s `root` and `addCollectors`' `jsonlRoot()` are distinct expressions and only one is the settled default; a helper that resolved the root internally would silently drop ingest's. **`SetModelBilling` is out of this bead's scope — it joins in bead 5.** The bead **does** add one read-only `Account()` accessor (D5, v7): it changes no behaviour, but it means 4b's diff is no longer *only* a move — stated here rather than left to be noticed. The two callers keep their own drive logic (`resetJSONLCursors` + one `Poll` in `runIngest`; collector registration in `addCollectors`) — **only construction collapses**. **Behaviour-preserving: the moved block is a pure move, guard included** (F5.1 — the `acct.Name != ""` guard is part of the moved block, so the extraction cannot silently re-route billing). Lands **before** bead 5 so that bead's diff shows only the semantic change and stays bisectable. (F4.2 standing-watch — escalation resolved as option (b))
 5. JSONL per-row billing routing + api-account wiring (D5) — the `SetModelBilling(resolvedAPIPrefixes(cfg), …)` attach joins `newTailer` (bead 4b), so the wiring lands in one place rather than mirrored per site
-6. `mergeEvents` `BillingMode` move + merge-path invariant test (D6, T8/T9/T9b)
+6. `mergeEvents` `BillingMode` move + merge-path invariant test (D6, T8/T9/T9b/T9c)
 7. API/CLI surface + backfill documentation (D7)
 8. `peak_pricing` warning: optional `PeakComputer` interface, both call sites (consumer + JSONL **`insert`**), kind + README row + the "Four of these" → "**Five**" prose **with the enumeration grown to five** (D8, T11/T12, F2.7/F2.8/F3.3)
 
@@ -1077,3 +1156,43 @@ F7.3 (br-GI-3-05's `resolvedAPIPrefixes`/unhomed integration assertions) and F7.
 `Account()`/`ModelBilling()`) remain **deferred bead-side** to the bead owner
 (`develop-story`) by human decision — not plan defects, and no compensating text was
 added to any plan section for either.
+
+### v9 — Phase 5.5 impl cross-review, round 1 (2026-09-19)
+
+**Changes the plan, not the code.** After all ten beads were implemented, committed,
+and pushed, `autonomous-loop:impl-conductor` ran its first review round and
+**escalated one defect in the plan itself** (category `spec`, minor) rather than in
+the code: D6's premise that `existing.BillingMode` is "**always** non-empty" is
+false, and the mandated assignment `merged.BillingMode = winner.BillingMode` inherits
+the flaw — a capture-complete proxy row with an unrecognized credential carries
+`billing_mode = ''`, so a reverse-ordering merge can blank a non-empty mode and drop
+the row out of all three cost aggregates. The reviewer's proposed repair — take the
+loser's mode when the winner's is empty — was **rejected on inspection**: it pairs
+the winner's `cost_usd` with the loser's `subscription` label, which is the exact
+invariant-5 pair D6 exists to remove, and it contributes 0 to both aggregates anyway
+because the subscription sum reads the column that would be left NULL.
+
+**Resolution (human decision)**: correct the premise; assign the winner's mode when
+it has one; when it does not, **derive the label from the column the winner actually
+priced** — `cost_usd` → `api`, `api_equivalent_cost_usd` → `subscription` — which is
+invariant 5's own statement ("a cost figure's billing model is carried in the column
+it lives in") applied to the merge. A winner that priced nothing leaves the mode
+empty: there is no cost for a label to describe. Affected: D6 (premise, fix block,
+trade-off paragraph), §4, §5 (new **T9c**), §7, §9 item 6, and `br-GI-3-08`'s test
+list.
+
+**Evidence gathered during the escalation, recorded because it bounds the risk.**
+A read-only query against the live `~/.clens/lens.db` shows 77,951 `jsonl` rows (all
+`billing_mode='subscription'`) and exactly **one** `proxy` row (`api_key`/`api`);
+all 60,963 DeepSeek rows are `jsonl`-sourced. So the empty-mode merge has no traffic
+to fire on today and stays latent, while D6's ordinary assignment is what makes the
+`--rebuild` backfill actually count — the merged mode must flip to `api` for the
+newly priced `cost_usd` to enter a total.
+
+**Also noted, not filed as a finding and not acted on** (pre-existing, outside this
+story's scope): the `clens prices --set` path can persist the shipped zero write
+rates into `~/.clens/prices.toml`, because it merges onto the *effective* table
+([prices.go:94,101-112](internal/cli/prices.go#L94)) and `SaveOverrides` writes every
+non-nil field. Latent only — the shipped rates are zero today, so no figure is wrong
+— and D3's conclusion is unaffected. Recorded for a future story rather than fixed
+here.
