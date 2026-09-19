@@ -108,6 +108,31 @@ Two states are first-class and never collapsed to zero:
 opposite of destructive: nothing is deleted without `--yes`, and `--dry-run`
 prints what `--yes` would have deleted.
 
+### Re-pricing rows already captured
+
+Editing a rate, or changing which model prefixes bill pay-as-you-go, does
+**not** re-price rows already in the database. `clens ingest --rebuild` is the
+re-pricing path.
+
+`--rebuild` zeroes every JSONL cursor, so the next poll re-reads each transcript
+from byte 0. The re-read is absorbed by the `request_id` UNIQUE constraint as a
+merge, which makes the run **idempotent** — no duplicate rows, no schema change,
+and no separate reprice command to run.
+
+Two things to know first:
+
+- **The merge has to be correct before you rely on this.** A re-ingest merges
+  the incoming row over the stored one, and `billing_mode` must move together
+  with the cost columns. On a build older than GI#3 the merge kept the stored
+  `billing_mode` while adopting the incoming cost, which would leave rows marked
+  `subscription` carrying a real `cost_usd` — the pair the billing invariant
+  forbids. Land the merge fix, then rebuild.
+- **No config edit is needed for DeepSeek.** The shipped default already treats
+  the `deepseek-` prefix as pay-as-you-go, so an unconfigured install routes
+  those rows to the `api` account and prices them on its own. Set
+  `CLENS_API_MODEL_PREFIXES` (or `ApiModelPrefixes` in `~/.clens/config.toml`)
+  only to route something else as well, or to `none` to route nothing.
+
 Every command takes the config flags — `--proxy-addr`, `--dashboard-addr`,
 `--upstream-url`, `--db-path`, `--body-policy`, `--body-cap-bytes`,
 `--allow-remote`, `--session-gap-minutes`, `--retention-days`, `--replay`,

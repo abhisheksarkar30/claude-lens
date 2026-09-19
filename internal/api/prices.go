@@ -42,10 +42,19 @@ func (a *api) getPrices(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, renderPrices(a.priceLoader.Table()))
 }
 
-// setPricesRequest is POST /api/prices's body: one model's rates, in exactly
-// the shape GET returns that model's row in. Decoding into priceModel itself
-// (rather than a parallel type) is what keeps the two directions from
-// drifting -- an editable Settings table can POST back the row it fetched.
+// setPricesRequest is POST /api/prices's body: one model's *rate fields*, not
+// the whole row GET returns. The two types are kept field-for-field parallel so
+// the directions cannot drift, but they are deliberately not the same type:
+// priceModel carries `source`, and this does not, so POSTing a GET body back
+// verbatim is a 400 naming "source". That is the intended contract, not an
+// oversight -- source is server-derived provenance (shipped / provisional /
+// user), and accepting it here would let a POST forge its own. The dashboard
+// rebuilds its payload from the rate inputs alone (internal/web/app.js), which
+// is the shape this type matches.
+//
+// There is deliberately no peak_multiplier field. Peak is config-derived -- the
+// window comes from the shipped row and the dates from config -- so a settable
+// one would silently no-op. `clens doctor` reports the effective dates instead.
 //
 // An omitted field and an explicit null both decode to a nil pointer, so both
 // mean "unset" with no separate syntax for either.

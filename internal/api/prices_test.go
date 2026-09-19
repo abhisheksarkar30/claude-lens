@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/json"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -218,5 +219,86 @@ func TestSetPricesRejectsMalformedBodies(t *testing.T) {
 		if rr.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400: %s", tc.name, rr.Code, rr.Body.String())
 		}
+	}
+}
+
+// T16: the rendered row must carry no peak_multiplier, and the rate fields it
+// does carry must POST back cleanly. The round-trip is of the *rate fields*,
+// not the whole row, which is what the dashboard actually sends -- it rebuilds
+// its payload from the rate inputs alone.
+func TestPricesRowRoundTripsWithoutSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prices.toml")
+	handler, _, _, _ := newTestAPI(t, newTestStore(t))
+	handler.SetPricing(pricing.NewLoader(path, nil))
+
+	// A DeepSeek row, so the peak window is in play -- the thing whose absence
+	// from the wire this guards.
+	rr := getOK(t, handler, "/api/prices")
+
+	// The wire bytes, not the struct: the guard is about what a client
+	// receives.
+	var raw struct {
+		Models []map[string]json.RawMessage `json:"models"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw response: %v", err)
+	}
+	var rawRow map[string]json.RawMessage
+	for _, m := range raw.Models {
+		var name string
+		if json.Unmarshal(m["model"], &name) == nil && name == "deepseek-flash" {
+			rawRow = m
+			break
+		}
+	}
+	if rawRow == nil {
+		t.Fatal("deepseek-flash is not in GET /api/prices")
+	}
+	if _, ok := rawRow["peak_multiplier"]; ok {
+		t.Error("the rendered price row carries peak_multiplier; Peak is config-derived, so a settable field would silently no-op")
+	}
+
+	var got *priceModel
+	decoded := decodeJSON[pricesResponse](t, rr.Body)
+	for i, m := range decoded.Models {
+		if m.Model == "deepseek-flash" {
+			got = &decoded.Models[i]
+		}
+	}
+	if got == nil {
+		t.Fatal("deepseek-flash missing from the decoded table")
+	}
+
+	// Rebuild the payload from the rate fields alone, the way the dashboard
+	// does. `source` is not among them.
+	payload, err := json.Marshal(map[string]any{
+		"model":               got.Model,
+		"input_rate":          got.InputRate,
+		"output_rate":         got.OutputRate,
+		"cache_write_5m_rate": got.CacheWrite5mRate,
+		"cache_write_1h_rate": got.CacheWrite1hRate,
+		"cache_read_rate":     got.CacheReadRate,
+	})
+	if err != nil {
+		t.Fatalf("Marshal payload: %v", err)
+	}
+	if post := postPrices(t, handler, string(payload)); post.Code != http.StatusOK {
+		t.Errorf("POST of the row's rate fields = %d, want 200: %s", post.Code, post.Body.String())
+	}
+
+	// The negative half, so the guard has teeth: the GET row posted *verbatim*
+	// is a 400 naming "source". This pins the not-client-settable contract
+	// instead of merely tolerating it, and stops a future reader from
+	// "fixing" the 400 by widening setPricesRequest to accept a forged
+	// provenance.
+	verbatim, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("Marshal verbatim row: %v", err)
+	}
+	post := postPrices(t, handler, string(verbatim))
+	if post.Code != http.StatusBadRequest {
+		t.Errorf("POST of the verbatim GET row = %d, want 400 (source is server-derived, not client-settable): %s", post.Code, post.Body.String())
+	} else if !strings.Contains(post.Body.String(), "source") {
+		t.Errorf("400 body %q does not name the offending field `source`", post.Body.String())
 	}
 }
