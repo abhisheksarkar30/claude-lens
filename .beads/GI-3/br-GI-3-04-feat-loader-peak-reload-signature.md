@@ -99,22 +99,28 @@ the plan chose over a `SetOffPeakDates` setter; the display-only sites pinning `
   the shipped 33, and a **second** loader built with a different list resolves independently —
   T17(b). This guard is **deterministic**: it must not depend on `-race`, because `go test ./...`
   does not enable the race detector (F3.1).
-- The `POST /api/prices` builder inherits a zero-write shipped row's write rates the same way (this
-  can land here as the Loader half; the api-surface case is br-GI-3-09's T5 API half).
+- The `POST /api/prices` builder inherits a zero-write shipped row's write rates the same way — the
+  api-surface half of T5, asserted here because this bead is what changes that builder.
 
 ## Test Specifications
 
 - Unit Tests (`internal/pricing/pricing_test.go`):
   - **T5 (Loader half)**: partial override on a shipped DeepSeek model → write rates `0`, `Peak`
     non-nil; partial override on `claude-sonnet-5` → `1.25x`/`2x` of the override input.
+  - **T5 (API half)**: `POST /api/prices` carrying only `input_rate`/`output_rate` for a shipped
+    DeepSeek model writes a `Rate` whose write rates are `0` (inherited from the shipped row, not
+    re-derived at `1.25x`/`2x`); the same partial POST for `claude-sonnet-5` writes `1.25x`/`2x` of
+    the **posted** input. The api-surface half is asserted here, not deferred: this bead is what
+    changes `internal/api/prices.go`, and deferring it left the change verified only by "it
+    compiles" — pointing at a bead (br-GI-3-09) that specifies no such test.
   - **T13**: custom one-date list + an override on `deepseek-flash` still excludes exactly that one
     date; `none` (non-nil empty slice) yields no exclusions.
   - **T17(b)**: a loader with a custom list leaves `ShippedTable()`'s 33 dates unchanged, and a
     second loader with a different list resolves independently (no shared-window hazard).
 - Unit Tests (`internal/pricing/pricing_test.go`, call sites): the existing loader tests
   (`pricing_test.go:199,222`) updated to the two-argument `NewLoader`.
-- Integration Tests: `internal/api` call-site updates compile; the api-surface inheritance
-  behavioural case is br-GI-3-09.
+- Integration Tests: `internal/api` call-site updates compile. The api-surface **behavioural** case
+  is T5 (API half) above, in this bead — not br-GI-3-09, which specifies no such test.
 - E2E: none.
 
 ## Files to Touch

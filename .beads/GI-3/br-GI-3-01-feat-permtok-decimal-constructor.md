@@ -26,8 +26,17 @@ degrade on (fail open: the panic happens at construction, not mid-request).
 Update all 11 Claude rows and the 2 fast-rate rows **mechanically** — same numeric value,
 new spelling (`1000` → `"10.00"`, `25` → `"0.25"`, `5000` → `"50.00"`, `200` → `"2.00"`,
 `20` → `"0.20"`, `500` → `"5.00"`, `2500` → `"25.00"`, `50` → `"0.50"`, `300` → `"3.00"`,
-`1500` → `"15.00"`, `30` → `"0.30"`, `100` → `"1.00"`; the fast block's `perMTok(1000)` /
-`perMTok(5000)` → `perMTok("10.00")` / `perMTok("50.00")`).
+`1500` → `"15.00"`, `30` → `"0.30"`, `100` → `"1.00"`, `10` → `"0.10"`; the fast block's
+`perMTok(1000)` / `perMTok(5000)` → `perMTok("10.00")` / `perMTok("50.00")`).
+
+That is the **13 distinct** cent literals in `table.go`, not 12: `10` is
+`claude-haiku-4-5`'s cache-read (`table.go:53`), the one row whose cache-read is not shared
+with a literal already listed. A missed literal panics at first call by design, so the
+mapping is exhaustive rather than illustrative.
+
+Test fixtures spell `rate(...)` in the old form too. `pricing_test.go:24`'s
+`rate("test-model", 1000, 1000, 20, "shipped")` is the only such call site and moves to the
+string form with the rest.
 
 Add a second constructor for models that charge **no separate cache-write fee**:
 
@@ -63,7 +72,7 @@ literal fails loudly. It is its own bead so the mechanical row update reviews as
 - `rateExact` builds a `Rate` whose write rates are the strings given, with no 1.25x/2x derivation.
 - No production call site of `rate()` changes shape; only the integer literals become strings.
 - No new non-stdlib dependency (`internal/pricing` already imports only `math/big`, `time`, `os`,
-  `path/filepath`, `sort`, `strings`, `sync`, `internal/parse`).
+  `path/filepath`, `sort`, `strings`, `sync`, `fmt`, `internal/parse`).
 
 ## Test Specifications
 
@@ -81,4 +90,5 @@ literal fails loudly. It is its own bead so the mechanical row update reviews as
 ## Files to Touch
 
 - `internal/pricing/table.go` (modify — `perMTok` signature, `rateExact`, mechanical row update)
-- `internal/pricing/pricing_test.go` (modify — new-constructor and panic cases)
+- `internal/pricing/pricing_test.go` (modify — new-constructor and panic cases; re-spell the
+  existing `rate(...)` fixture at `:24`)

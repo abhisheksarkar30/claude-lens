@@ -516,6 +516,12 @@ manufactures the invariant violation.
 This is documentation plus a bead ordering constraint — not new code. There is no
 reprice function to write, and adding one would duplicate the path.
 
+The runbook lives in **`README.md`**, at the `clens ingest` row
+([README.md:90](README.md#L90)) — **not** in `docs/context/`. That tree is
+generated: Phase 5.6 runs `document-project-context` in REFRESH mode across it, so
+a hand-written runbook there is clobbered by the next refresh. The README is
+hand-maintained and already carries the command table.
+
 ### D8 — A per-row `peak_pricing` warning, via an *optional* interface
 
 A call billed at peak cost double the same call off-peak, and nothing in the row
@@ -617,7 +623,7 @@ hide it.
 | `internal/store/store_test.go` | Extend `TestBillingModeInvariants` to cover the **merge** path |
 | `internal/consumer/consumer.go` | `PeakComputer` assertion + `peak_pricing` attach |
 | `internal/analyze/kinds.go` | `KindPeakPricing` + `nonAnalyzeKinds` entry |
-| `README.md` | `peak_pricing` row in the kind table; the prose "Four of these are not emitted by `analyze`" → "**Five**" **and its enumeration gains the fifth kind** — the sentence counts *and* enumerates, so changing the numeral alone leaves a five-item claim over a four-item list (F2.8, F3.3) |
+| `README.md` | `peak_pricing` row in the kind table; the prose "Four of these are not emitted by `analyze`" → "**Five**" **and its enumeration gains the fifth kind** — the sentence counts *and* enumerates, so changing the numeral alone leaves a five-item claim over a four-item list (F2.8, F3.3). Plus the **D7 backfill runbook** at the `clens ingest` row (br-GI-3-09): the README, not `docs/context/`, which is generated (D7) |
 | `internal/analyze/analyze_test.go` | Explicit third-party exception list for the minimum-prefix coverage test (see R3) |
 | `docs/context/*` | Phase 5.6 refresh |
 

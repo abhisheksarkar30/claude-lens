@@ -50,8 +50,9 @@ and the attach are local:
 - The consumer's pricing block (`internal/consumer/consumer.go:325-336`, where the `warnings`
   slice is built).
 - **`insert`** in the JSONL tailer (`internal/jsonlogs/jsonlogs.go:366-381`) — **not**
-  `buildEvent` at `:338`, which returns `(*store.Event, parse.Meta, parse.Usage)` and has no
-  warnings slice to attach to (F2.7).
+  `buildEvent` (declared `:291`), which returns `(*store.Event, parse.Meta, parse.Usage)` and has no
+  warnings slice to attach to. The `:338` the plan cites is the `if t.pricer != nil` block *inside*
+  `buildEvent`, which is the pricing half, not an attach point (F2.7).
 
 ```go
 if pc, ok := pricer.(PeakComputer); ok && ev.CostSource != "unpriced" && pc.PeakAt(ev.ModelResolved, ev.StartedAt) {
@@ -63,16 +64,21 @@ Two conditions matter: the warning fires **only on a priced row** (an unpriced r
 billed at any rate, so claiming it was billed at peak would be a lie — invariant 5), and only once
 per row — `(event_id, kind)` is already unique, so a re-ingest upserts rather than duplicates.
 
-**3. Kind bookkeeping** (all mechanically enforced by `internal/analyze/readme_test.go`):
+**3. Kind bookkeeping** (`readme_test.go` enforces the kind *table*; `analyze_test.go:154-171`
+separately constrains `allKinds` descriptions and `nonAnalyzeKinds`. Neither breaks on the new kind,
+but the bookkeeping is not one test's job):
 
 - `KindPeakPricing Kind = "peak_pricing"` in `internal/analyze/kinds.go` with a `KindInfo`
   description and `SeverityWarn`, added to `allKinds`.
 - Added to `nonAnalyzeKinds` as `"consumer, jsonlogs"`, since it is emitted by the capture path
-  rather than by a pure per-event rule (`kinds.go:100-105`).
+  rather than by a pure per-event rule (`kinds.go:100-105`, which holds **four** entries — the other
+  two, `KindCostDrift` → `"reconcile"` and `KindQuotaWindowApproaching` → `"quota"`, are owned by
+  separate packages).
 - A README row whose emitted-by cell is **exactly** `consumer, jsonlogs`. The test requires the
   cell to **equal** whatever `nonAnalyzeKinds` holds (`readme_test.go:67-70`) — the existing values
-  are `"consumer (panic recovery)"` and `"store (cross-source merge)"`, so the new cell follows the
-  *rule*, not those two spellings. A cell containing `|` or a newline fails the test.
+  are `"consumer (panic recovery)"`, `"store (cross-source merge)"`, `"reconcile"` and `"quota"`,
+  so the new cell follows the *rule*, not those spellings. A cell containing `|` or a newline fails
+  the test.
 
 **4. README prose — grow the enumeration, not only the numeral (F3.3).** The line at
 `README.md:194-199` both counts **and** enumerates. Change "Four of these are not emitted by

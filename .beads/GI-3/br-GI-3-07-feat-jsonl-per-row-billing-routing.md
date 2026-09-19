@@ -103,11 +103,21 @@ configured prefix (not a derived predicate) keeps "which models are third-party"
     `ApiEquivalentCostUSD` set, `CostUSD` nil.
   - No-prefix-list case: `SetModelBilling(nil, "", "api")` routes nothing, so an unset resolver at a
     call site would be visible (the nil-`HasPrefix` failure shape).
-- Unit Tests (`internal/cli`, helper level — T14):
-  - `resolvedAPIPrefixes(cfg)` resolves an unset `ApiModelPrefixes` to the shipped `{"deepseek-"}`,
-    and a tailer wired with `SetModelBilling(resolvedAPIPrefixes(cfg), …)` routes a `deepseek-*` row
-    to `api` while a `claude-*` row stays `subscription`. Assert on the helper + `SetModelBilling`,
-    **not** on `Serve()`/`addCollectors`, neither of which a test can reach.
+- Unit Tests (`internal/jsonlogs/jsonlogs_test.go`) — **T14 folds into T7's case above**: drive a
+  tailer directly with `SetModelBilling(pricing.ShippedAPIModelPrefixes(), "", "api")` — the exact
+  value `resolvedAPIPrefixes(cfg)` returns on an unconfigured install — and assert a `deepseek-*`
+  row lands in `api` while a `claude-*` row through the **same** tailer stays `subscription`. That
+  is Outcome Definition's "an unconfigured install routes by default", asserted at the seam that can
+  see it.
+- Unit Tests (`internal/cli`): **none added.** The resolver's own contract is br-GI-3-05's T10;
+  re-asserting it here would exercise the same function a second time without touching the wiring.
+  An assertion that `newTailer` *calls* `SetModelBilling` is unwritable from this package —
+  `apiPrefixes`/`apiAccount`/`apiBillingMode` are unexported with no accessor, and no test in
+  `internal/cli` builds a tailer at all (`cli_test.go`'s fixtures write rows straight to the store
+  via `seedEvent`), so a routing assertion here would need a net-new poll harness to observe what
+  `jsonlogs` already observes directly. br-GI-3-06 sets the precedent: the helper's two calls are a
+  reviewed-move property, visible in a small diff, and the behaviour they wire is asserted one
+  package down.
 - Integration Tests: none (T8 in br-GI-3-08 covers the merge interaction).
 - E2E: none.
 

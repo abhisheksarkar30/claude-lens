@@ -46,8 +46,8 @@ failure) — a typo'd date silently over-charges at peak — and a malformed pre
 whitespace-only). Errors name the field and value, matching the existing style.
 
 **3. New `Validate()` calls in `runIngest` and `runRefresh` (F1.2/R8).** `config.Load` does **not**
-call `Validate` itself (`config.go:203-238`), so the `clens ingest --rebuild` backfill path is
-validated **only** because `runIngest` calls it. Add `cfg.Validate()` to `runIngest`
+call `Validate` itself (`config.go:203-238`), so the `clens ingest --rebuild` backfill path is validated **only** once
+`runIngest` calls it — and today it does not. Add `cfg.Validate()` to `runIngest`
 (`internal/cli/ingest.go`, after `config.Load`, before the store is opened) and to `runRefresh`
 (`internal/cli/refresh.go`, before `addCollectors`). `runRefresh` is the site, not `addCollectors`:
 `addCollectors` has no error return (`refresh.go:90`), so a `Validate()` there could only be

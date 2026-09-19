@@ -84,12 +84,24 @@ never blames the extract for a routing bug.
 
 ## Test Specifications
 
+- Unit Tests (`internal/jsonlogs/jsonlogs_test.go`, **not** `internal/cli`): the F5.1 contract the
+  guard defends, asserted where the fields are readable. `account`/`billingMode` are unexported
+  (`jsonlogs.go:82-83`) and `Tailer` exposes no accessor — only the four setters, `Poll`, and
+  unexported internals (`jsonlogs.go:95-105`, `:132`, `:291`, `:366`) — so an assertion on tailer
+  state is **unwritable from package `cli`**, and no test in `internal/cli` builds a tailer at all
+  (its fixtures write rows straight to the store via `seedEvent`). Assert instead:
+  - `New(root, st)` leaves the account empty and `billingMode == "subscription"` (the `:91-93` seed).
+  - `SetAccount("", "")` assigns **unconditionally**, blanking the mode to `""` — the sharp edge
+    recorded in §8, and the reason the `acct.Name != ""` guard is load-bearing at every call site
+    rather than decorative.
 - Unit Tests (`internal/cli`, existing test files): the existing `clens ingest`/`clens refresh`
-  tests pass unchanged — they are the behaviour-preservation guard.
-  - One new case asserting the guard's contract: `newTailer` on a config with **no** subscription
-    account leaves the tailer's account empty and `billing_mode == "subscription"` (the `New`
-    seed), while a config **with** a subscription account applies that account — i.e. a zero
-    `Account` never blanks the mode (F5.1).
+  tests pass unchanged — they are the behaviour-preservation guard for the extract.
+- **Deliberately not test-covered.** That `newTailer` *keeps* the guard is a pure-move property,
+  verified by reading the diff. Making it test-observable would require either a new exported
+  accessor on `Tailer` (API added to satisfy one test) or a full poll harness in `internal/cli`
+  that does not exist today. The bead's existing "the diff must show a move, not a rewrite"
+  requirement is the honest control; the `jsonlogs` case above pins the contract the guard
+  protects, so an edit that drops the guard shows up as a diff against a stated rule.
 - Integration Tests: none (br-GI-3-07 asserts the routing this helper will carry).
 - E2E: none.
 
@@ -97,4 +109,5 @@ never blames the extract for a routing bug.
 
 - `internal/cli/ingest.go` (modify — host `newTailer`; `runIngest` calls it with `root`)
 - `internal/cli/refresh.go` (modify — `addCollectors` calls `newTailer(cfg, jsonlRoot(), st)`)
-- `internal/cli/cli_test.go` or `internal/cli/serve_test.go` (modify — the guard case)
+- `internal/jsonlogs/jsonlogs_test.go` (modify — the F5.1 guard contract; see Test Specifications
+  for why this case cannot live in `internal/cli`)
