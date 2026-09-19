@@ -514,3 +514,130 @@ func TestPeakDoesNotLeakOntoFlatModels(t *testing.T) {
 		t.Errorf("claude-sonnet-5 at peak = %v, off peak = %v, want equal", *at, *off)
 	}
 }
+
+// --- Shipped DeepSeek rows (br-GI-3-03) ---
+
+// T5 (shipped half): the table's shape once the DeepSeek rows land. The two
+// populations differ in exactly one way -- Peak -- and an unconditional
+// multiply would double every Claude row, so both directions are asserted.
+func TestShippedTableShape(t *testing.T) {
+	table := ShippedTable()
+	if len(table) != 14 {
+		t.Errorf("ShippedTable() has %d rows, want 14 (11 Claude + 3 DeepSeek)", len(table))
+	}
+
+	for _, model := range []string{"deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"} {
+		r, ok := table[model]
+		if !ok {
+			t.Errorf("%s missing from ShippedTable()", model)
+			continue
+		}
+		for name, v := range map[string]*big.Rat{
+			"input_rate": r.InputRate, "output_rate": r.OutputRate,
+			"cache_write_5m_rate": r.CacheWrite5mRate, "cache_write_1h_rate": r.CacheWrite1hRate,
+			"cache_read_rate": r.CacheReadRate,
+		} {
+			if v == nil {
+				t.Errorf("%s: %s is nil", model, name)
+			}
+		}
+		if r.Peak == nil {
+			t.Errorf("%s: Peak = nil, want the shipped window", model)
+		}
+		if r.CacheWrite5mRate.Sign() != 0 || r.CacheWrite1hRate.Sign() != 0 {
+			t.Errorf("%s: write rates = $%s/$%s per MTok, want 0/0 (DeepSeek bills no cache-write fee)",
+				model, perTokenToMTok(r.CacheWrite5mRate), perTokenToMTok(r.CacheWrite1hRate))
+		}
+	}
+
+	for model, r := range table {
+		switch model {
+		case "deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash":
+			continue
+		}
+		if r.Peak != nil {
+			t.Errorf("%s: Peak is non-nil on a flat-priced model; it would be multiplied", model)
+		}
+	}
+}
+
+// T6: the sub-cent cache-hit rates the integer-cent constructor could not
+// express. Truncating either to $0.00 would price every DeepSeek cache hit at
+// zero, which is the failure invariant 5 exists to prevent.
+func TestDeepseekCacheHitRatesAreExact(t *testing.T) {
+	table := ShippedTable()
+	for _, c := range []struct{ model, want string }{
+		{"deepseek-flash", "0.003000"},
+		{"deepseek-v4-flash", "0.003000"},
+		{"deepseek-v4-pro", "0.022000"},
+	} {
+		got := perTokenToMTok(table[c.model].CacheReadRate)
+		if got != c.want {
+			t.Errorf("%s cache hit = $%s/MTok, want $%s", c.model, got, c.want)
+		}
+		if table[c.model].CacheReadRate.Sign() == 0 {
+			t.Errorf("%s cache hit rate is zero -- the sub-cent value was truncated", c.model)
+		}
+	}
+}
+
+// T17(a): the shipped holiday list, and the freshness rule behind it. The
+// boundaries are checked against literals rather than against the slice the
+// window was built from, so this is not comparing the fixture to itself.
+func TestShippedDeepseekOffPeakDates(t *testing.T) {
+	window := ShippedTable()["deepseek-flash"].Peak
+	if window == nil {
+		t.Fatal("deepseek-flash has no Peak window")
+	}
+	if len(window.OffPeakDates) != 33 {
+		t.Errorf("OffPeakDates holds %d dates, want the shipped 33", len(window.OffPeakDates))
+	}
+	for d := range window.OffPeakDates {
+		if _, err := time.Parse("2006-01-02", d); err != nil {
+			t.Errorf("OffPeakDates holds %q, which is not a YYYY-MM-DD date: %v", d, err)
+		}
+	}
+	// Each 2026 span's first and last day.
+	for _, d := range []string{
+		"2026-01-01", "2026-01-03",
+		"2026-02-15", "2026-02-23",
+		"2026-04-04", "2026-04-06",
+		"2026-05-01", "2026-05-05",
+		"2026-06-19", "2026-06-21",
+		"2026-09-25", "2026-09-27",
+		"2026-10-01", "2026-10-07",
+	} {
+		if _, ok := window.OffPeakDates[d]; !ok {
+			t.Errorf("shipped holiday %s is absent from the window", d)
+		}
+	}
+	if _, ok := window.OffPeakDates["2026-03-15"]; ok {
+		t.Error("2026-03-15 is in OffPeakDates; the list is excluding ordinary weekdays")
+	}
+
+	// A fresh window per call: distinct instances carrying equal dates. A
+	// shared window would let one loader's configured list overwrite another's
+	// and make ShippedTable() report the last configuration rather than the
+	// shipped 33.
+	first := ShippedTable()["deepseek-flash"].Peak
+	second := ShippedTable()["deepseek-flash"].Peak
+	if first == second {
+		t.Error("ShippedTable() returned the same *PeakWindow twice; it must build a fresh one per call")
+	}
+	if len(first.OffPeakDates) != len(second.OffPeakDates) {
+		t.Errorf("successive windows differ: %d vs %d dates", len(first.OffPeakDates), len(second.OffPeakDates))
+	}
+}
+
+// ShippedAPIModelPrefixes is a copy, so a caller cannot corrupt the package's
+// own slice -- the same rule AllKinds() follows.
+func TestShippedAPIModelPrefixesIsACopy(t *testing.T) {
+	got := ShippedAPIModelPrefixes()
+	if len(got) != 1 || got[0] != "deepseek-" {
+		t.Fatalf("ShippedAPIModelPrefixes() = %v, want [deepseek-]", got)
+	}
+	got[0] = "mutated"
+	if again := ShippedAPIModelPrefixes(); again[0] != "deepseek-" {
+		t.Errorf("mutating the returned slice changed the package's own: next call returned %q", again[0])
+	}
+}

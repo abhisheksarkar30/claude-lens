@@ -2,8 +2,60 @@ package pricing
 
 import (
 	"math/big"
+	"slices"
 	"time"
 )
+
+// shippedAPIModelPrefixes is the default set of model prefixes that bill
+// pay-as-you-go rather than through a subscription. It is the shipped default
+// only: internal/config's ApiModelPrefixes replaces it wholesale when set.
+var shippedAPIModelPrefixes = []string{"deepseek-"}
+
+// ShippedAPIModelPrefixes returns the default pay-as-you-go model prefixes.
+// A copy, so no caller can mutate the package's own slice.
+func ShippedAPIModelPrefixes() []string {
+	return slices.Clone(shippedAPIModelPrefixes)
+}
+
+// deepseekOffPeakDates is the 2026 Chinese public holiday calendar: the dates
+// excluded from DeepSeek's peak window. DeepSeek bills peak at exactly 2x
+// off-peak, so a missing holiday leaves a day charged at peak.
+//
+// ponytail: this list goes stale on 2027-01-01 -- refresh it from the State
+// Council General Office notice each year. The failure direction is
+// over-charging, never under-charging, so a stale list is safe but wrong.
+// Weekends inside these spans are already off-peak, so listing the full spans
+// is redundant but harmless, and it keeps the list exactly the official table
+// -- the citable artifact. Source: State Council General Office notice of
+// 2025-11-04.
+var deepseekOffPeakDates = []string{
+	"2026-01-01", "2026-01-02", "2026-01-03",
+	"2026-02-15", "2026-02-16", "2026-02-17", "2026-02-18", "2026-02-19",
+	"2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",
+	"2026-04-04", "2026-04-05", "2026-04-06",
+	"2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05",
+	"2026-06-19", "2026-06-20", "2026-06-21",
+	"2026-09-25", "2026-09-26", "2026-09-27",
+	"2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05",
+	"2026-10-06", "2026-10-07",
+}
+
+// deepseekPeakWindow returns a fresh PeakWindow per call -- never a
+// package-level var. serve runs two pricers in one process and both call
+// Table()->reload() when the override file's mtime moves, so a shared window
+// would be a data race; and ShippedTable() would report the last configured
+// list instead of the shipped 33.
+func deepseekPeakWindow() *PeakWindow {
+	dates := make(map[string]struct{}, len(deepseekOffPeakDates))
+	for _, d := range deepseekOffPeakDates {
+		dates[d] = struct{}{}
+	}
+	return &PeakWindow{
+		Multiplier:   big.NewRat(2, 1),
+		Hours:        [][2]int{{1, 4}, {6, 10}},
+		OffPeakDates: dates,
+	}
+}
 
 // shippedEffectiveFrom is the date the shipped table below was compiled
 // from the skill bundle. It is not a per-row fetch time — the table ships
@@ -77,6 +129,25 @@ func ShippedTable() Table {
 		"claude-sonnet-5":   rate("claude-sonnet-5", "2.00", "10.00", "0.20", "shipped"),   // shared/model-migration.md:1291
 		"claude-sonnet-4-6": rate("claude-sonnet-4-6", "3.00", "15.00", "0.30", "shipped"), // shared/model-migration.md:1291
 		"claude-haiku-4-5":  rate("claude-haiku-4-5", "1.00", "5.00", "0.10", "provisional"),
+
+		// DeepSeek, billed pay-as-you-go. The rates below are the *off-peak*
+		// ones; peak is 2x, applied by the Peak window attached after this
+		// literal. DeepSeek charges no separate cache-write fee -- the
+		// cache-miss price is what populates the cache, and cache_write_*_tokens
+		// are 0 on every captured row -- so both write rates are exactly 0 via
+		// rateExact rather than derived at 1.25x/2x.
+		"deepseek-flash":    rateExact("deepseek-flash", "0.15", "0.60", "0.003", "0", "0", "shipped"),    // https://api-docs.deepseek.com/quick_start/pricing/ (retrieved 2026-09-19)
+		"deepseek-v4-pro":   rateExact("deepseek-v4-pro", "0.66", "1.98", "0.022", "0", "0", "shipped"),   // https://api-docs.deepseek.com/quick_start/pricing/ (retrieved 2026-09-19)
+		"deepseek-v4-flash": rateExact("deepseek-v4-flash", "0.15", "0.60", "0.003", "0", "0", "shipped"), // retired alias of V4.1-Flash; still routes there and bills at the Flash price
+	}
+
+	// Peak windows: DeepSeek only. Each row gets its own freshly-built window
+	// (see deepseekPeakWindow), so one loader's configured dates can never
+	// leak into another's.
+	for _, model := range []string{"deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"} {
+		r := t[model]
+		r.Peak = deepseekPeakWindow()
+		t[model] = r
 	}
 
 	// Fast-mode rates: shipped for Opus 5 / Opus 4.8 only ($10/$50 per MTok).
