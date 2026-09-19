@@ -293,8 +293,9 @@ store, component, build step, dependency, route, or schema change.
   (unconditional reset, D5); the back control is the second route back.
 - A detail fetch that is superseded by a later tab click or drill-down **never** renders — its
   success is dropped by `seq !== detailSeq` and its failure by the catch's `seq === detailSeq`.
-- Functionally: T5's ten runbook steps pass (executed against `go run ./cmd/clens serve` at
-  `http://127.0.0.1:8798` with a populated store; recorded in br-GI-5-03).
+- Functionally: T5's ten runbook steps pass (executed against a branch-built `clens` on
+  `http://127.0.0.1:8799` with a populated store; §5's `go run`/8798 setup was unavailable, and the
+  departure is recorded in the plan's §10, which br-GI-5-03 wrote).
 
 ## Test Specifications
 
