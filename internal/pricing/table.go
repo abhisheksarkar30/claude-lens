@@ -46,15 +46,42 @@ var deepseekOffPeakDates = []string{
 // would be a data race; and ShippedTable() would report the last configured
 // list instead of the shipped 33.
 func deepseekPeakWindow() *PeakWindow {
+	return &PeakWindow{
+		Multiplier:   big.NewRat(2, 1),
+		Hours:        [][2]int{{1, 4}, {6, 10}},
+		OffPeakDates: shippedOffPeakDates(),
+	}
+}
+
+// shippedOffPeakDates returns a fresh set of the shipped holiday dates, for
+// callers that need the default without a whole PeakWindow around it.
+func shippedOffPeakDates() map[string]struct{} {
 	dates := make(map[string]struct{}, len(deepseekOffPeakDates))
 	for _, d := range deepseekOffPeakDates {
 		dates[d] = struct{}{}
 	}
-	return &PeakWindow{
-		Multiplier:   big.NewRat(2, 1),
-		Hours:        [][2]int{{1, 4}, {6, 10}},
-		OffPeakDates: dates,
+	return dates
+}
+
+// ZeroWriteShippedRates reports a shipped model's cache-write rates when that
+// row bills no cache-write premium whatsoever. A partial override
+// (LoadOverrides) should inherit these rather than re-derive 1.25x/2x input,
+// which would invent a fee the model does not charge.
+//
+// ok is false for an unknown model and for a row whose shipped writes are
+// non-zero. That narrowing is the point: for a shipped Claude row the 1.25x/2x
+// derivation is the correct answer, because it has to follow the *effective*
+// (possibly overridden) input rate rather than the shipped one. Inheriting
+// unconditionally would pin an override's writes to the old shipped input.
+func ZeroWriteShippedRates(model string) (write5m, write1h *big.Rat, ok bool) {
+	r, found := ShippedTable()[model]
+	if !found || r.CacheWrite5mRate == nil || r.CacheWrite1hRate == nil {
+		return nil, nil, false
 	}
+	if r.CacheWrite5mRate.Sign() != 0 || r.CacheWrite1hRate.Sign() != 0 {
+		return nil, nil, false
+	}
+	return r.CacheWrite5mRate, r.CacheWrite1hRate, true
 }
 
 // shippedEffectiveFrom is the date the shipped table below was compiled

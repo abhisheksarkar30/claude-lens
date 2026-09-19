@@ -71,9 +71,19 @@ partial override on a shipped **Claude** row still prices cache writes at `1.25x
 `input_rate = 5.00` on a shipped Claude model would otherwise keep writes derived from the *old*
 shipped input). The zero-write guard is exactly the case the inheritance is for, and nothing wider.
 
-`internal/api` must not import `pricing` internals it does not already; expose whatever
-`internal/pricing` needs (e.g. a small exported helper or `ShippedTable()` lookup) so the api
-builder shares one rule with `LoadOverrides` rather than duplicating it.
+`internal/api` must not import `pricing` internals it does not already; expose a small exported
+helper from `internal/pricing` so the rule has one home rather than being duplicated.
+
+**Corrected: the second surface is `LoadOverrides` alone, and `internal/api/prices.go` needs no
+edit.** The api builder was thought to re-derive independently. It does not. It sends its fields
+through `pricing.SetOverride` → `SaveOverrides`, which writes only the non-nil ones, and the Loader
+then reads that file back through `LoadOverrides` — which is where the 1.25x/2x derivation actually
+runs. So the POST path reaches the same code as the file path, and fixing `LoadOverrides` fixes
+both. Verified by mutation: disabling only the `LoadOverrides` inheritance fails the api-surface
+test with the same invented fee as the loader test. Adding inheritance to the builder as well would
+be worse than redundant — the inherited rates would be non-nil, so `SaveOverrides` would write them
+into the user's override file, pinning the shipped zero there and stopping a later shipped-rate
+change from flowing through.
 
 **Invariant 5.** Inheritance must never turn a zero write rate into a non-nil non-zero rate on a
 DeepSeek row, and must never zero a Claude row's derived writes. Money stays exact via `big.Rat`.
@@ -99,8 +109,11 @@ the plan chose over a `SetOffPeakDates` setter; the display-only sites pinning `
   the shipped 33, and a **second** loader built with a different list resolves independently —
   T17(b). This guard is **deterministic**: it must not depend on `-race`, because `go test ./...`
   does not enable the race detector (F3.1).
-- The `POST /api/prices` builder inherits a zero-write shipped row's write rates the same way — the
-  api-surface half of T5, asserted here because this bead is what changes that builder.
+- The `POST /api/prices` path inherits a zero-write shipped row's write rates the same way — the
+  api-surface half of T5, asserted here, because this bead is what changes the rule it routes
+  through. The assertion lives in `internal/api/prices_test.go` even though the edit is in
+  `internal/pricing`: it is the surface claim, and a change to `SetOverride`/`SaveOverrides` that
+  stopped routing through `LoadOverrides` would break it and nothing in `internal/pricing`.
 
 ## Test Specifications
 
@@ -128,9 +141,12 @@ the plan chose over a `SetOffPeakDates` setter; the display-only sites pinning `
 - `internal/pricing/pricing.go` (modify — `reload()` re-take into a fresh window, `NewLoader`
   signature + `Loader` dates field, `LoadOverrides` zero-write inheritance)
 - `internal/pricing/pricing_test.go` (modify — T5 Loader half, T13, T17(b), call sites)
-- `internal/api/prices.go` (modify — the partial-`Rate` builder inherits from a zero-write shipped
-  row before derivation)
-- `internal/api/api_test.go`, `internal/api/prices_test.go` (modify — 7 `NewLoader` call sites)
+- `internal/pricing/table.go` (modify — `ZeroWriteShippedRates`, the one home for the rule)
+- `internal/api/prices.go` (**not modified** — see the correction above; the POST path reaches the
+  rule through `LoadOverrides`, and inheriting in the builder would write the shipped zero into the
+  user's override file)
+- `internal/api/api_test.go`, `internal/api/prices_test.go` (modify — 7 `NewLoader` call sites;
+  T5's API half lands in `prices_test.go`)
 - `internal/cli/serve.go`, `internal/cli/refresh.go`, `internal/cli/ingest.go` (modify — the three
   live loaders pass `nil`; br-GI-3-05 re-routes them)
 - `internal/cli/models.go`, `internal/cli/prices.go` (modify — the three display-only loaders pass

@@ -257,6 +257,20 @@ func LoadOverrides(path string) (Table, error) {
 			}
 			*field(&r) = rate
 		}
+		// A model that bills no cache-write premium must not acquire one here.
+		// The shipped row's zero write rates are inherited ahead of the
+		// derivation, so a partial override on a DeepSeek model keeps writes at
+		// 0 instead of pricing them at 1.25x the override's input. A shipped
+		// Claude row is untouched by this branch, so its writes are still
+		// derived from the *effective* input -- the invariant rate() holds.
+		if w5m, w1h, ok := ZeroWriteShippedRates(model); ok {
+			if r.CacheWrite5mRate == nil {
+				r.CacheWrite5mRate = w5m
+			}
+			if r.CacheWrite1hRate == nil {
+				r.CacheWrite1hRate = w1h
+			}
+		}
 		if r.CacheWrite5mRate == nil && r.InputRate != nil {
 			r.CacheWrite5mRate = new(big.Rat).Mul(r.InputRate, big.NewRat(5, 4))
 		}
@@ -333,6 +347,10 @@ func UnsetOverride(path, model string) error {
 // effect without a restart.
 type Loader struct {
 	path string
+	// offPeakDates is the configured peak-exclusion list: nil means "unset ->
+	// use the shipped default", a non-nil list replaces it wholesale (an empty
+	// one excludes nothing).
+	offPeakDates []string
 
 	mu    sync.Mutex
 	mtime time.Time
@@ -346,19 +364,61 @@ type Loader struct {
 func (l *Loader) Path() string { return l.path }
 
 // NewLoader returns a Loader for the override file at path, performing an
-// initial load immediately.
-func NewLoader(path string) *Loader {
-	l := &Loader{path: path}
+// initial load immediately. offPeakDates is a required argument deliberately:
+// it forces the compiler to enumerate every call site rather than trusting a
+// caller to remember a SetOffPeakDates call.
+func NewLoader(path string, offPeakDates []string) *Loader {
+	l := &Loader{path: path, offPeakDates: offPeakDates}
 	l.reload()
 	return l
 }
 
+// resolvedOffPeakDates is the date set this Loader excludes from peak. A fresh
+// map per call, so no two pricers can share one window's dates.
+func (l *Loader) resolvedOffPeakDates() map[string]struct{} {
+	if l.offPeakDates == nil {
+		return shippedOffPeakDates()
+	}
+	dates := make(map[string]struct{}, len(l.offPeakDates))
+	for _, d := range l.offPeakDates {
+		dates[d] = struct{}{}
+	}
+	return dates
+}
+
 func (l *Loader) reload() {
 	merged := ShippedTable()
+
+	// Which models are time-varying, and the window each ships with, read
+	// before the override merge below replaces whole rows.
+	shippedPeaks := map[string]*PeakWindow{}
+	for model, r := range merged {
+		if r.Peak != nil {
+			shippedPeaks[model] = r.Peak
+		}
+	}
+
 	if overrides, err := LoadOverrides(l.path); err == nil {
 		for model, r := range overrides {
 			merged[model] = r
 		}
+	}
+
+	// Re-take Peak from the shipped row as the final step. An override replaces
+	// the whole Rate and so carries no window; without this,
+	// `clens prices --set deepseek-flash` would silently revert the model to
+	// flat pricing. Taking the window from the *shipped* row -- never the
+	// override, which has none -- is what stops an override clobbering the
+	// configured dates. One place, applied uniformly, which is also why the
+	// POST /api/prices path needs no separate handling.
+	for model, window := range shippedPeaks {
+		r := merged[model]
+		r.Peak = &PeakWindow{
+			Multiplier:   window.Multiplier,
+			Hours:        window.Hours,
+			OffPeakDates: l.resolvedOffPeakDates(),
+		}
+		merged[model] = r
 	}
 
 	l.mu.Lock()

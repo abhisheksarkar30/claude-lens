@@ -45,7 +45,7 @@ func runIngest(args []string, w io.Writer) error {
 	}
 
 	tailer := jsonlogs.New(root, st)
-	tailer.SetPriceTable(pricing.NewLoader(pricing.DefaultPath()))
+	tailer.SetPriceTable(pricing.NewLoader(pricing.DefaultPath(), nil))
 	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
 		tailer.SetAccount(acct.Name, acct.BillingMode)
 	}

@@ -89,7 +89,7 @@ type collectorStore interface {
 // different sets of sources.
 func addCollectors(ctx context.Context, r *ingest.Runner, cfg *config.Config, st collectorStore) {
 	tailer := jsonlogs.New(jsonlRoot(), st)
-	tailer.SetPriceTable(pricing.NewLoader(pricing.DefaultPath()))
+	tailer.SetPriceTable(pricing.NewLoader(pricing.DefaultPath(), nil))
 	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
 		tailer.SetAccount(acct.Name, acct.BillingMode)
 	}

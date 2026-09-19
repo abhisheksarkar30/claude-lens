@@ -98,7 +98,7 @@ func Serve(args []string) error {
 	cons.SetSessionRule(engine)
 	// A Loader, not the shipped table: it re-reads prices.toml when the file
 	// changes, so `clens prices --set` takes effect without a restart.
-	priceLoader := pricing.NewLoader(pricing.DefaultPath())
+	priceLoader := pricing.NewLoader(pricing.DefaultPath(), nil)
 	cons.SetPriceTable(priceLoader)
 	// The decode limit is the same BodyCapBytes the proxy tees with -- without
 	// a second cap on the decoded form, a small compressed body would expand

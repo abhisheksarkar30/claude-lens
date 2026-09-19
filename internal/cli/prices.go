@@ -47,7 +47,7 @@ func runPrices(args []string, w io.Writer) error {
 
 	// The table is printed after any edit, so `clens prices --set …` shows
 	// the result of what it just did rather than the state before it.
-	rates := pricing.NewLoader(path).Table()
+	rates := pricing.NewLoader(path, nil).Table()
 	if len(rates) == 0 {
 		fmt.Fprintln(w, "no rates available")
 		return nil
@@ -91,7 +91,7 @@ func applyPriceEdits(path string, sets, unsets []string, w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("prices: %w", err)
 	}
-	effective := pricing.NewLoader(path).Table()
+	effective := pricing.NewLoader(path, nil).Table()
 
 	for _, s := range sets {
 		model, key, value, err := splitSet(s)

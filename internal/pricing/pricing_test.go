@@ -283,7 +283,7 @@ func TestSetOverrideRoundTripWins(t *testing.T) {
 		t.Errorf("Source = %q, want user", r.Source)
 	}
 
-	loader := NewLoader(path)
+	loader := NewLoader(path, nil)
 	overridden, source := loader.Compute("claude-sonnet-5", usage, "", "", time.Now())
 	if source != "user" {
 		t.Errorf("costSource = %q, want user", source)
@@ -306,7 +306,7 @@ func TestSetOverrideRoundTripWins(t *testing.T) {
 
 func TestLoaderReloadsOnFileChange(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "prices.toml")
-	loader := NewLoader(path)
+	loader := NewLoader(path, nil)
 	usage := parse.Usage{InputTokens: 1_000_000}
 
 	before, _ := loader.Compute("claude-sonnet-5", usage, "", "", time.Now())
@@ -639,5 +639,108 @@ func TestShippedAPIModelPrefixesIsACopy(t *testing.T) {
 	got[0] = "mutated"
 	if again := ShippedAPIModelPrefixes(); again[0] != "deepseek-" {
 		t.Errorf("mutating the returned slice changed the package's own: next call returned %q", again[0])
+	}
+}
+
+// --- Loader: window re-take and write-rate inheritance (br-GI-3-04) ---
+
+// T5 (Loader half): a partial override -- input/output only -- must not
+// re-invent a cache-write fee for a model that charges none, and must not
+// revert the model to flat pricing. Both are things the override file cannot
+// express, so both have to be re-taken from the shipped row.
+func TestLoaderPartialOverrideKeepsZeroWriteRatesAndPeak(t *testing.T) {
+	dir := t.TempDir()
+
+	deepseekPath := filepath.Join(dir, "deepseek.toml")
+	if err := os.WriteFile(deepseekPath, []byte("model = \"deepseek-flash\"\ninput_rate = 0.20\noutput_rate = 0.80\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	r := NewLoader(deepseekPath, nil).Table()["deepseek-flash"]
+	if r.CacheWrite5mRate == nil || r.CacheWrite5mRate.Sign() != 0 {
+		t.Errorf("deepseek cache_write_5m = %v, want 0 (inherited from the shipped row, not derived at 1.25x input)", r.CacheWrite5mRate)
+	}
+	if r.CacheWrite1hRate == nil || r.CacheWrite1hRate.Sign() != 0 {
+		t.Errorf("deepseek cache_write_1h = %v, want 0 (inherited from the shipped row, not derived at 2x input)", r.CacheWrite1hRate)
+	}
+	if r.Peak == nil {
+		t.Error("Peak = nil after a partial override; the override silently reverted the model to flat pricing")
+	}
+	if got := perTokenToMTok(r.InputRate); got != "0.200000" {
+		t.Errorf("input = $%s/MTok, want the override's $0.200000", got)
+	}
+
+	// A shipped Claude row keeps the derivation, so its writes follow the
+	// *override's* input rather than the shipped one.
+	claudePath := filepath.Join(dir, "claude.toml")
+	if err := os.WriteFile(claudePath, []byte("model = \"claude-sonnet-5\"\ninput_rate = 5.00\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	c := NewLoader(claudePath, nil).Table()["claude-sonnet-5"]
+	if got := perTokenToMTok(c.CacheWrite5mRate); got != "6.250000" {
+		t.Errorf("claude cache_write_5m = $%s/MTok, want $6.250000 (1.25x the override's 5.00)", got)
+	}
+	if got := perTokenToMTok(c.CacheWrite1hRate); got != "10.000000" {
+		t.Errorf("claude cache_write_1h = $%s/MTok, want $10.000000 (2x the override's 5.00)", got)
+	}
+}
+
+// T13: one place applies the configured dates, so an override -- which cannot
+// carry a window -- can never clobber them. A `none` list is non-nil and
+// empty: it excludes nothing rather than falling back to the shipped 33.
+func TestLoaderOverrideKeepsConfiguredOffPeakDates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prices.toml")
+	if err := os.WriteFile(path, []byte("model = \"deepseek-flash\"\ninput_rate = 0.20\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	holiday := time.Date(2026, time.October, 1, 2, 0, 0, 0, time.UTC) // a shipped holiday, in-window
+	otherHoliday := time.Date(2026, time.January, 1, 2, 0, 0, 0, time.UTC)
+
+	one := NewLoader(path, []string{"2026-10-01"}).Table()["deepseek-flash"].Peak
+	if one == nil {
+		t.Fatal("deepseek-flash lost its Peak window behind an override")
+	}
+	if len(one.OffPeakDates) != 1 {
+		t.Fatalf("OffPeakDates = %v, want exactly the one configured date (not the shipped 33)", one.OffPeakDates)
+	}
+	if one.IsPeak(holiday) {
+		t.Error("IsPeak on the configured excluded date = true, want false")
+	}
+	if !one.IsPeak(otherHoliday) {
+		t.Error("IsPeak on 2026-01-01 = false, want true (the custom list replaced the shipped 33)")
+	}
+
+	none := NewLoader(path, []string{}).Table()["deepseek-flash"].Peak
+	if none == nil {
+		t.Fatal("deepseek-flash lost its Peak window under a `none` list")
+	}
+	if len(none.OffPeakDates) != 0 {
+		t.Errorf("OffPeakDates = %v, want empty (`none` excludes nothing)", none.OffPeakDates)
+	}
+	if !none.IsPeak(holiday) {
+		t.Error("IsPeak = false under `none`, want true (no date is excluded)")
+	}
+}
+
+// T17(b): the freshness rule seen from the Loader side. Deterministic rather
+// than -race dependent, because go test ./... does not enable the race
+// detector -- a shared window would corrupt A's dates when B was built, and
+// nothing else would notice.
+func TestLoadersResolveOffPeakDatesIndependently(t *testing.T) {
+	dir := t.TempDir()
+	a := NewLoader(filepath.Join(dir, "a.toml"), []string{"2026-10-01"})
+	b := NewLoader(filepath.Join(dir, "b.toml"), []string{"2026-01-01", "2026-01-02"})
+
+	if n := len(a.Table()["deepseek-flash"].Peak.OffPeakDates); n != 1 {
+		t.Errorf("loader A excludes %d dates, want 1", n)
+	}
+	if n := len(b.Table()["deepseek-flash"].Peak.OffPeakDates); n != 2 {
+		t.Errorf("loader B excludes %d dates, want 2", n)
+	}
+	if n := len(ShippedTable()["deepseek-flash"].Peak.OffPeakDates); n != 33 {
+		t.Errorf("ShippedTable() excludes %d dates after two configured loaders were built, want the shipped 33", n)
+	}
+	if n := len(a.Table()["deepseek-flash"].Peak.OffPeakDates); n != 1 {
+		t.Errorf("loader A now excludes %d dates, want 1 (a shared window would let B overwrite A)", n)
 	}
 }
