@@ -243,6 +243,6 @@ be true alongside "we decode `br`/`zstd`" — see
 
 | | |
 |---|---|
-| Architecture, schema, cost model | [docs/context/](docs/context/) |
+| Architecture, schema, cost model, conventions | [docs/context/INDEX.md](docs/context/INDEX.md) |
 | The design and its decision log | [docs/planning/GI-1-claude-lens-v1.md](docs/planning/GI-1-claude-lens-v1.md) |
 | The acceptance run, as executed | [docs/acceptance.md](docs/acceptance.md) |
