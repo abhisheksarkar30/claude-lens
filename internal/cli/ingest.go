@@ -85,6 +85,11 @@ func newTailer(cfg *config.Config, root string, st collectorStore) *jsonlogs.Tai
 	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
 		t.SetAccount(acct.Name, acct.BillingMode)
 	}
+	// The api side has no such guard, and needs none: billing_mode is the
+	// literal "api" and is never the empty string, while a zero apiAccount is
+	// the value the consumer path already permits. The column invariant 5 keys
+	// off is billing_mode, not account.
+	t.SetModelBilling(resolvedAPIPrefixes(cfg), firstAccount(cfg, "api").Name, "api")
 	return t
 }
 

@@ -614,3 +614,43 @@ func TestNewTailerGuardKeepsTheSeededBillingMode(t *testing.T) {
 		t.Errorf("Account() = (%q, %q), want (work, subscription)", name, mode)
 	}
 }
+
+// T14: newTailer consumes resolvedAPIPrefixes rather than a hand-rolled list,
+// in both directions. Read through the ModelBilling() accessor beside
+// Account(). Dropping the resolver from newTailer -- so that the shipped
+// default silently stops being applied -- fails this test rather than being a
+// diff a reviewer has to spot.
+func TestNewTailerWiresResolvedAPIPrefixes(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+
+	// An unconfigured install: the shipped default, not an empty list.
+	cfg := config.Default()
+	prefixes, account, mode := newTailer(cfg, t.TempDir(), st).ModelBilling()
+	if len(prefixes) != 1 || prefixes[0] != "deepseek-" {
+		t.Errorf("ModelBilling prefixes = %v, want the shipped [deepseek-] on an unconfigured install", prefixes)
+	}
+	// billing_mode is the literal "api" even with no api account configured:
+	// it is the column invariant 5 keys off, so it is never the empty string.
+	if mode != "api" {
+		t.Errorf("ModelBilling billing mode = %q, want the literal api", mode)
+	}
+	if account != "" {
+		t.Errorf("ModelBilling account = %q, want empty (no api account is configured)", account)
+	}
+
+	// A configured list replaces the shipped one, and the api account is
+	// picked out by billing mode rather than by position.
+	cfg.ApiModelPrefixes = []string{"acme-"}
+	cfg.Accounts = []config.Account{
+		{Name: "work", BillingMode: "subscription", Plan: "max5x"},
+		{Name: "payg", BillingMode: "api"},
+	}
+	prefixes, account, mode = newTailer(cfg, t.TempDir(), st).ModelBilling()
+	if len(prefixes) != 1 || prefixes[0] != "acme-" {
+		t.Errorf("ModelBilling prefixes = %v, want [acme-] (the resolver's output, replacing the shipped list)", prefixes)
+	}
+	if account != "payg" || mode != "api" {
+		t.Errorf("ModelBilling = (%q, %q), want (payg, api)", account, mode)
+	}
+}

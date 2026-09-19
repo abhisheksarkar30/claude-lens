@@ -17,6 +17,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -73,14 +74,22 @@ type Tailer struct {
 	sessionRule SessionRule
 	pricer      PriceComputer
 
-	// account/billingMode are fixed for every row this tailer writes.
+	// account/billingMode are the default for every row this tailer writes.
 	// ponytail: a JSONL line carries no auth signal to disambiguate
 	// between multiple configured accounts, so this is one value for the
 	// whole tailer rather than a per-row resolution; ceiling: a multi-
 	// account setup with more than one subscription account can't tell
 	// their JSONL history apart -- revisit if that becomes real.
+	//
+	// The api* fields below are the one exception, and they do not reopen that
+	// ceiling: a model prefix is a signal the line *does* carry, so a
+	// prefix-matched row resolves per row rather than taking the default.
 	account     string
 	billingMode string
+
+	apiPrefixes    []string
+	apiAccount     string
+	apiBillingMode string
 }
 
 // New returns a Tailer walking root, writing to st. Every optional seam
@@ -109,6 +118,22 @@ func (t *Tailer) SetAccount(name, billingMode string) {
 // gets, unless a model prefix routes it otherwise.
 func (t *Tailer) Account() (name, billingMode string) {
 	return t.account, t.billingMode
+}
+
+// SetModelBilling lists the model prefixes that bill pay-as-you-go, and the
+// account/billing mode such a model's rows get. A prefix list consumed only
+// behind a tailer.
+func (t *Tailer) SetModelBilling(prefixes []string, apiAccount, apiBillingMode string) {
+	t.apiPrefixes = prefixes
+	t.apiAccount = apiAccount
+	t.apiBillingMode = apiBillingMode
+}
+
+// ModelBilling reports the prefixes that route a row to the api account, and
+// the account/billing mode such a row gets. prefixes is a copy, so a caller
+// cannot mutate the tailer's own slice -- the same rule AllKinds() follows.
+func (t *Tailer) ModelBilling() (prefixes []string, account, billingMode string) {
+	return slices.Clone(t.apiPrefixes), t.apiAccount, t.apiBillingMode
 }
 
 // Stats reports one Poll's work, for logging and tests.
@@ -316,14 +341,26 @@ func (t *Tailer) buildEvent(l *line, f walkedFile) (*store.Event, parse.Meta, pa
 		CliEntrypoint: l.CliEntrypoint,
 	}
 
+	// Account and billing mode resolve per row, not once for the tailer: one
+	// transcript tree holds both Claude and DeepSeek traffic, and a model whose
+	// prefix is configured pay-as-you-go must land in the api account with a
+	// real cost rather than the hypothetical column.
+	account, billingMode := t.account, t.billingMode
+	for _, p := range t.apiPrefixes {
+		if strings.HasPrefix(usage.Model, p) {
+			account, billingMode = t.apiAccount, t.apiBillingMode
+			break
+		}
+	}
+
 	startedAt := parseTimestamp(l.Timestamp)
 	ev := &store.Event{
 		RequestID:          requestKey(l),
 		Source:             "jsonl",
 		FirstSource:        "jsonl",
 		StartedAt:          startedAt,
-		Account:            t.account,
-		BillingMode:        t.billingMode,
+		Account:            account,
+		BillingMode:        billingMode,
 		ModelRequested:     usage.Model,
 		ModelResolved:      usage.Model,
 		InputTokens:        usage.InputTokens,

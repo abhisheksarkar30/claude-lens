@@ -2,10 +2,12 @@ package jsonlogs
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
@@ -375,5 +377,123 @@ func TestSetAccountAssignsUnconditionally(t *testing.T) {
 	name, mode := tailer.Account()
 	if name != "work" || mode != "api" {
 		t.Errorf("Account() = (%q, %q), want (work, api)", name, mode)
+	}
+}
+
+// --- Per-row billing routing (br-GI-3-07) ---
+
+// writeLines writes a JSONL transcript from the given lines.
+func writeLines(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	body := ""
+	for _, l := range lines {
+		body += l + "\n"
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile %s: %v", path, err)
+	}
+}
+
+// assistantLine is one assistant-with-usage transcript line, the only shape
+// dedup and token extraction consider.
+func assistantLine(requestID, sessionID, model string, inputTokens int) string {
+	return fmt.Sprintf(
+		`{"type":"assistant","sessionId":%q,"uuid":"u-%s","requestId":%q,"message":{"model":%q,"stop_reason":"end_turn","usage":{"input_tokens":%d,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}`,
+		sessionID, requestID, requestID, model, inputTokens)
+}
+
+// T7: one tailer, two models. A prefix-matched row bills to the api account
+// with a real cost in cost_usd; a Claude row from the same tailer still bills
+// to the subscription account with its cost in the hypothetical column. That
+// the two resolve differently from one tailer is the entire point -- resolving
+// once per tailer is what the api* seam replaced.
+func TestPollRoutesAPIPrefixedModelsPerRow(t *testing.T) {
+	root := t.TempDir()
+	writeLines(t, filepath.Join(root, "log.jsonl"),
+		assistantLine("req_ds", "sess_route", "deepseek-flash", 1_000_000),
+		assistantLine("req_cl", "sess_route", "claude-sonnet-5", 1_000_000),
+	)
+
+	st := newTestStore(t)
+	tailer := New(root, st)
+	tailer.SetPriceTable(pricing.ShippedTable())
+	// The exact value resolvedAPIPrefixes(cfg) returns on an unconfigured
+	// install, so this is the shipped default's behaviour, not a hand-rolled
+	// list.
+	tailer.SetModelBilling(pricing.ShippedAPIModelPrefixes(), "", "api")
+
+	if _, err := tailer.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	evs := eventsByRequestID(t, st)
+	ds, ok := evs["req_ds"]
+	if !ok {
+		t.Fatalf("no event for req_ds: %v", evs)
+	}
+	if ds.BillingMode != "api" {
+		t.Errorf("deepseek row BillingMode = %q, want api", ds.BillingMode)
+	}
+	if ds.CostUSD == nil {
+		t.Error("deepseek row CostUSD = nil, want a real cost in cost_usd")
+	}
+	if ds.ApiEquivalentCostUSD != nil {
+		t.Errorf("deepseek row ApiEquivalentCostUSD = %v, want nil (invariant 5: never both)", *ds.ApiEquivalentCostUSD)
+	}
+
+	cl, ok := evs["req_cl"]
+	if !ok {
+		t.Fatalf("no event for req_cl: %v", evs)
+	}
+	if cl.BillingMode != "subscription" {
+		t.Errorf("claude row BillingMode = %q, want subscription", cl.BillingMode)
+	}
+	if cl.ApiEquivalentCostUSD == nil {
+		t.Error("claude row ApiEquivalentCostUSD = nil, want the hypothetical cost")
+	}
+	if cl.CostUSD != nil {
+		t.Errorf("claude row CostUSD = %v, want nil", *cl.CostUSD)
+	}
+}
+
+// The nil-list case. SetModelBilling(nil, ...) routes nothing, which is
+// exactly how a call site that forgot resolvedAPIPrefixes would fail --
+// silently, because strings.HasPrefix over a nil slice simply never matches
+// and nothing returns an error.
+func TestSetModelBillingNilRoutesNothing(t *testing.T) {
+	root := t.TempDir()
+	writeLines(t, filepath.Join(root, "log.jsonl"),
+		assistantLine("req_nil", "sess_nil", "deepseek-flash", 1000))
+
+	st := newTestStore(t)
+	tailer := New(root, st)
+	tailer.SetPriceTable(pricing.ShippedTable())
+	tailer.SetModelBilling(nil, "payg", "api")
+
+	if _, err := tailer.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	ev := eventsByRequestID(t, st)["req_nil"]
+	if ev == nil {
+		t.Fatal("no event for req_nil")
+	}
+	if ev.BillingMode != "subscription" {
+		t.Errorf("BillingMode = %q, want subscription (a nil prefix list routes nothing)", ev.BillingMode)
+	}
+}
+
+// ModelBilling returns a copy, so a caller cannot mutate the tailer's own
+// slice -- the same rule AllKinds() follows.
+func TestModelBillingReturnsACopy(t *testing.T) {
+	tailer := New(t.TempDir(), newTestStore(t))
+	tailer.SetModelBilling([]string{"deepseek-"}, "payg", "api")
+
+	prefixes, account, mode := tailer.ModelBilling()
+	if len(prefixes) != 1 || prefixes[0] != "deepseek-" || account != "payg" || mode != "api" {
+		t.Fatalf("ModelBilling() = (%v, %q, %q), want ([deepseek-], payg, api)", prefixes, account, mode)
+	}
+	prefixes[0] = "mutated"
+	if again, _, _ := tailer.ModelBilling(); again[0] != "deepseek-" {
+		t.Errorf("mutating the returned slice changed the tailer's own: next call returned %q", again[0])
 	}
 }
