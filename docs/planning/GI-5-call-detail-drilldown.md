@@ -703,7 +703,7 @@ generated `docs/context/` tree. The runbook, to be executed against
 | 7 | From **Overview**, turn `clens serve` off, then click a call id. (Starting state matters: on a **straight sequential run** `#calls-table` still holds the rows step 3 last loaded — nothing clears it, and `show('overview')` does not touch it; on a **fresh page load** it was never loaded.) | The view switches to **Calls**; the Calls view is revealed with its filter row intact and `#calls-table` showing **the rows step 3 last loaded** (sequential run) **or** an **empty** table (fresh load) — `loadCalls` is `#calls-table`'s only writer and writes nothing when `api()` rejects (`app.js:124-144`), so in neither case is the container left blank (`table()` would have cleared it only had `loadCalls` reached it), and the status line carries the error. |
 | 8 | Open a call detail (step 1), then click the **Overview** tab, then click a **different** call id on Overview | The Calls view shows the **new** call — never the previous one, not even momentarily during the fetch. This is the tab-as-second-route (D5) and the runbook step that exercises F2.1's fix on the ordinary (non-racing) path — step 9 is the racing variant: leaving the first detail via the Overview tab runs `show('overview')`, whose unconditional reset clears both modes, so nothing from the first drill-down survives into the second. |
 | 9 | Overview → click a call id, then **immediately** click the **Warnings** tab (while the detail fetch is still in flight), then click a **different** call id there | The new call's detail appears; the first call's request and response bodies are **never** shown — not even momentarily. This is the F4.1 window D10 closes: the Warnings tab click bumps `detailSeq`, so the first fetch's late resolution fails its `seq !== detailSeq` guard and is dropped rather than flipping a stale body into `#call-detail` for `reveal('calls')` to un-hide under the second click. |
-| 10 | **Stale rejection — F5.1's `[data-call]` catch guard.** Against a store large enough that the detail fetch is not instantaneous, from **Overview** click a call id, then click the **Warnings** tab immediately (while the detail fetch is still in flight); let that in-flight request **fail** before it resolves (stop `clens serve` inside the window the slow fetch leaves open). | The view stays on **Warnings** — nothing pulls it back to Calls — and **no** status line appears for the abandoned click. The pre-F5.1 catch ran `await show('calls')` on **any** rejection, so a stale one snapped the view back to Calls and wrote the error; the `if (seq === detailSeq)` guard now drops it, so neither happens. |
+| 10 | **Stale rejection — F5.1's `[data-call]` catch guard.** Against a store large enough that the detail fetch is not instantaneous, from **Overview** click a call id, then click the **Warnings** tab immediately (while the detail fetch is still in flight); let that in-flight request **fail** before it resolves (stop `clens serve` inside the window the slow fetch leaves open). | The view stays on **Warnings** — nothing pulls it back to Calls — and **no** status line appears for the abandoned click. The pre-F5.1 catch ran `await show('calls')` on **any** rejection, so a stale one snapped the view back to Calls and wrote the error; the `if (seq === detailSeq)` guard now drops it, so neither happens. **Amended during the recorded run (§10):** by *this* method the status line is never empty, because stopping `clens serve` also trips the SSE subscription's error handler; the observable the run asserts is the narrower "no status line **from the abandoned click**" — the abandoned call's `api()` failure would read `Failed to fetch`, and it does not appear. |
 
 **Step 10's precondition is timing, stated rather than assumed.** The step exercises the catch guard
 only if the request is still in flight when the **Warnings** tab is clicked (the large store widens
@@ -844,6 +844,136 @@ the sketch, not the decomposition — `.beads/GI-5/` is the artifact of record.*
 further than "one logical change": §9's 02 ships primitives that are inert until 03's renderers use
 them, and 01's `hidden` attributes leave the detail permanently invisible until 03 un-hides it — so
 the sketch's halves are unsafe in *either* landing order, not merely unverifiable alone.
+
+---
+
+## 10. Recorded manual run (T5)
+
+Run on 2026-09-19 against the fix as merged into `GI-5-call-detail-drilldown` at `039711d`. §5 T5
+names this section as the run's home; §4's last row records why.
+
+**What was actually run, and where it departs from §5's stated setup.** §5 T5 says `go run ./cmd/clens
+serve` at `127.0.0.1:8798` with a populated store. A `clens serve` built *before* this story was
+already listening on 8798 and serving the old embedded assets, so it could not exercise the fix. The
+run therefore used a binary built from this branch, on `127.0.0.1:8799` with `-allow-remote=false`,
+against a **copy** of that populated store (`lens.db`, 39.5 MB, `X-Total-Count: 81006`) — the copy
+because the live instance holds SQLite's single write connection. Same binary, same store, same
+`api()` and asset bytes; only the port and the file differ. The runbook's ten steps are otherwise
+followed verbatim.
+
+**How it was driven.** No browser automation exists in this repo (§5 T5), but that is a statement
+about *this repo*, not about the machine: the run drove the real dashboard in **headless Edge
+153.0.4234.32** over the Chrome DevTools Protocol, from a throwaway Node script outside the tree.
+Each step is a real DOM `.click()` on a real link rendered from the real store, and the step-1
+network observation is CDP's own `Network.requestWillBeSent` stream, not an inference. The
+observations below are what the browser did; the harness that drove it is not committed, and
+`internal/web/assets_test.go` remains the only automated guard the repo ships.
+
+| # | Result | What was observed |
+|---|---|---|
+| 1 | **PASS** | Network: exactly `["/api/requests/81006"]`. See below. |
+| 2 | **PASS** | `‹ all calls` issued one list fetch; the list reappeared with its filter row (`f-source`, `f-model`, `f-billing`) and pager (`calls-prev`, `calls-next`) intact, range `1-50 of 81006`. R3 holds. |
+| 3 | **PASS** | Calls tab → the `id` cell of the first row: list replaced by the detail, only `/api/requests/81006` issued. |
+| 4 | **PASS** | Warnings tab → a `call` id (72797): the view switched to Calls and the detail showed 72797, with no list fetch. |
+| 5 | **PASS** | Sessions tab → a session id: session detail only, `‹ all sessions` rendered, sessions list hidden, **no** view switch (D8), no `#calls-list` fetch. The detail named `Session s_1789818336907_d8530832` and carried its calls table. |
+| 6 | **PASS** | From that open detail, a call id in its calls table (79682): view switched to **Calls** in detail mode, no list fetch — the fourth `data-call` renderer, and `reveal('calls')` exercised from the Sessions view. |
+| 7 | **PASS** | See below — the sequential-run starting state reproduced exactly. |
+| 8 | **PASS** | Detail open for 81006 → **Overview** tab → the detail closed and the list was unhidden (D5) → clicking a *different* call (81007) rendered 81007, never 81006, not even transiently. |
+| 9 | **PASS** | The racing window **was** observed — but only with instrumentation. See below. |
+| 10 | **PASS** | Landed inside its timing window, with one amendment to the runbook's stated observable. See below. |
+
+**Step 1, in full** — the reported defect, at the wire:
+
+```
+Network observed: ["http://127.0.0.1:8799/api/requests/81006"]
+```
+
+One request, the detail endpoint. No `/api/requests?…` follows it. The pre-fix signature recorded in
+§2.1 was the reverse order — `["/api/requests?limit=50&offset=0","/api/requests/42"]` — the list
+fetch that made the click "abruptly fetch the list of calls". Alongside the wire observation: the
+detail opened, `#calls-list` was hidden, the view switched to Calls, the tab strip marked Calls
+active, the heading read `Call 81006`, and the status line stayed empty.
+
+**Step 7 — the sequential-run state.** The step's own text says the outcome differs between a
+straight sequential run and a fresh load, so the run reproduced the sequential state deliberately:
+the Calls tab was visited first, loading `#calls-table` to 10,283 chars of rows, then Overview, then
+the server was stopped (verified dead: `still-listening=0`), then a call id was clicked. Observed:
+
+```
+{"views":["calls"],"active":["calls"],"detailOpen":false,"callsListHidden":false,
+ "callsTableLen":10283,"status":"Failed to fetch","statusErr":"error"}
+```
+
+The view switched to Calls as §5 T5 predicts, the filter row was intact, the detail did not open,
+and `#calls-table` still held **exactly** the 10,283 chars the Calls visit had loaded — not blanked.
+The status line carried the error, in the error style. This is the D4 fallback working, and it is
+also the run's **positive control** for step 10 (below): this is what the code does when an
+`api()` rejection is *live*.
+
+**Step 9 — the window was landed in, and the honest measurement of how.** §5 T5's step 9 asks for the
+tab to be clicked while the detail fetch is still in flight. Measured on this store, the detail fetch
+takes **2.7–3.4 ms** (six samples; the list fetch takes ~5.1 ms) — a ~3 ms window, which a human
+cannot hit and a script cannot hit reliably. The run therefore *held* the fetch at the CDP request
+stage, asserting explicitly that it was still in flight at the moment the Warnings tab was clicked,
+then clicked a different call id there, then released the held request as a **success**. Observed:
+the second call's detail rendered, the first call's bodies never appeared, the view was Calls (the
+newest click), and the status line was empty. So the window was genuinely exercised — D10's
+stale-**success** half — but by instrumentation, not by timing. A run that reported "the window was
+observed" without saying this would be overstating it.
+
+**Step 10 — landed inside the window, both variants, one amendment.** §5 T5's precondition paragraph
+allows this step to record a miss rather than claim the guard. It did not have to: the run landed
+inside the window, twice, by two methods.
+
+*Variant (a) — the runbook's literal method.* From Overview, click a call id, hold its fetch in
+flight, click the **Warnings** tab, then stop `clens serve` inside the window (verified dead), then
+release the held request so it fails against a dead server. Observed: the view stayed on **Warnings**,
+the tab strip stayed on Warnings, the abandoned call never rendered — and the **status line was not
+empty**. It read `live updates disconnected — retrying…`.
+
+**That is the SSE subscription's own error handler, not the catch guard.** Stopping `clens serve`
+trips the `EventSource` independently of the detail fetch, and `subscribe()` writes its own message.
+So §5 T5's expected observable — "**no** status line appears" — is **not literally achievable by the
+method that step prescribes**; the server being down is precisely what makes the status line
+non-empty. The assertion has to be the narrower *"no status line **from the abandoned click**"*, and
+that is how it was applied: the abandoned call's `api()` failure would have read `Failed to fetch`
+(step 7's exact text, same code path), and it does not appear. Recorded as an amendment to §5 T5
+step 10 rather than smoothed over — the step's *intent* is unambiguous and met, but its stated
+observable, read literally, is unmeetable.
+
+*Variant (b) — isolated.* Same in-flight-then-stale timing, but the held request was failed via CDP
+`Fetch.failRequest` with the server left **up**, so SSE kept its connection and the catch guard was
+the only code that could write to the status line. Observed: the view stayed on Warnings, no detail
+rendered, and the status line was **empty — nothing wrote at all**. This is the clean test of F5.1.
+
+*Why the two together mean the guard works.* Variant (b) alone shows "a stale rejection writes
+nothing", which would also be true if the catch did nothing ever. Step 7 supplies the discriminating
+case in the same instrument: the *same* `api()` rejection on the *live* path did switch the view to
+Calls and did write `Failed to fetch`. Same app, same failure mode, no generation bump in between —
+the guard is the only thing that differs, and it is what changes the outcome.
+
+**Beyond the runbook — R4's ceiling is real and was measured.** §6 R4 accepts that
+`scroll-margin-top: 72px` is the *single-row* header height and that a wrapped header can still
+cover the `‹ all calls` control. Forced to scroll (400px-tall viewport), measured across widths:
+
+| Viewport | `.app-header` height | `#call-back` top | Covered by the sticky header? |
+|---|---|---|---|
+| 600 px | 138 px | 72 px | **yes** |
+| 800–1200 px | 101 px | 72 px | **yes** |
+| ≥ 1400 px | 58 px | 72 px | no |
+
+The control lands at `top: 72` in every case — `scrollIntoView` is doing exactly what it is told;
+the constant is simply the wrong one once the header wraps. So R4's accepted ceiling is confirmed,
+and its trigger is narrower than "sometimes": **the control is hidden whenever the header wraps to
+two or more rows (≲1200 px on this machine's font stack) and the document scrolls.** At ≥1400 px,
+D7's offset works as designed. Left as the documented ceiling: the fix for it is the runtime
+`getBoundingClientRect` → custom-property machinery R4 declines to add for a loopback dev
+dashboard, and it is one line if it ever matters.
+
+**What this run does not cover.** It is a click-through of the shipped assets, not a regression
+suite: nothing here re-runs on a future change, which is why T1–T3 exist alongside it. The 404 path
+is absent for the reason §5 T5 gives (no UI action produces one). The two racing windows, if ever
+exercised again, will need the same instrumentation or a slow enough store to land in naturally.
 
 ---
 
