@@ -127,30 +127,33 @@ func boolToInt(b bool) int64 {
 // into the existing row instead of duplicating it (invariant 3): whichever
 // side is capture_complete wins the token/cost columns, source_refs gains
 // the new source, and the owning session's totals are re-derived in the
-// same transaction. It returns the row's id.
-func (s *Store) InsertEvent(ctx context.Context, ev *Event) (int64, error) {
+// same transaction. It returns the row's id and the session that row
+// belongs to — on a merge the *existing* row's session, since a merge never
+// rewrites session_id.
+func (s *Store) InsertEvent(ctx context.Context, ev *Event) (id int64, sessionID string, err error) {
 	ev.TotalPromptTokens = ev.InputTokens + ev.CacheWrite5mTokens + ev.CacheWrite1hTokens + ev.CacheReadTokens
 
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("store: InsertEvent: begin: %w", err)
+		return 0, "", fmt.Errorf("store: InsertEvent: begin: %w", err)
 	}
 	defer tx.Rollback()
 
-	id, merged, err := insertOrMerge(ctx, tx, ev)
+	var merged bool
+	id, sessionID, merged, err = insertOrMerge(ctx, tx, ev)
 	if err != nil {
-		return 0, fmt.Errorf("store: InsertEvent: %w", err)
+		return 0, "", fmt.Errorf("store: InsertEvent: %w", err)
 	}
-	if merged && ev.SessionID != "" {
-		if err := reconcileSessionTx(ctx, tx, ev.SessionID); err != nil {
-			return 0, fmt.Errorf("store: InsertEvent: reconcile session: %w", err)
+	if merged && sessionID != "" {
+		if err := reconcileSessionTx(ctx, tx, sessionID); err != nil {
+			return 0, "", fmt.Errorf("store: InsertEvent: reconcile session: %w", err)
 		}
 	}
 
 	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("store: InsertEvent: commit: %w", err)
+		return 0, "", fmt.Errorf("store: InsertEvent: commit: %w", err)
 	}
-	return id, nil
+	return id, sessionID, nil
 }
 
 // InsertEvents inserts every event in one transaction, for the consumer's
@@ -162,15 +165,17 @@ func (s *Store) InsertEvents(ctx context.Context, evs []*Event) error {
 	}
 	defer tx.Rollback()
 
+	// Keyed by the surviving row's session, not the incoming event's: see
+	// insertOrMerge.
 	sessions := map[string]bool{}
 	for _, ev := range evs {
 		ev.TotalPromptTokens = ev.InputTokens + ev.CacheWrite5mTokens + ev.CacheWrite1hTokens + ev.CacheReadTokens
-		_, merged, err := insertOrMerge(ctx, tx, ev)
+		_, sessionID, merged, err := insertOrMerge(ctx, tx, ev)
 		if err != nil {
 			return fmt.Errorf("store: InsertEvents: request_id %s: %w", ev.RequestID, err)
 		}
-		if merged && ev.SessionID != "" {
-			sessions[ev.SessionID] = true
+		if merged && sessionID != "" {
+			sessions[sessionID] = true
 		}
 	}
 	for sessionID := range sessions {

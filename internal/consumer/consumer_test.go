@@ -226,9 +226,9 @@ type failingStore struct {
 	failedOnce atomic.Bool
 }
 
-func (f *failingStore) InsertEvent(ctx context.Context, ev *store.Event) (int64, error) {
+func (f *failingStore) InsertEvent(ctx context.Context, ev *store.Event) (int64, string, error) {
 	if !f.failedOnce.Swap(true) {
-		return 0, errors.New("simulated store failure")
+		return 0, "", errors.New("simulated store failure")
 	}
 	return f.inner.InsertEvent(ctx, ev)
 }

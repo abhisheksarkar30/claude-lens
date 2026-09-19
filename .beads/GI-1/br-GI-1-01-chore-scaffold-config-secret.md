@@ -62,11 +62,16 @@ the only one that writes it.
      expands no `"${USERNAME}"`, so that would reach `icacls` literally and fail with *"No mapping
      between account names and security IDs was done"*.
   2. Write a temp file **in the same directory** as `secrets.toml`.
-  3. Apply the complete ACL to the temp file: `icacls <tmp> /inheritance:r /grant:r <user>:F`.
-     `/inheritance:r` is load-bearing, not redundant — a newly created file **does inherit** its
-     parent directory's ACEs (that is what inheritance means), including one directory of
-     indirection, so without it the `%USERPROFILE%` `SYSTEM` / `Administrators` / user ACEs remain.
-     No `/reset` is needed: the rename replaces the live file's ACLs wholesale.
+  3. Apply the complete ACL to the temp file: `icacls <tmp> /reset`, then
+     `icacls <tmp> /inheritance:r /grant:r <user>:F`. Both are load-bearing, for **different**
+     reasons. `/inheritance:r` drops the ACEs the new file inherits from its parent directory
+     (`%USERPROFILE%`'s `SYSTEM` / `Administrators` / user ACEs) — inheritance is what a new file
+     gets, so without it those survive. `/reset` handles the other half: a file Go has just created
+     on Windows carries **explicit** ACEs for SYSTEM, Administrators, and the current user —
+     verified against a real `icacls` read-back, which shows no `(I)` flag on any of them — and
+     `/inheritance:r` strips only *inherited* ACEs while `/grant:r` replaces only the named
+     principal's own rights. `/reset` → `/inheritance:r` → `/grant:r` is the sequence that
+     converges on exactly one principal; dropping `/reset` leaves three.
   4. **Read the DACL back** (`icacls <tmp>`) and assert the resulting principal set is **exactly** the
      intended one.
   5. Only then `os.Rename` over `secrets.toml`. The rename is the single atomic commit point.

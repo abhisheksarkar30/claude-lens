@@ -786,9 +786,15 @@ Admin API key. That is a real expansion of the blast radius and it is handled ex
       attempted). The temp-then-rename path removes that window: a failure at any step deletes the
       temp and leaves the live file byte- and ACL-identical to before, and the rename is the
       **single atomic commit point** — the credential and its verified ACL land together or not at
-      all. The rename replaces the live file's ACLs wholesale, which is also why no `/reset` pass is
-      needed (a freshly created temp file has only *inherited* ACEs, and `/inheritance:r` drops
-      those).
+      all. The rename replaces the live file's ACLs wholesale, but that is **not** a reason to skip
+      `/reset`: a file Go has just created on Windows carries *explicit* ACEs for SYSTEM,
+      Administrators, and the current user — verified against a real `icacls` read-back, which shows
+      no `(I)` flag on any of them — and `/inheritance:r` strips only *inherited* ACEs, while
+      `/grant:r` replaces only the named principal's own rights. So the sequence applied to the temp
+      file is `/reset` → `/inheritance:r` → `/grant:r`, and `/reset` is load-bearing rather than
+      redundant: it is the step that discards the file's explicit ACEs. (An earlier revision of this
+      paragraph claimed the created-file ACEs were inherited and that `/reset` was therefore
+      unnecessary. The read-back falsified that; see F1.3 in §Implementation review.)
     - **The one safe direct-on-target case is the file that does not yet exist.** When there is no
       `secrets.toml` to strand, `secret.Save` may create it in place and apply the same ACL directly:
       there is no prior credential and no prior permissions to lose. Every path where the file
@@ -1235,10 +1241,13 @@ future implementer can **test**.
   no ACEs to inherit" premise is corrected: a newly created file **does** inherit its parent
   directory's ACEs — that is what inheritance means — including at one directory of indirection, so
   `/inheritance:r` is load-bearing and **kept**. The destructive-before-constructive ordering is fixed
-  structurally: the complete ACL (`/inheritance:r` + `/grant:r`; no `/reset`, since the rename
-  replaces the live file's ACLs wholesale) is applied to a **temp file in the same directory**, the
-  DACL read back and asserted to be exactly the intended principal set, and only then renamed into
-  place. The plan now states **why** this makes fail-closed *true* rather than merely asserted:
+  structurally: the complete ACL (`/reset` + `/inheritance:r` + `/grant:r`) is applied to a **temp
+  file in the same directory**, the DACL read back and asserted to be exactly the intended principal
+  set, and only then renamed into place. (`/reset` is kept, per F2.1; F3.2 had dropped it on the
+  premise that a created file's ACEs are inherited, and a real `icacls` read-back falsified that —
+  they are explicit, so `/inheritance:r` alone leaves SYSTEM, Administrators, and the current user in
+  place. See F1.3.) The plan now states **why** this makes fail-closed *true* rather than merely
+  asserted:
   `icacls` applies its arguments in sequence, so a direct-on-target `/inheritance:r` followed by a
   failing `/grant:r` would leave a zero-ACE DACL denying everyone — stranding an existing
   `secrets.toml`, a state the "does not overwrite an existing credential" promise does not cover
@@ -1319,3 +1328,46 @@ back to `status=draft`.
   for that landing (or `develop` created first); "identical to deepseek-lens" is replaced by
   "carried over from". The `.githooks` claims, the "two workflow guards only — no test CI" claim, and
   the `.gitignore` list were checked and hold.
+
+## Implementation review
+
+The implementation cross-review loop (`impl-conductor`) ran against the landed code and the beads.
+Its findings are recorded here rather than in §Change history, which carries the *plan* review
+rounds. Three were code defects, fixed in place; one was this document being stale, fixed here.
+
+- **F1.3 (MINOR, plan defect) — the `/reset` step is load-bearing, and this plan twice said it was
+  not.** §Security posture's temp-then-rename paragraph and the round-3 record (F3.2) both claimed
+  "no `/reset`, since the rename replaces the live file's ACLs wholesale", resting on the premise
+  that a file Go has just created carries only *inherited* ACEs. A real `icacls` read-back falsified
+  that premise: `os.CreateTemp` produces **explicit** ACEs for SYSTEM, Administrators, and the
+  current user, with no `(I)` flag, and `/inheritance:r` strips only inherited ACEs. Round-2's F2.1
+  had this right and specified `/reset` first; F3.2 then removed it on the bad premise. The **code
+  was correct throughout** — `internal/secret/applyWindowsACL` runs `/reset` → `/inheritance:r` →
+  `/grant:r`, and its doc comment already records the read-back — so this is a documentation fix
+  only, with no behaviour change and no safety impact: the DACL read-back still asserts exactly one
+  principal and still fails closed. Both plan passages are corrected above in place, and
+  `br-GI-1-01` step 3 now states what each of the two flags removes and why dropping `/reset` leaves
+  three principals rather than one.
+
+The three code findings, for the record, each now covered by a test that fails without the fix:
+
+- **F1.1 (BLOCKER) — a cross-source merge re-derived the wrong session.** `insertOrMerge` returned
+  only the row id, so both `InsertEvent` and the consumer reconciled `ev.SessionID` while
+  `mergeEvents` preserves `existing.SessionID`. For a real merge the two always differ (proxy
+  `s_<ms>_<hex>` vs the JSONL session uuid), so the merge left the owning session's totals at their
+  pre-merge values. `insertOrMerge` now returns the surviving row's session and every caller keys
+  its session work to that. The covering test used one id on both sides and passed vacuously; it now
+  uses two, and fails when the old return value is substituted back.
+- **F1.2 (MAJOR) — `cache_prefix_below_minimum` never consulted the per-model minimum.** The rule
+  fired on "marker present, nothing cached", which is the *symptom*; without the minimum it cannot
+  distinguish "too short to cache" from "cached nothing for another reason" — invalidated, expired,
+  raced — each of which has its own rule. The table
+  (512/1024/2048/4096, non-monotonic across generations) is now implemented and consulted, with the
+  prefix length derived from the captured body, and the rule declines when it has no body to measure
+  or does not know the model — the same discipline as an unpriced model storing NULL rather than
+  `$0.00`. Its fixture previously varied the *usage outcome*, which passes even when the rule ignores
+  the model; it now holds body and usage fixed and varies only the model, per test 14.
+- **F1.4 (NIT) — the containment import guard covered one third of its claim.** It banned only
+  `internal/secret`, while the package docs promise `secret`, `config`, and `ingest` alike. It now
+  bans all three for non-test files and keeps `secret` banned in tests too; `replay_test.go`'s
+  legitimate `internal/config` import is why the test-file exemption exists.

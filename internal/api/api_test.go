@@ -60,7 +60,7 @@ func seedEvent(t *testing.T, st *store.Store, opts func(*store.Event)) *store.Ev
 	if opts != nil {
 		opts(ev)
 	}
-	id, err := st.InsertEvent(context.Background(), ev)
+	id, _, err := st.InsertEvent(context.Background(), ev)
 	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}

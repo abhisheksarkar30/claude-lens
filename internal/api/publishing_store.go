@@ -34,14 +34,15 @@ func NewPublishingStore(st *store.Store, b *Broker) *PublishingStore {
 }
 
 // InsertEvent inserts ev through the wrapped store, then publishes a
-// {type:"event", id} event on success.
-func (p *PublishingStore) InsertEvent(ctx context.Context, ev *store.Event) (int64, error) {
-	id, err := p.Store.InsertEvent(ctx, ev)
+// {type:"event", id} event on success. It returns the written row's session
+// alongside the id, unchanged from the wrapped store.
+func (p *PublishingStore) InsertEvent(ctx context.Context, ev *store.Event) (int64, string, error) {
+	id, sessionID, err := p.Store.InsertEvent(ctx, ev)
 	if err != nil {
-		return id, err
+		return id, sessionID, err
 	}
 	p.broker.Publish(Event{Type: "event", ID: id})
-	return id, nil
+	return id, sessionID, nil
 }
 
 // UpsertWarnings attaches warnings through the wrapped store, then

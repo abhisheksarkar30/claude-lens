@@ -92,7 +92,7 @@ func TestPublishingStoreInsertEventPublishes(t *testing.T) {
 	ch, unsubscribe := broker.Subscribe()
 	defer unsubscribe()
 
-	id, err := ps.InsertEvent(context.Background(), &store.Event{
+	id, _, err := ps.InsertEvent(context.Background(), &store.Event{
 		RequestID: "req_publish_1", Source: "proxy", FirstSource: "proxy",
 		StartedAt: time.Now(), BillingMode: "api",
 	})
@@ -115,7 +115,7 @@ func TestPublishingStoreUpsertWarningsPublishesOnlyWhenNonEmpty(t *testing.T) {
 	broker := NewBroker()
 	ps := NewPublishingStore(st, broker)
 
-	id, err := ps.InsertEvent(context.Background(), &store.Event{
+	id, _, err := ps.InsertEvent(context.Background(), &store.Event{
 		RequestID: "req_publish_2", Source: "proxy", FirstSource: "proxy",
 		StartedAt: time.Now(), BillingMode: "api",
 	})

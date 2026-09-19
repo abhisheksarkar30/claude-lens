@@ -32,7 +32,7 @@ func insertEvent(t *testing.T, st *store.Store, requestID, account, model string
 		ModelResolved:  model,
 		InputTokens:    inputTokens,
 	}
-	if _, err := st.InsertEvent(context.Background(), ev); err != nil {
+	if _, _, err := st.InsertEvent(context.Background(), ev); err != nil {
 		t.Fatalf("InsertEvent %s: %v", requestID, err)
 	}
 }

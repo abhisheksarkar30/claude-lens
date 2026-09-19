@@ -28,7 +28,7 @@ func seedEvent(t *testing.T, st *store.Store, ev *store.Event) int64 {
 	if ev.FirstSource == "" {
 		ev.FirstSource = ev.Source
 	}
-	id, err := st.InsertEvent(context.Background(), ev)
+	id, _, err := st.InsertEvent(context.Background(), ev)
 	if err != nil {
 		t.Fatalf("InsertEvent %s: %v", ev.RequestID, err)
 	}

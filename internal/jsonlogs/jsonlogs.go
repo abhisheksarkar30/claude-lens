@@ -26,7 +26,10 @@ import (
 
 // Store is the slice of *store.Store the tailer calls.
 type Store interface {
-	InsertEvent(ctx context.Context, ev *store.Event) (int64, error)
+	// InsertEvent returns the written row's id and the session that row
+	// belongs to -- on a request_id merge, the *existing* row's session,
+	// not ev's. The tailer must key its session-scoped work to that id.
+	InsertEvent(ctx context.Context, ev *store.Event) (int64, string, error)
 	UpsertWarnings(ctx context.Context, eventID int64, warnings []store.Warning) error
 	SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error)
 	CursorStore
@@ -361,7 +364,7 @@ func parseTimestamp(s string) time.Time {
 // logged and counted by the caller, the same fail-open discipline
 // internal/consumer uses.
 func (t *Tailer) insert(ctx context.Context, ev *store.Event, meta parse.Meta, usage parse.Usage) bool {
-	id, err := t.st.InsertEvent(ctx, ev)
+	id, sessionID, err := t.st.InsertEvent(ctx, ev)
 	if err != nil {
 		log.Printf("jsonlogs: insert event %s: %v", ev.RequestID, err)
 		return false
@@ -377,14 +380,16 @@ func (t *Tailer) insert(ctx context.Context, ev *store.Event, meta parse.Meta, u
 		}
 	}
 
+	// sessionID is the written row's session, which after a cross-source
+	// merge is the first-written row's, not ev's -- see consumer.Store.
 	warningCount := len(warnings)
-	if t.sessionRule != nil && ev.SessionID != "" {
-		warningCount += t.runSessionRule(ctx, ev.SessionID)
+	if t.sessionRule != nil && sessionID != "" {
+		warningCount += t.runSessionRule(ctx, sessionID)
 	}
 
-	if t.recorder != nil && ev.SessionID != "" {
-		if err := t.recorder.RecordCall(ctx, ev.SessionID, ev, warningCount); err != nil {
-			log.Printf("jsonlogs: record session call %s: %v", ev.SessionID, err)
+	if t.recorder != nil && sessionID != "" {
+		if err := t.recorder.RecordCall(ctx, sessionID, ev, warningCount); err != nil {
+			log.Printf("jsonlogs: record session call %s: %v", sessionID, err)
 		}
 	}
 	return true

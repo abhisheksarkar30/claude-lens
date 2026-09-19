@@ -31,7 +31,10 @@ const (
 // narrowed to an interface so a test can inject a store that fails on
 // command without a second SQLite implementation.
 type Store interface {
-	InsertEvent(ctx context.Context, ev *store.Event) (int64, error)
+	// InsertEvent returns the written row's id and the session that row
+	// belongs to -- on a request_id merge, the *existing* row's session,
+	// not ev's. The consumer must key its session-scoped work to that id.
+	InsertEvent(ctx context.Context, ev *store.Event) (int64, string, error)
 	UpsertWarnings(ctx context.Context, eventID int64, warnings []store.Warning) error
 	SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error)
 }
@@ -195,7 +198,7 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 	c.flushCount.Add(1)
 	wrote := false
 	for _, pe := range batch {
-		id, err := c.st.InsertEvent(ctx, pe.ev)
+		id, sessionID, err := c.st.InsertEvent(ctx, pe.ev)
 		if err != nil {
 			log.Printf("consumer: insert event %s: %v", pe.ev.RequestID, err)
 			c.failed.Add(1)
@@ -210,16 +213,21 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 		}
 
 		warningCount := len(pe.warnings)
-		if c.sessionRule != nil && pe.ev.SessionID != "" {
-			warningCount += c.runSessionRule(ctx, pe.ev.SessionID)
+		if c.sessionRule != nil && sessionID != "" {
+			warningCount += c.runSessionRule(ctx, sessionID)
 		}
 
 		// Run last, after the session-scoped pass, so warning_count's
 		// re-derivation (ReconcileSession) counts findings that pass
 		// attached to earlier rows in this same session too.
-		if c.aggregator != nil && pe.ev.SessionID != "" {
-			if err := c.aggregator.RecordCall(ctx, pe.ev.SessionID, pe.ev, warningCount); err != nil {
-				log.Printf("consumer: record session call for %s: %v", pe.ev.SessionID, err)
+		//
+		// sessionID is the written row's session, which after a cross-source
+		// merge is the first-written row's, not pe.ev's. Folding into
+		// pe.ev.SessionID would create a session row owning no events and
+		// leave the row's real session out of the analysis.
+		if c.aggregator != nil && sessionID != "" {
+			if err := c.aggregator.RecordCall(ctx, sessionID, pe.ev, warningCount); err != nil {
+				log.Printf("consumer: record session call for %s: %v", sessionID, err)
 			}
 		}
 	}

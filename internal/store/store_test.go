@@ -80,7 +80,7 @@ func TestRoundTripAllFields(t *testing.T) {
 	ctx := context.Background()
 
 	ev := fullEvent("req-1")
-	id, err := st.InsertEvent(ctx, ev)
+	id, _, err := st.InsertEvent(ctx, ev)
 	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
@@ -161,7 +161,7 @@ func TestDerivedPromptTotal(t *testing.T) {
 	fixtures[1].TotalPromptTokens = 999999 // caller-supplied garbage must be ignored
 
 	for _, ev := range fixtures {
-		id, err := st.InsertEvent(ctx, ev)
+		id, _, err := st.InsertEvent(ctx, ev)
 		if err != nil {
 			t.Fatalf("InsertEvent: %v", err)
 		}
@@ -242,7 +242,7 @@ func TestBillingModeInvariants(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		id, err := st.InsertEvent(ctx, tc.ev)
+		id, _, err := st.InsertEvent(ctx, tc.ev)
 		if err != nil {
 			t.Fatalf("%s: InsertEvent: %v", tc.name, err)
 		}
@@ -285,7 +285,7 @@ func TestSessionCostSplit(t *testing.T) {
 		t.Fatalf("UpsertSession: %v", err)
 	}
 	for _, ev := range []*Event{api, sub} {
-		if _, err := st.InsertEvent(ctx, ev); err != nil {
+		if _, _, err := st.InsertEvent(ctx, ev); err != nil {
 			t.Fatalf("InsertEvent: %v", err)
 		}
 	}
@@ -313,7 +313,7 @@ func TestSessionCostSplit(t *testing.T) {
 	if err := st.UpsertSession(ctx, allUnpriced, "", u1.StartedAt); err != nil {
 		t.Fatalf("UpsertSession: %v", err)
 	}
-	if _, err := st.InsertEvent(ctx, u1); err != nil {
+	if _, _, err := st.InsertEvent(ctx, u1); err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
 	if err := st.ReconcileSession(ctx, allUnpriced); err != nil {
@@ -342,7 +342,7 @@ func TestWarningUpsertIdempotent(t *testing.T) {
 	if err := st.UpsertSession(ctx, "s_warn", "", ev.StartedAt); err != nil {
 		t.Fatalf("UpsertSession: %v", err)
 	}
-	id, err := st.InsertEvent(ctx, ev)
+	id, _, err := st.InsertEvent(ctx, ev)
 	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
@@ -530,7 +530,7 @@ func TestPurge(t *testing.T) {
 	unpriced.CostUSD = nil
 
 	for _, ev := range []*Event{old, recent, unpriced} {
-		if _, err := st.InsertEvent(ctx, ev); err != nil {
+		if _, _, err := st.InsertEvent(ctx, ev); err != nil {
 			t.Fatalf("InsertEvent: %v", err)
 		}
 	}
@@ -596,7 +596,7 @@ func TestConcurrentReadersDuringWriteBatch(t *testing.T) {
 			default:
 			}
 			ev := fullEvent("req-concurrent-" + strconv.Itoa(i))
-			if _, err := st.InsertEvent(ctx, ev); err != nil {
+			if _, _, err := st.InsertEvent(ctx, ev); err != nil {
 				t.Errorf("InsertEvent: %v", err)
 				return
 			}

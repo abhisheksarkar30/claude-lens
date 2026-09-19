@@ -23,7 +23,7 @@ func f64(v float64) *float64 { return &v }
 
 func insertAPIEvent(t *testing.T, st *store.Store, requestID, model string, startedAt time.Time, costUSD float64) int64 {
 	t.Helper()
-	id, err := st.InsertEvent(context.Background(), &store.Event{
+	id, _, err := st.InsertEvent(context.Background(), &store.Event{
 		RequestID:       requestID,
 		Source:          "proxy",
 		FirstSource:     "proxy",
@@ -116,7 +116,7 @@ func TestReconcileComputedAndBilledNeverSummed(t *testing.T) {
 // ever compared and cost_drift can never fire.
 func TestReconcileSubscriptionOnlyNoDriftPossible(t *testing.T) {
 	st := newTestStore(t)
-	_, err := st.InsertEvent(context.Background(), &store.Event{
+	_, _, err := st.InsertEvent(context.Background(), &store.Event{
 		RequestID:            "req1",
 		Source:               "jsonl",
 		FirstSource:          "jsonl",

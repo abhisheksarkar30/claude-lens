@@ -26,25 +26,95 @@ func ruleCacheBreakpointsExceeded(meta parse.Meta, _ parse.Usage, _ *store.Event
 		"more than 4 cache_control breakpoints in one request"), true
 }
 
+// minimumCacheablePrefix is the API's minimum cacheable prefix length per
+// model, in tokens. It is deliberately *not* monotonic across generations
+// -- Opus 4.6 needs 4096 where Opus 4.8 needs 1024 and Opus 5 needs 512 --
+// which is why it is a table and not a rule of thumb: "a newer model needs
+// less" is false for Opus 4.6/4.5, and a rule of thumb would mis-diagnose
+// exactly those.
+//
+// Matched by substring against the lowercased model id, first entry wins.
+// No shipped id matches two entries.
+var minimumCacheablePrefix = []struct {
+	match string
+	min   int
+}{
+	{"opus-5", 512}, {"fable-5", 512}, {"mythos-5", 512},
+	{"opus-4-8", 1024}, {"sonnet-5", 1024}, {"sonnet-4-6", 1024}, {"sonnet-4-5", 1024},
+	{"opus-4-7", 2048},
+	{"opus-4-6", 4096}, {"opus-4-5", 4096}, {"haiku-4-5", 4096},
+}
+
+// minimumCacheablePrefixFor returns the model's minimum cacheable prefix
+// in tokens, and whether the table knows the model at all. An unknown
+// model reports no minimum rather than a default, for the same reason an
+// unpriced model stores NULL and not $0.00: an invented threshold asserts
+// something the evidence does not support.
+func minimumCacheablePrefixFor(model string) (int, bool) {
+	m := strings.ToLower(model)
+	for _, e := range minimumCacheablePrefix {
+		if strings.Contains(m, e.match) {
+			return e.min, true
+		}
+	}
+	return 0, false
+}
+
+// markedPrefixTokens estimates the token count of the prefix carrying the
+// cache_control breakpoint, from the captured request body.
+//
+// ponytail: bytes/4, not a tokenizer -- the table's steps are 512/1024/
+// 2048/4096, far coarser than the estimate's error, and both error modes
+// are safe. The body is the *longest* prefix (the breakpoint chain runs
+// tools -> system -> messages, so the last breakpoint sits at or before the
+// end), which makes this an over-estimate for an early breakpoint in a long
+// conversation; an over-estimate suppresses the warning rather than
+// inventing one. A truncated body under-estimates, but the 256 KB cap is
+// ~65k tokens, still far above the largest minimum. Swap in a real
+// tokenizer if a genuine prefix ever lands within a few percent of a step.
+func markedPrefixTokens(body []byte) int {
+	return len(body) / 4
+}
+
 // ruleCachePrefixBelowMinimum fires when a cache_control marker was
 // present but produced no observable cache effect at all -- no write, no
-// read. This is the one T1 rule that genuinely needs the captured
-// request body: no token stream alone can reveal that a marker was
-// present but under the model's minimum cacheable length, because the
-// symptom (cache_creation_input_tokens: 0) leaves no other trace in
-// usage. The per-model minimum table (512/1024/2048/4096 tokens,
-// non-monotonic across generations) explains *why* this happens; it is
-// not consulted here because the API's own response already encodes it
-// in whether any cache tokens landed.
-func ruleCachePrefixBelowMinimum(meta parse.Meta, usage parse.Usage, _ *store.Event) (store.Warning, bool) {
+// read -- *and* the marked prefix is below the model's own minimum
+// cacheable length. This is the one T1 rule that genuinely needs the
+// captured request body: usage alone shows only the symptom
+// (cache_creation_input_tokens: 0), never the cause.
+//
+// The no-effect condition is not the diagnosis by itself. A marker that
+// cached nothing on a prefix long enough to cache has some *other* cause
+// -- invalidated, expired, raced -- each with its own rule; firing this
+// kind there would name the wrong one, so the rule declines whenever it
+// cannot measure the prefix or does not know the model.
+func ruleCachePrefixBelowMinimum(meta parse.Meta, usage parse.Usage, ev *store.Event) (store.Warning, bool) {
 	if !meta.HasCacheControl {
 		return store.Warning{}, false
 	}
 	if usage.CacheWrite5mTokens > 0 || usage.CacheWrite1hTokens > 0 || usage.CacheReadTokens > 0 {
 		return store.Warning{}, false
 	}
-	return warning(KindCachePrefixBelowMinimum, SeverityWarn,
-		"a cache_control breakpoint was present but produced no cache write or read"), true
+	// No captured body, no prefix to measure. JSONL rows never set
+	// HasCacheControl, so this only ever declines a proxy row whose request
+	// body was truncated away entirely.
+	if len(ev.ReqBody) == 0 {
+		return store.Warning{}, false
+	}
+	model := usage.Model
+	if model == "" {
+		model = meta.ModelRequested
+	}
+	minimum, ok := minimumCacheablePrefixFor(model)
+	if !ok {
+		return store.Warning{}, false
+	}
+	if markedPrefixTokens(ev.ReqBody) >= minimum {
+		return store.Warning{}, false
+	}
+	detail := fmt.Sprintf("a cache_control breakpoint marked a prefix under %d tokens; %s caches nothing below %d",
+		minimum, model, minimum)
+	return warning(KindCachePrefixBelowMinimum, SeverityWarn, detail), true
 }
 
 // ruleThinkingBudgetRejected fires when a request that sent

@@ -89,23 +89,32 @@ func isUniqueConstraintError(err error) bool {
 // the existing row (invariant 3) and reports whether a merge happened. A
 // merge that finds two *complete* captures disagreeing on tokens attaches a
 // source_mismatch warning to the merged row.
-func insertOrMerge(ctx context.Context, tx *sql.Tx, ev *Event) (id int64, merged bool, err error) {
+//
+// sessionID is the session the surviving row belongs to, which is *not*
+// always ev.SessionID: a merge never rewrites session_id, so the row keeps
+// the session it was first written under (mergeEvents). Callers must
+// re-derive that session rather than ev's — the plan's "exactly that one
+// session is the re-derivation target" — because reconciling ev's session
+// would aggregate a set the merged row is not in and leave the owner's
+// totals at their pre-merge values, which is the drift the re-derive rule
+// exists to prevent.
+func insertOrMerge(ctx context.Context, tx *sql.Tx, ev *Event) (id int64, sessionID string, merged bool, err error) {
 	id, err = insertEventTx(ctx, tx, ev)
 	if err == nil {
-		return id, false, nil
+		return id, ev.SessionID, false, nil
 	}
 	if !isUniqueConstraintError(err) {
-		return 0, false, err
+		return 0, "", false, err
 	}
 
 	existing, gerr := getEventByRequestIDTx(ctx, tx, ev.RequestID)
 	if gerr != nil {
-		return 0, false, fmt.Errorf("merge: load existing request_id %s: %w", ev.RequestID, gerr)
+		return 0, "", false, fmt.Errorf("merge: load existing request_id %s: %w", ev.RequestID, gerr)
 	}
 
 	result, mismatch := mergeEvents(existing, ev)
 	if err := updateEventTx(ctx, tx, result); err != nil {
-		return 0, false, fmt.Errorf("merge: update: %w", err)
+		return 0, "", false, fmt.Errorf("merge: update: %w", err)
 	}
 	if mismatch {
 		w := Warning{
@@ -115,10 +124,10 @@ func insertOrMerge(ctx context.Context, tx *sql.Tx, ev *Event) (id int64, merged
 			CreatedAt: time.Now(),
 		}
 		if err := upsertWarningsTx(ctx, tx, result.ID, []Warning{w}); err != nil {
-			return 0, false, fmt.Errorf("merge: attach source_mismatch: %w", err)
+			return 0, "", false, fmt.Errorf("merge: attach source_mismatch: %w", err)
 		}
 	}
-	return result.ID, true, nil
+	return result.ID, result.SessionID, true, nil
 }
 
 // mergeEvents merges incoming into existing (existing.ID is preserved) and

@@ -98,7 +98,7 @@ func TestRecordCallFoldsIntoSessionTotals(t *testing.T) {
 		InputTokens: 42,
 		PrefixHash:  strPtr("abc"),
 	}
-	if _, err := st.InsertEvent(ctx, ev); err != nil {
+	if _, _, err := st.InsertEvent(ctx, ev); err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
 	if err := r.RecordCall(ctx, sessionID, ev, 0); err != nil {

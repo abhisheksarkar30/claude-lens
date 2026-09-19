@@ -17,7 +17,7 @@ func TestMergePreservesJSONLOnlyColumns(t *testing.T) {
 	proxy := fullEvent("req-cols-1")
 	proxy.Source = "proxy"
 	proxy.FirstSource = "proxy"
-	if _, err := st.InsertEvent(ctx, proxy); err != nil {
+	if _, _, err := st.InsertEvent(ctx, proxy); err != nil {
 		t.Fatalf("InsertEvent proxy: %v", err)
 	}
 
@@ -29,7 +29,7 @@ func TestMergePreservesJSONLOnlyColumns(t *testing.T) {
 	jsonl.GitBranch = "main"
 	jsonl.CliEntrypoint = "cli"
 	jsonl.IsSidechain = true
-	id, err := st.InsertEvent(ctx, jsonl)
+	id, _, err := st.InsertEvent(ctx, jsonl)
 	if err != nil {
 		t.Fatalf("InsertEvent jsonl (merge): %v", err)
 	}
@@ -73,7 +73,7 @@ func TestMergeWarningLedgerDedup(t *testing.T) {
 	proxy := fullEvent("req-warn-1")
 	proxy.Source = "proxy"
 	proxy.SessionID = sessionID
-	id, err := st.InsertEvent(ctx, proxy)
+	id, _, err := st.InsertEvent(ctx, proxy)
 	if err != nil {
 		t.Fatalf("InsertEvent proxy: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestMergeWarningLedgerDedup(t *testing.T) {
 	jsonl := fullEvent("req-warn-1")
 	jsonl.Source = "jsonl"
 	jsonl.SessionID = sessionID
-	id2, err := st.InsertEvent(ctx, jsonl)
+	id2, _, err := st.InsertEvent(ctx, jsonl)
 	if err != nil {
 		t.Fatalf("InsertEvent jsonl (merge): %v", err)
 	}
@@ -145,7 +145,7 @@ func TestRetryPreservesTwoRows(t *testing.T) {
 	rateLimited := fullEvent("req-retry-1")
 	rateLimited.Status = 429
 	rateLimited.ReqBody = body
-	id1, err := st.InsertEvent(ctx, rateLimited)
+	id1, _, err := st.InsertEvent(ctx, rateLimited)
 	if err != nil {
 		t.Fatalf("InsertEvent rateLimited: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestRetryPreservesTwoRows(t *testing.T) {
 	retry := fullEvent("req-retry-2")
 	retry.Status = 200
 	retry.ReqBody = body
-	id2, err := st.InsertEvent(ctx, retry)
+	id2, _, err := st.InsertEvent(ctx, retry)
 	if err != nil {
 		t.Fatalf("InsertEvent retry: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestMergeCollidingRequestID(t *testing.T) {
 	first.FirstSource = "proxy"
 	first.InputTokens = 10
 
-	id1, err := st.InsertEvent(ctx, first)
+	id1, _, err := st.InsertEvent(ctx, first)
 	if err != nil {
 		t.Fatalf("InsertEvent 1: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestMergeCollidingRequestID(t *testing.T) {
 	second.FirstSource = "jsonl" // must not win — first_source is never rewritten
 	second.InputTokens = 20
 
-	id2, err := st.InsertEvent(ctx, second)
+	id2, _, err := st.InsertEvent(ctx, second)
 	if err != nil {
 		t.Fatalf("InsertEvent 2 (merge): %v", err)
 	}
@@ -268,7 +268,7 @@ func TestMergePrecedenceTruncatedVsComplete(t *testing.T) {
 	truncated.InputTokens = 0
 	truncated.OutputTokens = 0
 
-	id1, err := st.InsertEvent(ctx, truncated)
+	id1, _, err := st.InsertEvent(ctx, truncated)
 	if err != nil {
 		t.Fatalf("InsertEvent truncated: %v", err)
 	}
@@ -278,7 +278,7 @@ func TestMergePrecedenceTruncatedVsComplete(t *testing.T) {
 	complete.InputTokens = 500
 	complete.OutputTokens = 250
 
-	id2, err := st.InsertEvent(ctx, complete)
+	id2, _, err := st.InsertEvent(ctx, complete)
 	if err != nil {
 		t.Fatalf("InsertEvent complete (merge): %v", err)
 	}
@@ -309,14 +309,14 @@ func TestMergePrecedenceTruncatedVsComplete(t *testing.T) {
 
 	// Same scenario in the opposite insertion order: complete first, then
 	// a truncated retry — the complete capture must still win.
-	id3, err := st.InsertEvent(ctx, fullEvent("req-merge-3"))
+	id3, _, err := st.InsertEvent(ctx, fullEvent("req-merge-3"))
 	if err != nil {
 		t.Fatalf("InsertEvent complete first: %v", err)
 	}
 	truncatedRetry := fullEvent("req-merge-3")
 	truncatedRetry.CaptureComplete = false
 	truncatedRetry.InputTokens = 0
-	if _, err := st.InsertEvent(ctx, truncatedRetry); err != nil {
+	if _, _, err := st.InsertEvent(ctx, truncatedRetry); err != nil {
 		t.Fatalf("InsertEvent truncated retry (merge): %v", err)
 	}
 	got3, err := st.GetEvent(ctx, id3)
@@ -331,37 +331,47 @@ func TestMergePrecedenceTruncatedVsComplete(t *testing.T) {
 // Session re-derivation: a merge that rewrites a row's tokens leaves the
 // session totals equal to the recomputed sum over events, not an
 // increment of the pre-merge totals.
+//
+// The two sides of the merge carry *different* session ids, which is the
+// only shape that tests the rule: a merge never rewrites session_id, so the
+// row stays in the first-written session and it is that session -- not the
+// incoming event's -- whose totals must be re-derived. Using one id on both
+// sides (as this test once did) passes even when the code reconciles the
+// wrong session, because the wrong session and the right one are the same
+// session.
 func TestMergeRederivesSessionTotals(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 
-	sessionID := "s_rederive"
-	if err := st.UpsertSession(ctx, sessionID, "", fullEvent("seed").StartedAt); err != nil {
+	// owner is the session the row was first written under; incoming is the
+	// session the merging event claims.
+	const owner, incoming = "s_first_written", "s_incoming"
+	if err := st.UpsertSession(ctx, owner, "", fullEvent("seed").StartedAt); err != nil {
 		t.Fatalf("UpsertSession: %v", err)
 	}
 
 	other := fullEvent("req-other")
-	other.SessionID = sessionID
+	other.SessionID = owner
 	other.InputTokens = 1000
-	if _, err := st.InsertEvent(ctx, other); err != nil {
+	if _, _, err := st.InsertEvent(ctx, other); err != nil {
 		t.Fatalf("InsertEvent other: %v", err)
 	}
-	if err := st.ReconcileSession(ctx, sessionID); err != nil {
+	if err := st.ReconcileSession(ctx, owner); err != nil {
 		t.Fatalf("ReconcileSession: %v", err)
 	}
 
 	truncated := fullEvent("req-merge-session")
-	truncated.SessionID = sessionID
+	truncated.SessionID = owner
 	truncated.CaptureComplete = false
 	truncated.InputTokens = 5
-	if _, err := st.InsertEvent(ctx, truncated); err != nil {
+	if _, _, err := st.InsertEvent(ctx, truncated); err != nil {
 		t.Fatalf("InsertEvent truncated: %v", err)
 	}
-	if err := st.ReconcileSession(ctx, sessionID); err != nil {
+	if err := st.ReconcileSession(ctx, owner); err != nil {
 		t.Fatalf("ReconcileSession: %v", err)
 	}
 
-	sessAfterFirst, err := st.GetSession(ctx, sessionID)
+	sessAfterFirst, err := st.GetSession(ctx, owner)
 	if err != nil {
 		t.Fatalf("GetSession: %v", err)
 	}
@@ -369,17 +379,33 @@ func TestMergeRederivesSessionTotals(t *testing.T) {
 		t.Fatalf("InputTokens before merge = %d, want 1005", sessAfterFirst.InputTokens)
 	}
 
-	// The merge itself re-derives the session inline (invariant 3), so no
-	// explicit ReconcileSession call is needed here.
+	// The merge itself re-derives the owning session inline (invariant 3),
+	// so no explicit ReconcileSession call is needed here -- and the merge
+	// names a *different* session, so only a re-derivation keyed to the
+	// surviving row can produce the assertion below.
 	rewrite := fullEvent("req-merge-session")
-	rewrite.SessionID = sessionID
+	rewrite.SessionID = incoming
 	rewrite.CaptureComplete = true
 	rewrite.InputTokens = 400
-	if _, err := st.InsertEvent(ctx, rewrite); err != nil {
+	mergedID, mergedSession, err := st.InsertEvent(ctx, rewrite)
+	if err != nil {
 		t.Fatalf("InsertEvent rewrite (merge): %v", err)
 	}
+	if mergedSession != owner {
+		t.Errorf("InsertEvent returned session %q for the merged row, want the first-written %q", mergedSession, owner)
+	}
 
-	sessAfterMerge, err := st.GetSession(ctx, sessionID)
+	// The row itself kept the first-written session, which is the premise
+	// the re-derivation target rests on.
+	merged, err := st.GetEvent(ctx, mergedID)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	if merged.SessionID != owner {
+		t.Errorf("merged row session_id = %q, want %q (a merge preserves it)", merged.SessionID, owner)
+	}
+
+	sessAfterMerge, err := st.GetSession(ctx, owner)
 	if err != nil {
 		t.Fatalf("GetSession: %v", err)
 	}
@@ -387,5 +413,12 @@ func TestMergeRederivesSessionTotals(t *testing.T) {
 	// 1005 + 400 (which would be the old total incremented).
 	if sessAfterMerge.InputTokens != 1400 {
 		t.Errorf("InputTokens after merge = %d, want 1400 (recomputed, not incremented)", sessAfterMerge.InputTokens)
+	}
+
+	// The incoming session owns no rows, so nothing may have created one:
+	// a session row here is what the dashboard would render as an agentic
+	// run with zero calls.
+	if sess, err := st.GetSession(ctx, incoming); err == nil {
+		t.Errorf("incoming session %q has a row (request_count=%d); a merge must not fold into it", incoming, sess.RequestCount)
 	}
 }
