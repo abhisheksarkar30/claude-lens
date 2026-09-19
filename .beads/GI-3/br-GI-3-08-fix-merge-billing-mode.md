@@ -79,14 +79,21 @@ forever to protect a column from a value that is simply wrong.
 
 ## Test Specifications
 
-- Unit Tests (`internal/store/store_test.go`):
+- Unit Tests (`internal/store/merge_test.go`) — T8/T9/T9b live here, not in `store_test.go`:
+  `merge_test.go` is where every existing merge-behaviour test already sits
+  (`TestMergeCollidingRequestID`, `TestMergePrecedenceTruncatedVsComplete`,
+  `TestMergeRederivesSessionTotals`, …), and `T8` is a merge-precedence claim like theirs.
   - **T8**: insert a `subscription` DeepSeek row (`CostUSD` nil, mode `subscription`), merge a
     priced `api` DeepSeek row over it (same `request_id`), assert `CostUSD` set,
     `BillingMode == "api"`, `ApiEquivalentCostUSD == nil`. This is the regression that would have
     caught this story's own defect.
   - **T9**: a merge where the incoming capture is incomplete leaves `billing_mode` unchanged.
   - **T9b**: a merge where the incoming (JSONL) side has an empty `account` preserves the non-empty
-    proxy `account` (`Account` stays `preferNonEmpty`).
+    proxy `account` (`Account` stays `preferNonEmpty`). The case also pins `AuthKind` on
+    `preferNonEmpty` by making the incoming side's value *different* and asserting the existing
+    side's survives, with the incoming side's cost winning in the same merge — so a winner-based
+    assignment cannot pass it by accident.
+- Unit Tests (`internal/store/store_test.go`):
   - Extend `TestBillingModeInvariants` to cover the **merge** path, not just the insert path.
 - Integration Tests: none.
 - E2E: none (the plan accepts no E2E `--rebuild` against a real 57k-row store; T8 is where the
@@ -96,4 +103,5 @@ forever to protect a column from a value that is simply wrong.
 
 - `internal/store/merge.go` (modify — `merged.BillingMode = winner.BillingMode`; comment recording
   the trade-off and the known gap)
-- `internal/store/store_test.go` (modify — T8/T9/T9b; extend `TestBillingModeInvariants`)
+- `internal/store/merge_test.go` (modify — T8/T9/T9b)
+- `internal/store/store_test.go` (modify — extend `TestBillingModeInvariants` with the merge path)

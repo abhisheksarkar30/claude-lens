@@ -184,7 +184,28 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 
 	merged.AuthKind = preferNonEmpty(existing.AuthKind, incoming.AuthKind)
 	merged.Account = preferNonEmpty(existing.Account, incoming.Account)
-	merged.BillingMode = preferNonEmpty(existing.BillingMode, incoming.BillingMode)
+	// billing_mode moves with the cost columns above -- it is not
+	// preferNonEmpty like its neighbours. It is the one column a cross-source
+	// merge is expected to contradict: the JSONL tailer resolves it per row by
+	// model prefix, so re-ingesting a DeepSeek call flips it subscription ->
+	// api. Since existing.BillingMode is always non-empty, preferNonEmpty could
+	// never apply that flip, and the merge would write the incoming priced
+	// cost_usd onto a row still marked subscription -- exactly the pair
+	// invariant 5 forbids, silently, because TestBillingModeInvariants covered
+	// the insert path only.
+	//
+	// Account above stays preferNonEmpty deliberately: it is a column the JSONL
+	// tailer structurally cannot supply (the JSONL line carries no auth
+	// signal), and on the ordinary ordering the proxy row is written live
+	// (existing, holding a real account name) while the JSONL row arrives
+	// minutes later, so a winner-based assignment would blank it.
+	//
+	// Known gap: a merge whose two sides genuinely disagree on the mode (a
+	// credential resolving to subscription on a prefix-api model) now takes the
+	// incoming side's mode and is not surfaced. auth_kind_anomaly fires on
+	// api_key + subscription, which is a different case, and this change
+	// removes the only production path that produced its trigger.
+	merged.BillingMode = winner.BillingMode
 
 	// The columns A (proxy) structurally cannot supply.
 	merged.ClientVersion = preferNonEmpty(existing.ClientVersion, incoming.ClientVersion)
