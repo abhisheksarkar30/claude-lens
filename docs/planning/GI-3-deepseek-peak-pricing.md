@@ -1176,8 +1176,10 @@ because the subscription sum reads the column that would be left NULL.
 it has one; when it does not, **derive the label from the column the winner actually
 priced** — `cost_usd` → `api`, `api_equivalent_cost_usd` → `subscription` — which is
 invariant 5's own statement ("a cost figure's billing model is carried in the column
-it lives in") applied to the merge. A winner that priced nothing leaves the mode
-empty: there is no cost for a label to describe. Affected: D6 (premise, fix block,
+it lives in") applied to the merge. A winner that priced nothing has no cost column
+for a label to describe, so the merge **keeps the stored mode** rather than blanking
+it — the one branch where the loser's mode is adopted, and safe there precisely
+because the winner left both cost columns NULL. Affected: D6 (premise, fix block,
 trade-off paragraph), §4, §5 (new **T9c**), §7, §9 item 6, and `br-GI-3-08`'s test
 list.
 
