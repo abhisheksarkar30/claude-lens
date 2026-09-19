@@ -77,7 +77,13 @@ reviewable literal entry per third-party model** — not a derived predicate:
 var thirdPartyWithoutCacheMinimum = []string{"deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"}
 ```
 
-and let the coverage test skip exactly those names. This does **not** widen a gap:
+and let the coverage test skip exactly those names.
+
+The literal lives in **`internal/analyze/analyze_test.go`** (`package analyze`), not in
+`rules.go`: it exists for the coverage test's benefit only, and production already declines for
+these models — `minimumCacheablePrefixFor` reports not-ok, so `ruleCachePrefixBelowMinimum` never
+fires. The literal makes that decline an explicit, reviewable claim instead of an implicit side
+effect. Adding another third-party model stays a visible edit to this one literal. This does **not** widen a gap:
 `minimumCacheablePrefixFor` already reports not-ok for an unknown model, so
 `ruleCachePrefixBelowMinimum` declines for DeepSeek today (`internal/analyze/rules.go:108-111`).
 The exception list makes that decline explicit rather than implicit. Adding another third-party

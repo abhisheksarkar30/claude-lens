@@ -26,8 +26,8 @@ mislabelled.
 func (t *Tailer) SetModelBilling(prefixes []string, apiAccount, apiBillingMode string)
 ```
 
-**`ModelBilling()` — the read-only accessor, `Account()`'s sibling (br-GI-3-06).** The wiring in
-item 2 is only assertable if a test can read back what `SetModelBilling` stored:
+**`ModelBilling()` — the read-only accessor *this* bead adds.** The wiring in item 2 is only
+assertable if a test can read back what `SetModelBilling` stored:
 
 ```go
 // ModelBilling reports the prefixes that route a row to the api account, and
@@ -38,8 +38,9 @@ func (t *Tailer) ModelBilling() (prefixes []string, account, billingMode string)
 ```
 
 `prefixes` is a **copy**, so a caller cannot mutate the tailer's own slice — the same rule
-`AllKinds()` follows. br-GI-3-06 adds `Account()` (the default, un-routed account/mode) beside it;
-this one covers the routing half.
+`AllKinds()` follows. Ownership, since it is easy to misread: **br-GI-3-06 lands `Account()`** (the
+default, un-routed pair); **this bead** lands `ModelBilling()` (the routed triple), beside the
+fields it reads.
 
 `buildEvent` (`jsonlogs.go:291-350`) resolves account/billing **per row** before the `store.Event`
 literal, instead of once:

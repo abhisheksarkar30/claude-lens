@@ -69,8 +69,10 @@ indirectly, through the column a mis-billed row lands in, and cannot tell "the g
 repo already has the shape (`AllKinds()` is a read-only accessor). br-GI-3-07 adds
 `ModelBilling()` beside it for the same reason.
 
-**`SetModelBilling` is out of scope.** It joins the helper in br-GI-3-07, so this bead's diff
-contains only the move.
+**`SetModelBilling` is out of scope.** It joins the helper in br-GI-3-07. This bead's diff is
+therefore **not** only the move — it also adds the `Account()` accessor above. The moved block
+itself is still a pure move, guard included, and the accessor changes no behaviour; but the plan
+states the accessor explicitly rather than leaving it to be noticed (v8, §9 item 4b).
 
 **Only construction collapses.** The two callers keep their own drive logic:
 `resetJSONLCursors` + one `Poll` in `runIngest`; collector registration in `addCollectors`. After
@@ -79,9 +81,9 @@ the change:
 - `addCollectors`: `tailer := newTailer(cfg, jsonlRoot(), st)`
 - `runIngest`: `tailer := newTailer(cfg, root, st)`
 
-**Why this lands before br-GI-3-07**: so br-GI-3-07's diff shows only the semantic change (D5's
-routing) and stays bisectable. Landing the wiring first would bury the extract inside a semantic
-diff.
+**Why this lands before br-GI-3-07**: so br-GI-3-07's diff shows the semantic change (D5's routing)
+on its own rather than buried inside the extract. Landing the wiring first would fold the two
+together and cost the bisect.
 
 ## Rationale
 
@@ -108,7 +110,7 @@ never blames the extract for a routing bug.
   - `New(root, st)` leaves the account empty and `billingMode == "subscription"` (the `:91-93` seed).
   - `SetAccount("", "")` assigns **unconditionally**, blanking the mode to `""` — the sharp edge
     recorded in §8, and the reason the guard is load-bearing rather than decorative.
-- Unit Tests (`internal/cli/cli_test.go`): **the guard itself**, read through the new
+- Unit Tests (`internal/cli/cli_test.go`): **T18 — the guard itself**, read through the new
   `Tailer.Account()`. `newTailer` on a config with **no** subscription account → `("", "subscription")`;
   on a config **with** one → that account's name and billing mode. Deleting the `acct.Name != ""`
   guard makes the first case read `("", "")`, so the regression fails a test instead of depending on

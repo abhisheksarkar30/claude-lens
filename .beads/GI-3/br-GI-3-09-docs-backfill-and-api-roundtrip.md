@@ -81,8 +81,8 @@ that never took effect (and that 400s the Settings tab's own round-trip) is wors
     half so the guard has teeth: the GET row posted **verbatim** is asserted to 400 on `source`,
     which pins the not-client-settable contract instead of merely tolerating it, and stops a future
     reader from "fixing" the 400 by widening `setPricesRequest`.
-- Unit Tests (`internal/pricing` / docs): the shipped rows are still visible via `doctor`'s
-  `peak_off_peak_dates` row (covered in br-GI-3-05's T15).
+- Unit Tests: **none added here.** `doctor`'s `peak_off_peak_dates` row is br-GI-3-05's T15; this
+  bead does not duplicate it, and it adds no test outside `internal/api`.
 - Integration Tests: none.
 - E2E: none (the plan accepts no E2E `--rebuild` against a real 57k-row store).
 

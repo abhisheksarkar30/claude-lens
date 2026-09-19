@@ -112,18 +112,26 @@ accepted to remove, and hand-resolving it at three call sites is how it returns 
 
 ## Test Specifications
 
-- Unit Tests (`internal/config/config_test.go`):
-  - **T10**: both keys parse from file and from env; a malformed date is rejected by `Validate`; an
+**Every case below sits in the package that owns the symbol it asserts.** Test files in this repo
+are internal (`package config`, `package cli`, …), so unexported symbols *are* reachable — but only
+from their own package's test file. `resolvedAPIPrefixes` is unexported in `internal/cli`, so
+`internal/config`'s test file cannot reference it; the assertion belongs beside the helper, and
+`internal/config`'s test file must not grow an import to reach it.
+
+- Unit Tests (`internal/config/config_test.go`) — **T10**, the config surface:
+  - both keys parse from file and from env; a malformed date is rejected by `Validate`; an
     empty/whitespace-only prefix is rejected; `none` yields a non-nil empty slice for either key;
     an unset key yields `nil`.
+- Unit Tests (`internal/cli/cli_test.go`) — **T10 (resolver half)**, beside the helper it names:
   - `resolvedAPIPrefixes` resolves an unset `ApiModelPrefixes` to the shipped `{"deepseek-"}` and a
-    non-nil `acme-` list replaces it wholesale — asserted on the helper, not on an unreachable
-    wiring site (F2.1/F3.2).
+    non-nil `acme-` list replaces it wholesale.
 - Unit Tests (`internal/cli/doctor_test.go`):
   - **T15**: `doctor` prints `33 (default)` and `deepseek- (default)` when both keys are unset, and
     `none`/`N` (and the joined list) when set.
-- Integration Tests: `runIngest`/`runRefresh` reject a malformed date before touching the store (a
-  fixture config file with a bad date makes `Ingest`/`Refresh` return an error).
+- Integration Tests (`internal/cli/cli_test.go`): a fixture config file with a malformed date makes
+  `Ingest` and `Refresh` return an error **before the store is opened** — the `cfg.Validate()` calls
+  this bead adds (F1.2/R8). Asserted through the exported entry points (`Ingest`, `ingest.go:21`;
+  `Refresh`, `refresh.go:40`) because `runIngest`/`runRefresh` are unexported.
 - E2E: none.
 
 ## Files to Touch
@@ -131,6 +139,8 @@ accepted to remove, and hand-resolving it at three call sites is how it returns 
 - `internal/config/config.go` (modify — 2 fields, 2 `fieldsByEnv` entries, 2 `applyKV` cases,
   `Validate` date/prefix checks, `none` sentinel)
 - `internal/config/config_test.go` (modify — T10)
+- `internal/cli/cli_test.go` (modify — T10's resolver half; the `Ingest`/`Refresh` malformed-date
+  integration case)
 - `internal/cli/ingest.go` (modify — `resolvedAPIPrefixes`/`newPriceLoader` helpers beside
   `firstAccount`; `newPriceLoader(cfg)` at the loader site; `cfg.Validate()` in `runIngest`)
 - `internal/cli/refresh.go` (modify — `newPriceLoader(cfg)`; `cfg.Validate()` in `runRefresh`)
