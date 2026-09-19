@@ -4,17 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/consumer"
+	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/sink"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
+	"github.com/abhisheksarkar30/claude-lens/internal/web"
 )
 
 func newTestStore(t *testing.T) *store.Store {
@@ -64,13 +70,21 @@ func seedEvent(t *testing.T, st *store.Store, opts func(*store.Event)) *store.Ev
 
 // newTestAPI builds a handler backed by st, a fresh broker, and a real
 // (unstarted) consumer -- Run is never called in these tests, so Stats() is
-// fine on a fresh Consumer.
+// fine on a fresh Consumer. Replay is off and no proxy handler is wired, which
+// is the default every read-route test wants; newReplayAPI is the wired one.
 func newTestAPI(t *testing.T, st Store) (*api, *sink.Sink, *consumer.Consumer, *Broker) {
 	t.Helper()
 	sk := sink.New(16)
 	cons := consumer.New(sk, nil, nil)
 	broker := NewBroker()
-	return New(st, sk, cons, broker), sk, cons, broker
+	return New(st, sk, cons, broker, testAssets(), nil, false), sk, cons, broker
+}
+
+// testAssets stands in for internal/web's embedded FS: one page, so a test
+// can assert the mount serves something without depending on the real
+// dashboard's markup.
+func testAssets() fs.FS {
+	return fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("<!doctype html><title>clens</title>")}}
 }
 
 func decodeJSON[T any](t *testing.T, body io.Reader) T {
@@ -292,5 +306,89 @@ func TestMethodNotAllowedOnReadRoute(t *testing.T) {
 	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/requests", nil))
 	if rr.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", rr.Code)
+	}
+}
+
+// The four write seams are declared in this bead and wired by br-GI-1-17's
+// composition root, a bead earlier in the DAG than br-GI-1-18, which adds the
+// routes that consume them. That ordering only works if a seam setter is
+// assignable with no route attached and an unwired seam is a supported state
+// rather than a nil dereference -- which is what this test pins down.
+//
+// Setting every seam must not perturb the read surface, and a read must not
+// invoke one: a seam is a write capability, so a GET that fired one would mean
+// a read route had grown a side effect.
+func TestWriteSeamsAreAssignableAndUnsetIsSupported(t *testing.T) {
+	st := newTestStore(t)
+	seedEvent(t, st, nil)
+	handler, _, _, _ := newTestAPI(t, st) // every seam deliberately unset
+
+	// Unset: reads still work, and the one route that consumes a seam answers
+	// 503 rather than panicking.
+	getOK(t, handler, "/api/requests")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/prices", strings.NewReader(`{"model":"m"}`)))
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Errorf("POST /api/prices with no SetPricing: status = %d, want 503", rr.Code)
+	}
+
+	var calls atomic.Int64
+	handler.SetPricing(pricing.NewLoader(filepath.Join(t.TempDir(), "prices.toml")))
+	handler.SetCredentialWriter(func(name, value string) error { calls.Add(1); return nil })
+	handler.SetAccountWriter(func() error { calls.Add(1); return nil })
+	handler.SetIngestTrigger(func(context.Context) error { calls.Add(1); return nil })
+
+	getOK(t, handler, "/api/requests")
+	getOK(t, handler, "/api/sessions")
+	getOK(t, handler, "/api/warnings")
+	getOK(t, handler, "/api/stats")
+	getOK(t, handler, "/api/health")
+	getOK(t, handler, "/api/prices")
+	if n := calls.Load(); n != 0 {
+		t.Errorf("a read route invoked a write seam %d time(s)", n)
+	}
+}
+
+// externalRef matches anything that would make the browser leave loopback: an
+// absolute URL, a scheme-relative one, a CSS @import, or a font/script fetch.
+// cssURL is separate because url(...) is also how an inline data: URI appears,
+// which is local and fine.
+var externalRef = regexp.MustCompile(`https?://|(?:src|href|action)\s*=\s*["']//|@import|url\(\s*["']?//`)
+
+// TestEmbeddedAssetsServedWithoutExternalFetch is the E2E half of the bead's
+// asset requirement: the running handler serves internal/web's real embedded
+// files, and none of them points anywhere but this server.
+//
+// The check is a scan of the served bytes rather than an observed network
+// call: proving a browser made no request would need a browser, and what is
+// actually in our control is the markup. A scan for absolute and
+// scheme-relative references is what that reduces to -- a data: URI or a
+// relative path is served from the embed FS and never leaves the process.
+func TestEmbeddedAssetsServedWithoutExternalFetch(t *testing.T) {
+	st := newTestStore(t)
+	sk := sink.New(16)
+	handler := New(st, sk, consumer.New(sk, nil, nil), NewBroker(), web.Files, nil, false)
+
+	// Fetched the way a browser loads the dashboard: the page at /, then the
+	// two assets it links by relative path. /index.html is deliberately not in
+	// this list -- http.FileServer canonicalizes it to / with a 301, and
+	// following the redirect would only test the same bytes twice.
+	for _, asset := range []struct{ name, path string }{
+		{"index.html", "/"},
+		{"app.js", "/app.js"},
+		{"style.css", "/style.css"},
+	} {
+		rr := getOK(t, handler, asset.path)
+		if rr.Body.Len() == 0 {
+			t.Errorf("%s (%s) served 0 bytes", asset.name, asset.path)
+		}
+		if m := externalRef.FindString(rr.Body.String()); m != "" {
+			t.Errorf("%s contains an external reference %q: the dashboard must not reach the network", asset.name, m)
+		}
+	}
+
+	// The page the user opens is really the index page, not an empty shell.
+	if !strings.Contains(getOK(t, handler, "/").Body.String(), "<title>") {
+		t.Error("GET / did not serve the dashboard's index page")
 	}
 }

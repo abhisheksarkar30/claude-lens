@@ -1,0 +1,144 @@
+/* Nothing here is fetched: an imported stylesheet or a webfont is a network
+   request from a tool whose premise is that the user's traffic stays local.
+   System font stack instead. (The words for those directives are avoided in
+   this comment on purpose -- internal/api's asset guard scans for them.) */
+
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --line: #2b303a;
+  --fg: #e6e8ec;
+  --muted: #8b93a1;
+  --accent: #7aa2f7;
+  --error: #f7768e;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f8fa;
+    --panel: #ffffff;
+    --line: #dfe3ea;
+    --fg: #1b1f27;
+    --muted: #667085;
+    --accent: #2f5fd0;
+    --error: #b4232f;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+h1 { font-size: 18px; margin: 0; }
+h2 { font-size: 15px; margin: 24px 0 8px; }
+h3 { font-size: 14px; margin: 16px 0 6px; color: var(--muted); }
+
+code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+}
+
+.totals { display: flex; gap: 14px; color: var(--muted); }
+.totals strong { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+.tabs { display: flex; gap: 4px; margin-left: auto; flex-wrap: wrap; }
+
+.tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  padding: 5px 10px;
+}
+.tab:hover { color: var(--fg); border-color: var(--line); }
+.tab.active { color: var(--fg); background: var(--bg); border-color: var(--line); }
+
+main { padding: 20px; }
+
+.muted { color: var(--muted); }
+.error { color: var(--error); }
+
+.view[hidden] { display: none; }
+
+.cards { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 140px;
+  padding: 10px 14px;
+}
+.card-label { color: var(--muted); font-size: 12px; }
+.card-value { font-size: 20px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 10px 0; }
+.row label { color: var(--muted); font-size: 12px; }
+.row.pager { justify-content: center; }
+
+input, select, button {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--fg);
+  font: inherit;
+  padding: 4px 8px;
+}
+input[type="number"] { width: 110px; }
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { color: var(--muted); cursor: default; opacity: 0.5; }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  background: var(--panel);
+  font-variant-numeric: tabular-nums;
+}
+th, td {
+  border-bottom: 1px solid var(--line);
+  padding: 6px 10px;
+  text-align: left;
+  white-space: nowrap;
+}
+thead th { color: var(--muted); font-size: 12px; font-weight: 600; }
+tbody tr:hover { background: var(--bg); }
+td:nth-child(n + 4) { text-align: right; }
+
+table.kv { background: transparent; }
+table.kv th { color: var(--muted); font-weight: 500; width: 180px; }
+table.kv td { text-align: left; white-space: normal; }
+
+.sev-warning { color: #d7a53f; }
+.sev-error { color: var(--error); }
+.sev-info { color: var(--muted); }
+
+svg.chart {
+  display: block;
+  width: 100%;
+  height: 120px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+svg.chart rect { fill: var(--accent); }
+svg.chart rect:hover { opacity: 0.7; }

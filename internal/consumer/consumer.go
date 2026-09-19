@@ -387,6 +387,8 @@ func buildEvent(call *sink.CapturedCall, meta parse.Meta, usage parse.Usage) *st
 		CliEntrypoint:      meta.CliEntrypoint,
 		PrefixHash:         meta.PrefixHash,
 		CaptureComplete:    call.CaptureComplete,
+		ReplayOf:           call.ReplayOf,
+		ReplayEdits:        call.ReplayEdits,
 		Method:             call.Method,
 		Path:               call.Path,
 		Status:             call.Status,

@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -282,6 +283,13 @@ func (f EventFilter) whereClause() (string, []any) {
 	if !f.Until.IsZero() {
 		conds = append(conds, "started_at < ?")
 		args = append(args, f.Until.UnixNano())
+	}
+	if f.ReplayOf != nil {
+		// replay_of is TEXT (schema.sql), so the id is bound in the same
+		// decimal form Event.ReplayOf is written with -- an int64 arg here
+		// would compare INTEGER against TEXT and never match.
+		conds = append(conds, "replay_of = ?")
+		args = append(args, strconv.FormatInt(*f.ReplayOf, 10))
 	}
 	if len(conds) == 0 {
 		return "", nil

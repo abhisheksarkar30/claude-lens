@@ -14,12 +14,12 @@ import (
 // reads only headers -- never the store, an upstream, or the body -- so a
 // rejection costs nothing.
 //
-// No route in this slice calls it yet: Slice A ships it because bead
-// br-GI-1-16 defines it as a package-level capability shared by every write
-// route landing in a later slice (POST /api/prices, /api/secrets,
-// /api/accounts, /api/ingest -- see docs/planning/GI-1-claude-lens-v1.md
-// §API surface), the same way SetPricing's setter ships ahead of the route
-// that will consume it.
+// The write routes that call it are the two Slice B ones -- POST /api/prices
+// and POST /api/requests/{id}/replay -- plus the four br-GI-1-18 adds
+// (/api/secrets, /api/accounts, /api/ingest; see
+// docs/planning/GI-1-claude-lens-v1.md §API surface). Read (GET) routes do
+// not: they are loopback-bound and change nothing, which is what the
+// dashboard's no-auth-on-loopback posture rests on.
 //
 // action names the calling route in the rejection message ("prices",
 // "secrets", ...), since every write route shares this one guard.

@@ -43,6 +43,11 @@ type CapturedCall struct {
 	// downstream storage reads.
 	CaptureComplete bool
 
+	// ReplayOf and ReplayEdits carry a replay's linkage (see
+	// proxy.ReplayMeta/WithReplay), empty for ordinary traffic.
+	ReplayOf    string
+	ReplayEdits string
+
 	// RequestID is the cross-source dedup key: the response's request-id
 	// header when a response exists, or a synthetic
 	// proxy:<hash>:<started_at_ns>:<attempt> key for a call that never

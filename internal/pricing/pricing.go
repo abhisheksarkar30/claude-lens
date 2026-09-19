@@ -298,6 +298,12 @@ type Loader struct {
 	table Table
 }
 
+// Path is the override file this Loader reads. A caller that wants to write
+// an override (POST /api/prices, `clens prices --set`) needs the file the
+// reader is actually watching -- the two must be the same file or a write
+// would never be observed.
+func (l *Loader) Path() string { return l.path }
+
 // NewLoader returns a Loader for the override file at path, performing an
 // initial load immediately.
 func NewLoader(path string) *Loader {

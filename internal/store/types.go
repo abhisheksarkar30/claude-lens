@@ -129,6 +129,11 @@ type EventFilter struct {
 	Until       time.Time
 	Limit       int
 	Offset      int
+
+	// ReplayOf, when non-nil, keeps only rows replayed from that event id.
+	// A pointer rather than an int64 because 0 is not a valid event id and
+	// "unset" has to be distinguishable from it.
+	ReplayOf *int64
 }
 
 // StatsSummary is the aggregate shape shared by StatsSummary, StatsByModel,

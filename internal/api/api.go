@@ -2,11 +2,17 @@
 // surface over internal/store, served by the dashboard's own http.Server
 // (CLAUDE.md: "the dashboard listener reads SQLite and pushes SSE").
 //
-// This is Slice A of br-GI-1-16: the read (GET) routes, the SSE broker, and
-// the PublishingStore decorator only. Write routes (POST /api/prices,
-// /api/secrets, /api/accounts, /api/ingest), internal/replay, and
-// internal/web's asset mount are a later slice -- see the bead file for the
-// full route table this package will eventually carry.
+// The read (GET) routes, the SSE broker and the PublishingStore decorator are
+// Slice A of br-GI-1-16; the write routes (POST /api/prices,
+// /api/requests/{id}/replay), the injected write seams, the Origin/Host
+// allowlist and internal/web's asset mount are Slice B. br-GI-1-18 adds eight
+// more routes on top.
+//
+// Credential containment (br-GI-1-16 test 18) is a mechanical property of this
+// package, not a review habit: it never imports internal/secret. A route that
+// has to write a credential reaches the write through an injected seam
+// (SetCredentialWriter and friends), so there is no import edge a future
+// handler could accidentally use to read one back.
 package api
 
 import (
@@ -15,8 +21,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/consumer"
@@ -54,30 +62,76 @@ type api struct {
 	broker   *Broker
 	mux      *http.ServeMux
 
-	// priceLoader backs GET /api/prices. nil means unwired: the route
-	// answers 503, exactly as deepseek-lens's does without SetPricing.
+	// priceLoader backs GET /api/prices and, through its Path, the write
+	// POST /api/prices performs. nil means unwired: both routes answer 503,
+	// exactly as deepseek-lens's do without SetPricing.
 	priceLoader *pricing.Loader
+
+	// proxyHandler is the live proxy's own Handler. The replay endpoint sends
+	// through it rather than through a transport of its own, so a replay picks
+	// up the same transport, tee, body cap and header redaction as live
+	// traffic and reaches SQLite through the consumer's single writer.
+	// replayEnabled is config.ReplayEnabled -- the endpoint's opt-in control.
+	proxyHandler  http.Handler
+	replayEnabled bool
+
+	// replayRejected counts every replay turned away by either guard:
+	// disabled-by-default, or the Origin/Host allowlist. Without it a rejected
+	// probe against the one billable route leaves no server-side trace at all.
+	// Surfaced on /api/health alongside the other counters.
+	replayRejected atomic.Uint64
+
+	// The three write seams br-GI-1-17's composition root wires. They are
+	// declared here, in the bead that owns the write routes, because a seam's
+	// setter is a package-level capability with no route attached -- which is
+	// what lets the setter ship a bead before br-GI-1-18 adds the routes that
+	// call it, with no 17 -> 18 dependency edge. An unwired seam is a
+	// supported state: the route that consumes it answers 503, never a nil
+	// dereference.
+	credentialWriter func(name, value string) error
+	accountWriter    func() error
+	ingestTrigger    func(ctx context.Context) error
 }
 
-// SetPricing wires GET /api/prices to loader. Leaving it unset is a
-// supported state (the route answers 503), not a nil dereference.
+// SetPricing wires GET/POST /api/prices to loader's table and override file.
+// Leaving it unset is a supported state (both routes answer 503), not a nil
+// dereference.
 func (a *api) SetPricing(loader *pricing.Loader) { a.priceLoader = loader }
+
+// SetCredentialWriter wires the route that stores a credential to fn. This
+// package never imports internal/secret; the composition root does, and hands
+// the write in as a value.
+func (a *api) SetCredentialWriter(fn func(name, value string) error) { a.credentialWriter = fn }
+
+// SetAccountWriter wires the route that saves the accounts file to fn.
+func (a *api) SetAccountWriter(fn func() error) { a.accountWriter = fn }
+
+// SetIngestTrigger wires the route that runs every collector once to fn.
+func (a *api) SetIngestTrigger(fn func(ctx context.Context) error) { a.ingestTrigger = fn }
 
 // ServeHTTP delegates to the stored mux, so *api satisfies http.Handler.
 func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) { a.mux.ServeHTTP(w, r) }
 
-// New builds the dashboard's read API: st, sk and cons back /api/health;
-// broker backs /api/stream and is what PublishingStore publishes to. The
-// write routes, the asset mount, and their constructor parameters
-// (proxyHandler, assets fs.FS, replayEnabled) land in a later slice --
-// adding them here now, unused, is exactly the premature scaffolding
-// CLAUDE.md's lazy-engineering discipline argues against.
-func New(st Store, sk *sink.Sink, cons *consumer.Consumer, broker *Broker) *api {
-	a := &api{store: st, sink: sk, consumer: cons, broker: broker}
+// New builds the dashboard's http.Handler: a mostly-read JSON API under
+// /api/* (including the /api/stream SSE endpoint) plus internal/web's
+// embedded assets at every other path. Handlers are thin -- parse query
+// params into a store filter, call st, encode JSON -- with no business logic
+// here; grouping that has to be correct over the whole table (the warning
+// inbox's per-kind totals) therefore lives in SQL, in store.WarningSummary.
+//
+// Two routes write. POST /api/requests/{id}/replay re-issues a captured
+// request through proxyHandler, so the replay is proxied, teed and recorded
+// by exactly the code that handles live traffic; POST /api/prices writes the
+// price-override file through the Loader SetPricing wired. A nil
+// proxyHandler disables replay's send path, which is what tests before
+// replay's own rely on.
+func New(st Store, sk *sink.Sink, cons *consumer.Consumer, broker *Broker, assets fs.FS, proxyHandler http.Handler, replayEnabled bool) *api {
+	a := &api{store: st, sink: sk, consumer: cons, broker: broker, proxyHandler: proxyHandler, replayEnabled: replayEnabled}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/requests", methodGet(a.listRequests))
 	mux.HandleFunc("/api/requests/{id}", methodGet(a.getRequest))
+	mux.HandleFunc("POST /api/requests/{id}/replay", a.replay)
 	mux.HandleFunc("/api/stats", methodGet(a.stats))
 	// Registered before /api/warnings, which as a prefix pattern would
 	// otherwise also match this path. Go's ServeMux prefers the more
@@ -89,6 +143,8 @@ func New(st Store, sk *sink.Sink, cons *consumer.Consumer, broker *Broker) *api 
 	mux.HandleFunc("/api/stream", methodGet(a.stream))
 	mux.HandleFunc("/api/health", methodGet(a.health))
 	mux.HandleFunc("/api/prices", methodGet(a.getPrices))
+	mux.HandleFunc("POST /api/prices", a.setPrices)
+	mux.Handle("/", http.FileServer(http.FS(assets)))
 	a.mux = mux
 	return a
 }
@@ -184,6 +240,23 @@ func parseTimeBoundParam(r *http.Request, key string) (time.Time, error) {
 
 func parseSinceParam(r *http.Request) (time.Time, error) {
 	return parseTimeBoundParam(r, "since")
+}
+
+// parseBoolParam reads the named query param as a boolean. Absent means
+// false; the accepted spellings are strconv.ParseBool's (1, t, T, TRUE, true,
+// True, 0, f, F, FALSE, false, False). Anything else is rejected rather than
+// guessed at -- ?no_capture=yes silently meaning false would send a call the
+// caller asked not to record.
+func parseBoolParam(r *http.Request, key string) (bool, error) {
+	s := r.URL.Query().Get(key)
+	if s == "" {
+		return false, nil
+	}
+	b, err := strconv.ParseBool(s)
+	if err != nil {
+		return false, fmt.Errorf("invalid %s %q: want a boolean", key, s)
+	}
+	return b, nil
 }
 
 // parseGranularityParam reads ?granularity, defaulting to "day" when absent.
@@ -501,6 +574,9 @@ type healthResponse struct {
 	ConsumerFlushes   uint64     `json:"consumer_flushes"`
 	LastWriteAt       *time.Time `json:"last_write_at,omitempty"`
 	LastWriteAgeMs    int64      `json:"last_write_age_ms,omitempty"`
+	// ReplayRejected counts replay attempts turned away by either guard. It is
+	// the only server-side trace a rejected probe leaves -- see replayRejected.
+	ReplayRejected uint64 `json:"replay_rejected"`
 }
 
 func (a *api) health(w http.ResponseWriter, r *http.Request) {
@@ -514,6 +590,7 @@ func (a *api) health(w http.ResponseWriter, r *http.Request) {
 		ConsumerFailed:    cs.Failed,
 		ConsumerDrained:   cs.Drained,
 		ConsumerFlushes:   cs.FlushCount,
+		ReplayRejected:    a.replayRejected.Load(),
 	}
 	if !cs.LastWriteAt.IsZero() {
 		t := cs.LastWriteAt

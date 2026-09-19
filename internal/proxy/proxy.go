@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -100,6 +101,10 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 		}
 		if rm, ok := r.Context().Value(replayKey{}).(ReplayMeta); ok {
 			st.noCapture = rm.NoCapture
+			if rm.Of != 0 {
+				st.replayOf = strconv.FormatInt(rm.Of, 10)
+			}
+			st.replayEdits = rm.Edits
 		}
 		r = r.WithContext(context.WithValue(r.Context(), stateKey{}, st))
 		rp.ServeHTTP(w, r)
@@ -173,6 +178,15 @@ type captureState struct {
 
 	fallbackSeq *uint64
 	noCapture   bool
+
+	// replayOf and replayEdits come from ReplayMeta. replayOf is the
+	// original's row id rendered in decimal -- the same form
+	// Event.ReplayOf is stored in (replay_of is a TEXT column) and the
+	// form EventFilter.ReplayOf is matched against. Both stay empty for
+	// ordinary traffic, which is what makes "replay_of = ''" mean "not a
+	// replay" without a separate flag.
+	replayOf    string
+	replayEdits string
 }
 
 // submit assembles and submits the CapturedCall. It is called at most once
@@ -198,6 +212,8 @@ func (st *captureState) submit(status int, respHeaders http.Header, respBody []b
 		ReqBody:         st.reqBody.Bytes(),
 		RespBody:        respBody,
 		CaptureComplete: captureComplete,
+		ReplayOf:        st.replayOf,
+		ReplayEdits:     st.replayEdits,
 		RequestID:       st.requestID(respHeaders),
 		Err:             callErr,
 	})
