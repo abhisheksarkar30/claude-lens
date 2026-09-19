@@ -50,6 +50,25 @@ assigns unconditionally (`internal/jsonlogs/jsonlogs.go:102-105`) and `New` seed
 mis-bill every row into `cost_usd` (the sharp edge recorded in §8). The diff must show a **move**,
 not a rewrite — a reviewer must be able to see the guard arrived intact.
 
+**The state is readable — `Tailer.Account()`, added here and used by br-GI-3-07.** The guard is
+only assertable if a test can read back what it set:
+
+```go
+// Account reports the account and billing mode every row from this tailer
+// gets, unless a model prefix routes it otherwise.
+func (t *Tailer) Account() (name, billingMode string) {
+	return t.account, t.billingMode
+}
+```
+
+Without it the guard carries no regression test: `account`/`billingMode` are unexported
+(`jsonlogs.go:82-83`), `Tailer` exposes no other accessor, and no test in `internal/cli` builds a
+tailer at all. The alternative — a poll harness in `internal/cli` — observes the guard only
+indirectly, through the column a mis-billed row lands in, and cannot tell "the guard held" from
+"the pricer declined". One three-line accessor is the smaller and more direct instrument, and the
+repo already has the shape (`AllKinds()` is a read-only accessor). br-GI-3-07 adds
+`ModelBilling()` beside it for the same reason.
+
 **`SetModelBilling` is out of scope.** It joins the helper in br-GI-3-07, so this bead's diff
 contains only the move.
 
@@ -84,24 +103,18 @@ never blames the extract for a routing bug.
 
 ## Test Specifications
 
-- Unit Tests (`internal/jsonlogs/jsonlogs_test.go`, **not** `internal/cli`): the F5.1 contract the
-  guard defends, asserted where the fields are readable. `account`/`billingMode` are unexported
-  (`jsonlogs.go:82-83`) and `Tailer` exposes no accessor — only the four setters, `Poll`, and
-  unexported internals (`jsonlogs.go:95-105`, `:132`, `:291`, `:366`) — so an assertion on tailer
-  state is **unwritable from package `cli`**, and no test in `internal/cli` builds a tailer at all
-  (its fixtures write rows straight to the store via `seedEvent`). Assert instead:
+- Unit Tests (`internal/jsonlogs/jsonlogs_test.go`): the contract the guard defends, in the package
+  that owns the fields.
   - `New(root, st)` leaves the account empty and `billingMode == "subscription"` (the `:91-93` seed).
   - `SetAccount("", "")` assigns **unconditionally**, blanking the mode to `""` — the sharp edge
-    recorded in §8, and the reason the `acct.Name != ""` guard is load-bearing at every call site
-    rather than decorative.
+    recorded in §8, and the reason the guard is load-bearing rather than decorative.
+- Unit Tests (`internal/cli/cli_test.go`): **the guard itself**, read through the new
+  `Tailer.Account()`. `newTailer` on a config with **no** subscription account → `("", "subscription")`;
+  on a config **with** one → that account's name and billing mode. Deleting the `acct.Name != ""`
+  guard makes the first case read `("", "")`, so the regression fails a test instead of depending on
+  a reviewer noticing it in a diff.
 - Unit Tests (`internal/cli`, existing test files): the existing `clens ingest`/`clens refresh`
   tests pass unchanged — they are the behaviour-preservation guard for the extract.
-- **Deliberately not test-covered.** That `newTailer` *keeps* the guard is a pure-move property,
-  verified by reading the diff. Making it test-observable would require either a new exported
-  accessor on `Tailer` (API added to satisfy one test) or a full poll harness in `internal/cli`
-  that does not exist today. The bead's existing "the diff must show a move, not a rewrite"
-  requirement is the honest control; the `jsonlogs` case above pins the contract the guard
-  protects, so an edit that drops the guard shows up as a diff against a stated rule.
 - Integration Tests: none (br-GI-3-07 asserts the routing this helper will carry).
 - E2E: none.
 
@@ -109,5 +122,6 @@ never blames the extract for a routing bug.
 
 - `internal/cli/ingest.go` (modify — host `newTailer`; `runIngest` calls it with `root`)
 - `internal/cli/refresh.go` (modify — `addCollectors` calls `newTailer(cfg, jsonlRoot(), st)`)
-- `internal/jsonlogs/jsonlogs_test.go` (modify — the F5.1 guard contract; see Test Specifications
-  for why this case cannot live in `internal/cli`)
+- `internal/jsonlogs/jsonlogs.go` (modify — `Account()` accessor)
+- `internal/jsonlogs/jsonlogs_test.go` (modify — the `New` seed / `SetAccount` sharp-edge cases)
+- `internal/cli/cli_test.go` (modify — the guard case, via `Account()`)

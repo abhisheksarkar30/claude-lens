@@ -26,6 +26,21 @@ mislabelled.
 func (t *Tailer) SetModelBilling(prefixes []string, apiAccount, apiBillingMode string)
 ```
 
+**`ModelBilling()` — the read-only accessor, `Account()`'s sibling (br-GI-3-06).** The wiring in
+item 2 is only assertable if a test can read back what `SetModelBilling` stored:
+
+```go
+// ModelBilling reports the prefixes that route a row to the api account, and
+// the account/billing mode such a row gets.
+func (t *Tailer) ModelBilling() (prefixes []string, account, billingMode string) {
+	return slices.Clone(t.apiPrefixes), t.apiAccount, t.apiBillingMode
+}
+```
+
+`prefixes` is a **copy**, so a caller cannot mutate the tailer's own slice — the same rule
+`AllKinds()` follows. br-GI-3-06 adds `Account()` (the default, un-routed account/mode) beside it;
+this one covers the routing half.
+
 `buildEvent` (`jsonlogs.go:291-350`) resolves account/billing **per row** before the `store.Event`
 literal, instead of once:
 
@@ -103,29 +118,26 @@ configured prefix (not a derived predicate) keeps "which models are third-party"
     `ApiEquivalentCostUSD` set, `CostUSD` nil.
   - No-prefix-list case: `SetModelBilling(nil, "", "api")` routes nothing, so an unset resolver at a
     call site would be visible (the nil-`HasPrefix` failure shape).
-- Unit Tests (`internal/jsonlogs/jsonlogs_test.go`) — **T14 folds into T7's case above**: drive a
-  tailer directly with `SetModelBilling(pricing.ShippedAPIModelPrefixes(), "", "api")` — the exact
-  value `resolvedAPIPrefixes(cfg)` returns on an unconfigured install — and assert a `deepseek-*`
-  row lands in `api` while a `claude-*` row through the **same** tailer stays `subscription`. That
-  is Outcome Definition's "an unconfigured install routes by default", asserted at the seam that can
-  see it.
-- Unit Tests (`internal/cli`): **none added.** The resolver's own contract is br-GI-3-05's T10;
-  re-asserting it here would exercise the same function a second time without touching the wiring.
-  An assertion that `newTailer` *calls* `SetModelBilling` is unwritable from this package —
-  `apiPrefixes`/`apiAccount`/`apiBillingMode` are unexported with no accessor, and no test in
-  `internal/cli` builds a tailer at all (`cli_test.go`'s fixtures write rows straight to the store
-  via `seedEvent`), so a routing assertion here would need a net-new poll harness to observe what
-  `jsonlogs` already observes directly. br-GI-3-06 sets the precedent: the helper's two calls are a
-  reviewed-move property, visible in a small diff, and the behaviour they wire is asserted one
-  package down.
+- Unit Tests (`internal/jsonlogs/jsonlogs_test.go`): **T7 above**, driven directly through
+  `SetModelBilling(pricing.ShippedAPIModelPrefixes(), "", "api")` — the exact value
+  `resolvedAPIPrefixes(cfg)` returns on an unconfigured install.
+- Unit Tests (`internal/cli/cli_test.go`) — **T14, the wiring**: `newTailer(cfg, root, st)` with
+  neither config key set reports `ModelBilling()` = `{"deepseek-"}`, `""`, `"api"`, so the helper is
+  proven to consume the resolver's shipped default rather than a hand-rolled list. Read through the
+  `ModelBilling()` accessor br-GI-3-06 adds beside `Account()`. The same case with
+  `CLENS_API_MODEL_PREFIXES=acme-` reports `{"acme-"}`, pinning "resolved, not raw" in both
+  directions — and making Outcome Definition's "an unconfigured install routes by default" a
+  failing test if the wiring is dropped, not a diff a reviewer has to spot.
 - Integration Tests: none (T8 in br-GI-3-08 covers the merge interaction).
 - E2E: none.
 
 ## Files to Touch
 
 - `internal/jsonlogs/jsonlogs.go` (modify — `apiPrefixes`/`apiAccount`/`apiBillingMode`,
-  `SetModelBilling`, per-row resolution in `buildEvent`, `ponytail:` comment amendment)
+  `SetModelBilling`, `ModelBilling`, per-row resolution in `buildEvent`, `ponytail:` comment
+  amendment)
 - `internal/jsonlogs/jsonlogs_test.go` (modify — T7)
 - `internal/cli/ingest.go` (modify — `newTailer` gains the `SetModelBilling` call)
+- `internal/cli/cli_test.go` (modify — T14, the wiring, via `ModelBilling()`)
 - `internal/cli/refresh.go` (modify — `addCollectors` reaches it through `newTailer`; no separate
   edit expected)
