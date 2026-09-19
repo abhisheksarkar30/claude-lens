@@ -329,3 +329,188 @@ func TestLoaderReloadsOnFileChange(t *testing.T) {
 		t.Error("Loader did not pick up the override after the file changed")
 	}
 }
+
+// --- Peak pricing (br-GI-3-02) ---
+
+// testPeakWindow is the shipped DeepSeek shape: 2x, 01:00-04:00 and
+// 06:00-10:00 UTC, no excluded dates.
+func testPeakWindow() *PeakWindow {
+	return &PeakWindow{
+		Multiplier:   big.NewRat(2, 1),
+		Hours:        [][2]int{{1, 4}, {6, 10}},
+		OffPeakDates: map[string]struct{}{},
+	}
+}
+
+// fixtureInstant builds a UTC instant, failing the test if that date is not
+// the weekday the case assumes -- a boundary table that silently lands on a
+// Saturday would pass for the wrong reason.
+func fixtureInstant(t *testing.T, y int, m time.Month, d, h, min int, want time.Weekday) time.Time {
+	t.Helper()
+	if got := time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Weekday(); got != want {
+		t.Fatalf("fixture date %04d-%02d-%02d is a %s, want %s", y, m, d, got, want)
+	}
+	return time.Date(y, m, d, h, min, 0, 0, time.UTC)
+}
+
+// peakFixtureTable is a one-model table at $10/MTok with a peak window, so
+// T3 is self-contained rather than depending on the shipped DeepSeek rows
+// br-GI-3-03 adds.
+func peakFixtureTable() Table {
+	return Table{
+		"peak-model": {
+			Model:            "peak-model",
+			InputRate:        perMTok("10.00"),
+			OutputRate:       perMTok("10.00"),
+			CacheWrite5mRate: perMTok("0"),
+			CacheWrite1hRate: perMTok("0"),
+			CacheReadRate:    perMTok("0"),
+			Source:           "shipped",
+			Peak:             testPeakWindow(),
+		},
+	}
+}
+
+// T1: the hour edge is the single most likely bug here, and it produces
+// plausible-looking costs rather than an error.
+func TestIsPeakBoundaryTable(t *testing.T) {
+	w := testPeakWindow()
+	// Monday 2026-09-21; window is [01:00,04:00) and [06:00,10:00) UTC.
+	cases := []struct {
+		h, min int
+		want   bool
+	}{
+		{0, 59, false},
+		{1, 0, true},
+		{3, 59, true},
+		{4, 0, false},
+		{5, 59, false},
+		{6, 0, true},
+		{9, 59, true},
+		{10, 0, false},
+	}
+	for _, c := range cases {
+		at := fixtureInstant(t, 2026, time.September, 21, c.h, c.min, time.Monday)
+		if got := w.IsPeak(at); got != c.want {
+			t.Errorf("IsPeak(%s) = %v, want %v", at.Format(time.RFC3339), got, c.want)
+		}
+	}
+}
+
+// T1: the weekend half. 02:00 is squarely inside the window on a weekday.
+func TestIsPeakWeekendIsOffPeak(t *testing.T) {
+	w := testPeakWindow()
+	for _, c := range []struct {
+		d    int
+		want time.Weekday
+	}{
+		{19, time.Saturday},
+		{20, time.Sunday},
+	} {
+		at := fixtureInstant(t, 2026, time.September, c.d, 2, 0, c.want)
+		if w.IsPeak(at) {
+			t.Errorf("IsPeak(%s) = true on a %s, want false", at.Format(time.RFC3339), c.want)
+		}
+	}
+}
+
+// T2: a holiday is off-peak at an otherwise in-window hour, and removing it
+// from the list is what makes the same instant peak.
+func TestIsPeakOffPeakDates(t *testing.T) {
+	at := fixtureInstant(t, 2026, time.October, 1, 2, 0, time.Thursday)
+
+	excluded := testPeakWindow()
+	excluded.OffPeakDates = map[string]struct{}{"2026-10-01": {}}
+	if excluded.IsPeak(at) {
+		t.Error("IsPeak on an OffPeakDates date = true, want false")
+	}
+
+	if !testPeakWindow().IsPeak(at) {
+		t.Error("IsPeak with the date absent from OffPeakDates = false, want true")
+	}
+}
+
+// T3: the peak analogue of TestComputeBatchRoundsPerClass. The multiplier is
+// applied to the exact per-class cost before the single roundHalfUp, so a
+// fixture where per-class and total-then-multiply disagree must produce the
+// per-class answer.
+//
+// 300 tokens x $10/MTok = $0.003 per class. Doubled before rounding, each
+// class is $0.006 -> $0.01, for $0.02. Doubling the rounded total instead
+// gives round($0.003) x 2 classes x 2 = $0.00 -- the two must differ.
+func TestComputePeakRoundsPerClass(t *testing.T) {
+	table := peakFixtureTable()
+	usage := parse.Usage{InputTokens: 300, OutputTokens: 300}
+
+	peakAt := fixtureInstant(t, 2026, time.September, 21, 2, 0, time.Monday)
+	got, source := table.Compute("peak-model", usage, "", "", peakAt)
+	if source != "shipped" {
+		t.Fatalf("costSource = %q, want shipped", source)
+	}
+	if got == nil {
+		t.Fatal("usd = nil, want a priced value")
+	}
+	if *got != 0.02 {
+		t.Errorf("per-class-rounded peak total = %v, want 0.02", *got)
+	}
+
+	// The same call off peak: $0.003 per class rounds to $0.00 each.
+	offAt := fixtureInstant(t, 2026, time.September, 21, 0, 30, time.Monday)
+	off, _ := table.Compute("peak-model", usage, "", "", offAt)
+	if off == nil {
+		t.Fatal("off-peak usd = nil, want a priced value")
+	}
+	if *off != 0.00 {
+		t.Errorf("off-peak total = %v, want 0.00", *off)
+	}
+	if *got == *off {
+		t.Error("peak and off-peak priced identically; the fixture no longer distinguishes them")
+	}
+}
+
+// T3: batch halving and the peak multiplier compose on one call, as two exact
+// multiplications before the single rounding. 600 tokens x $10/MTok = $0.006
+// per class; halving then doubling cancels exactly, leaving $0.006 -> $0.01.
+// Rounding between the two multiplications would give round($0.003) x 2 =
+// $0.00, so this asserts the multiplies are adjacent.
+func TestComputePeakAndBatchCompose(t *testing.T) {
+	table := peakFixtureTable()
+	usage := parse.Usage{InputTokens: 600}
+
+	peakAt := fixtureInstant(t, 2026, time.September, 21, 2, 0, time.Monday)
+	offAt := fixtureInstant(t, 2026, time.September, 21, 0, 30, time.Monday)
+
+	batched, _ := table.Compute("peak-model", usage, "", "batch", peakAt)
+	plain, _ := table.Compute("peak-model", usage, "", "", offAt)
+	if batched == nil || plain == nil {
+		t.Fatal("expected priced values")
+	}
+	if *batched != 0.01 {
+		t.Errorf("batch at peak = %v, want 0.01 (a rounding between the two multiplies gives 0.00)", *batched)
+	}
+	if *batched != *plain {
+		t.Errorf("batch at peak = %v, plain off peak = %v, want equal (halving and doubling cancel exactly)", *batched, *plain)
+	}
+}
+
+// T4: peak must not leak onto a flat-priced model. claude-sonnet-5 ships with
+// no window, so a peak instant must price identically to off peak.
+func TestPeakDoesNotLeakOntoFlatModels(t *testing.T) {
+	table := ShippedTable()
+	if r := table["claude-sonnet-5"]; r.Peak != nil {
+		t.Fatal("claude-sonnet-5 carries a Peak window; pick a flat model for this case")
+	}
+
+	usage := parse.Usage{InputTokens: 1_000_000, OutputTokens: 1_000_000, CacheReadTokens: 1_000_000}
+	peakAt := fixtureInstant(t, 2026, time.September, 21, 2, 0, time.Monday)
+	offAt := fixtureInstant(t, 2026, time.September, 21, 0, 30, time.Monday)
+
+	at, _ := table.Compute("claude-sonnet-5", usage, "", "", peakAt)
+	off, _ := table.Compute("claude-sonnet-5", usage, "", "", offAt)
+	if at == nil || off == nil {
+		t.Fatal("expected priced values")
+	}
+	if *at != *off {
+		t.Errorf("claude-sonnet-5 at peak = %v, off peak = %v, want equal", *at, *off)
+	}
+}

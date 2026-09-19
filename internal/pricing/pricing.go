@@ -32,6 +32,38 @@ type Rate struct {
 	FastOutputRate   *big.Rat
 	EffectiveFrom    time.Time
 	Source           string // "shipped" | "provisional" | "user"
+	Peak             *PeakWindow
+}
+
+// PeakWindow describes a model whose rate varies by time of day. A nil
+// *PeakWindow on a Rate means the model is flat-priced, which is why the
+// window is per-Rate and never global: ShippedTable() legitimately mixes
+// flat-priced Anthropic rows with time-varying DeepSeek ones, and an
+// unconditional multiply would double every Claude cost.
+type PeakWindow struct {
+	Multiplier   *big.Rat            // peak = off-peak x Multiplier (DeepSeek: 2)
+	Hours        [][2]int            // [start,end) UTC hour ranges: {{1,4},{6,10}}
+	OffPeakDates map[string]struct{} // "2006-01-02" UTC dates excluded from peak
+}
+
+// IsPeak reports whether at falls in the peak window: UTC, Monday-Friday, not
+// an OffPeakDates date, and inside one of the [start,end) hour ranges. The
+// caller is expected to have checked the window is non-nil.
+func (w *PeakWindow) IsPeak(at time.Time) bool {
+	utc := at.UTC()
+	if d := utc.Weekday(); d == time.Saturday || d == time.Sunday {
+		return false
+	}
+	if _, off := w.OffPeakDates[utc.Format("2006-01-02")]; off {
+		return false
+	}
+	h := utc.Hour()
+	for _, span := range w.Hours {
+		if h >= span[0] && h < span[1] {
+			return true
+		}
+	}
+	return false
 }
 
 // Table is a rate table keyed by model id.
@@ -71,6 +103,12 @@ func (t Table) Compute(model string, usage parse.Usage, speed, serviceTier strin
 	// service_tier == "priority" applies no rate change: the skill bundle
 	// documents no per-token Priority rate, so none is asserted here.
 
+	// Peak is resolved once per call and applied per class, in the same place
+	// batch halving sits: two exact multiplications, one rounding. Multiplying
+	// the already-rounded total instead would drift, the same way it would for
+	// batch (TestComputeBatchRoundsPerClass guards that half).
+	peak := r.Peak != nil && r.Peak.IsPeak(at)
+
 	total := new(big.Rat)
 	for _, class := range []struct {
 		tokens int
@@ -88,6 +126,9 @@ func (t Table) Compute(model string, usage parse.Usage, speed, serviceTier strin
 		cost := new(big.Rat).Mul(big.NewRat(int64(class.tokens), 1), class.rate)
 		if batch {
 			cost.Mul(cost, big.NewRat(1, 2))
+		}
+		if peak {
+			cost.Mul(cost, r.Peak.Multiplier)
 		}
 		total.Add(total, roundHalfUp(cost, centsPerUnit))
 	}
