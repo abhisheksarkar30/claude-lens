@@ -86,7 +86,7 @@ dashboard's Sources tab are how per-collector health is made visible rather than
 | [internal/decode](../../internal/decode/) | `br` / `zstd` / `gzip` body decoding |
 | [internal/analyze](../../internal/analyze/) | the rule engine and the one spelling of every warning kind |
 | [internal/session](../../internal/session/) | session resolution and the incremental per-session fold |
-| [internal/pricing](../../internal/pricing/) | the shipped rate table, overrides, and `Cost()` |
+| [internal/pricing](../../internal/pricing/) | the shipped rate table, overrides, and `Compute()` — including the per-model peak window and the `PeakComputer` seam |
 | [internal/quota](../../internal/quota/) | rolling-window burn, snapshot cross-check, limit calibration |
 | [internal/replay](../../internal/replay/) | replay payload construction and edit application |
 | [internal/catalog](../../internal/catalog/) | the models-endpoint catalogue |

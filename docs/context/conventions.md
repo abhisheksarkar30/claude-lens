@@ -59,8 +59,20 @@ Two rules that come with the pattern:
 - **Seams are declared in the bead that owns the *setter*, not the route.** That is what let the
   write seams ship a bead before their routes existed, with no dependency edge between the two.
 
-The one interface in the codebase is `api.Store` — a narrow read slice of `*store.Store` — kept so
-tests can seed a real temp store. It is not extensibility.
+Interfaces do exist, but as **narrow mirrors of a dependency, one per consuming package** — each
+consumer declares the handful of methods it calls, so a test can inject a fake without the package
+importing the real one. `api.Store` is the one on the dashboard's DI path (a read slice of
+`*store.Store`, kept so tests can seed a real temp store); [internal/jsonlogs](../../internal/jsonlogs/)
+mirrors `Store`, `Analyzer`, `SessionRule`, `SessionRecorder` and `PriceComputer` for the same
+reason. None of them is extensibility — the method sets are deliberately the minimum each caller
+uses, and [internal/consumer](../../internal/consumer/)'s copies are duplicated rather than shared
+so the two collectors can drift independently.
+
+One variant is worth knowing: `pricing.PeakComputer` (with its `peakComputer` mirrors in the two
+collectors) is an **optional-capability** seam rather than a dependency seam — a pricer may or may
+not implement `PeakAt`, and the caller type-asserts. It is a separate interface instead of a third
+return value on `Compute` so that widening it cannot force an update on every fake behind
+`PriceComputer`. See [cost-and-quota.md](cost-and-quota.md) §Peak and off-peak.
 
 ## Logging & observability
 

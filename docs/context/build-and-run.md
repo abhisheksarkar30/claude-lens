@@ -23,6 +23,12 @@ One buildable unit: the `clens` binary. Commands are taken from
 No `Makefile`, no build tags, no cgo (`modernc.org/sqlite` is the pure-Go driver, which is what
 keeps the single-static-binary story true).
 
+`gofmt -l .` printing nothing is the intent, but **on a Windows clone with `core.autocrlf=true` it
+flags every file** — the checkout is CRLF throughout and `gofmt` always wants LF. That is a line-
+ending artefact, not a style failure, and `gofmt -w` there would rewrite every line of every file.
+The gates this repo actually enforces are `go build`, `go vet`, and `go test` ([CLAUDE.md](../../CLAUDE.md)
+§Commands); there is no format gate in CI.
+
 ## Local dev setup
 
 One step per clone, and it is not optional:
@@ -85,6 +91,30 @@ Every subcommand accepts the same flag set; precedence is flags > `CLENS_*` > fi
 
 Source: [internal/config/config.go](../../internal/config/config.go) `Default()` and the `Config`
 struct. `clens doctor` prints the resolved values.
+
+Two keys have **no flag** — they are config-file / `CLENS_*` only, and both are deliberately absent
+from `Default()` so an unconfigured install falls back to the shipped table's own values rather
+than to a second copy of them that could drift:
+
+| Config key | `CLENS_*` | Unset → | `none` → |
+|---|---|---|---|
+| `PeakOffPeakDates` | `CLENS_PEAK_OFF_PEAK_DATES` | the 33 bundled 2026 dates | no holiday excluded |
+| `ApiModelPrefixes` | `CLENS_API_MODEL_PREFIXES` | `deepseek-` | nothing routed pay-as-you-go |
+
+Comma-separated; `none` is the sentinel for an empty list, and unset is *not* the same as empty —
+the difference is preserved by a `nil`-vs-empty check on both sides
+([internal/cli/ingest.go:100-105](../../internal/cli/ingest.go#L100-L105)). Read the two `none`
+columns as **more expensive, not less**:
+
+- Clearing `PeakOffPeakDates` does not disable peak pricing. Peak is a property of the shipped
+  DeepSeek rows; the dates are only the holiday exclusions, so an empty list means every weekday
+  peak hour is billed at peak.
+- Clearing `ApiModelPrefixes` does not make anything free — it stops DeepSeek rows being routed to
+  the `api` account, so they fall back to the collector's `subscription` default and their cost
+  lands in the hypothetical column instead of `cost_usd`.
+
+`Validate()` rejects a malformed date (not `YYYY-MM-DD`) and an empty or whitespace-only prefix.
+`clens doctor` prints the resolved state as `N (default)`, `N`, or `none`.
 
 ## The acceptance run
 

@@ -79,9 +79,22 @@ sequenceDiagram
   one — which is why `insertOrMerge` returns the session id and every caller uses *that*.
   Reconciling `ev.SessionID` instead creates a session row owning no events and leaves the real
   session out of the analysis. This was an implementation-cross-review finding, fixed in `8650b9a`.
+- **`billing_mode` moves with the winning cost columns** — it is *not* `preferNonEmpty` like its
+  neighbours. This is the one column a merge is expected to contradict: the JSONL tailer resolves it
+  per row by model prefix, so re-ingesting a DeepSeek call flips it `subscription` → `api`. Keeping
+  the stored mode while adopting the incoming cost would leave a `subscription` row carrying a real
+  `cost_usd` — the pair [decisions/001](decisions/001-billing-split-by-column.md) forbids.
+  `account` and `auth_kind` stay `preferNonEmpty` deliberately: a JSONL line carries no auth signal,
+  and on the ordinary ordering the live proxy row already holds the real account name.
+- **A winner with no mode derives one from the column it priced.** An unclassified credential leaves
+  `billing_mode` as `''`, which matches neither of the aggregates' `CASE WHEN` branches and would
+  drop the row from every total, so the label follows the money: `cost_usd` → `api`,
+  `api_equivalent_cost_usd` → `subscription`. A winner that priced nothing keeps the stored mode
+  instead, because there is no cost column for an adopted label to contradict.
 - **A disagreement is a finding, not an error:** `source_mismatch` is written and both rows survive
   as one merged row.
-- **Idempotent:** re-ingesting the same JSONL re-merges to the same result.
+- **Idempotent:** re-ingesting the same JSONL re-merges to the same result. That is what makes
+  `clens ingest --rebuild` the re-pricing path rather than a duplicate-row risk.
 
 ## 3. `clens refresh` — the collector fan-out
 
