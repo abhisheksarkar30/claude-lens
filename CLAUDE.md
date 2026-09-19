@@ -129,3 +129,11 @@ there is nothing for it to integrate.
   modes on Unix and an explicit Windows ACL on Windows (`0600` is a no-op there). Full bodies *are*
   stored, so the content — every prompt and every file the agent read — is the asset this repo is
   protecting. Loopback binding and redaction are load-bearing defaults, not conveniences.
+
+## Compact Instructions
+
+When compacting, always preserve the working state for continuation:
+
+- Keep the current high-level goal and acceptance criteria.
+- Keep the exact list of files modified during this session.
+- Do not preserve verbose terminal outputs or tool logs.
