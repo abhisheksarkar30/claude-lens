@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -21,6 +22,18 @@ func newTestStore(t *testing.T) *Store {
 	}
 	t.Cleanup(func() { st.Close() })
 	return st
+}
+
+func TestOpenCreatesMissingParentDir(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "does", "not", "exist", "lens.db")
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("db file not created: %v", err)
+	}
 }
 
 func f64(v float64) *float64 { return &v }
@@ -464,6 +477,42 @@ func TestAdminUpsertIdempotent(t *testing.T) {
 	}
 	if amount != 4.56 {
 		t.Errorf("amount_usd = %v, want 4.56 (updated in place)", amount)
+	}
+}
+
+func TestListAdminCostDays(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	day1 := AdminCostDay{
+		DayStart: time.Unix(1700000000, 0), WindowStart: time.Unix(1700000000, 0), WindowEnd: time.Unix(1700086400, 0),
+		Model: "claude-sonnet-5", Description: "input tokens", AmountUSD: 1.23, Currency: "USD", FetchedAt: time.Unix(1700100000, 0),
+	}
+	day2 := AdminCostDay{
+		DayStart: time.Unix(1700086400, 0), WindowStart: time.Unix(1700086400, 0), WindowEnd: time.Unix(1700172800, 0),
+		Model: "claude-sonnet-5", Description: "output tokens", AmountUSD: 4.56, Currency: "USD", FetchedAt: time.Unix(1700100000, 0),
+	}
+	if err := st.UpsertAdminCostDays(ctx, []AdminCostDay{day1, day2}); err != nil {
+		t.Fatalf("UpsertAdminCostDays: %v", err)
+	}
+
+	all, err := st.ListAdminCostDays(ctx, time.Time{}, time.Time{})
+	if err != nil {
+		t.Fatalf("ListAdminCostDays (unfiltered): %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("got %d rows, want 2", len(all))
+	}
+	if all[0].AmountUSD != 1.23 || all[1].AmountUSD != 4.56 {
+		t.Errorf("rows out of day_start order: %+v", all)
+	}
+
+	filtered, err := st.ListAdminCostDays(ctx, day2.DayStart, time.Time{})
+	if err != nil {
+		t.Fatalf("ListAdminCostDays (since day2): %v", err)
+	}
+	if len(filtered) != 1 || filtered[0].Description != "output tokens" {
+		t.Fatalf("filtered = %+v, want only day2's row", filtered)
 	}
 }
 

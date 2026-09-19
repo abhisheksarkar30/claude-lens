@@ -5,11 +5,21 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/abhisheksarkar30/claude-lens/internal/cli"
 )
 
 // commands dispatches subcommand names to their internal/cli implementation.
-// Empty in this bead; br-GI-1-15 and br-GI-1-17 append their entries here.
-var commands = map[string]func([]string) error{}
+// br-GI-1-15 appends its six entries below; br-GI-1-17 appends its twelve
+// carried-over names to the same map -- the two beads own disjoint keys.
+var commands = map[string]func([]string) error{
+	"ingest":    cli.Ingest,
+	"refresh":   cli.Refresh,
+	"quota":     cli.Quota,
+	"accounts":  cli.Accounts,
+	"models":    cli.Models,
+	"reconcile": cli.Reconcile,
+}
 
 func main() {
 	if len(os.Args) < 2 {

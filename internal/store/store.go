@@ -11,6 +11,8 @@ import (
 	"database/sql"
 	_ "embed"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -41,8 +43,17 @@ type Store struct {
 
 // Open creates (or opens) the SQLite file at dbPath, enables WAL and
 // foreign keys, and creates the schema. The returned Store serializes every
-// writer onto one connection.
+// writer onto one connection. dbPath's parent directory is created if
+// missing -- the default path is a ~/.clens subdirectory that nothing else
+// is guaranteed to have created yet on a completely fresh install (a
+// command that never touches internal/secret, e.g. `clens doctor` on its
+// first-ever run, would otherwise be the first thing to fail).
 func Open(dbPath string) (*Store, error) {
+	if dir := filepath.Dir(dbPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("store: open %s: %w", dbPath, err)
+		}
+	}
 	dsn := fmt.Sprintf(
 		"file:%s?_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)&_pragma=journal_mode(WAL)",
 		dbPath,
@@ -748,6 +759,51 @@ func (s *Store) UpsertAdminCostDays(ctx context.Context, days []AdminCostDay) er
 		}
 	}
 	return tx.Commit()
+}
+
+// ListAdminCostDays returns admin_cost_days rows with day_start in
+// [since, until), ordered by day_start then model. A zero since or until
+// leaves that bound unfiltered. internal/reconcile takes billed rows as a
+// caller-supplied parameter rather than reading admin_cost_days itself
+// (br-GI-1-13's design), so this is the read its first caller --
+// internal/cli's `reconcile` command -- uses to supply them.
+func (s *Store) ListAdminCostDays(ctx context.Context, since, until time.Time) ([]AdminCostDay, error) {
+	query := `SELECT day_start, window_start, window_end, model, description, amount_usd, currency, raw, fetched_at FROM admin_cost_days`
+	var conds []string
+	var args []any
+	if !since.IsZero() {
+		conds = append(conds, "day_start >= ?")
+		args = append(args, unixNano(since))
+	}
+	if !until.IsZero() {
+		conds = append(conds, "day_start < ?")
+		args = append(args, unixNano(until))
+	}
+	if len(conds) > 0 {
+		query += " WHERE " + strings.Join(conds, " AND ")
+	}
+	query += " ORDER BY day_start, model"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: ListAdminCostDays: %w", err)
+	}
+	defer rows.Close()
+
+	var out []AdminCostDay
+	for rows.Next() {
+		var d AdminCostDay
+		var dayStart, windowStart, windowEnd, fetchedAt int64
+		if err := rows.Scan(&dayStart, &windowStart, &windowEnd, &d.Model, &d.Description, &d.AmountUSD, &d.Currency, &d.Raw, &fetchedAt); err != nil {
+			return nil, fmt.Errorf("store: ListAdminCostDays: scan: %w", err)
+		}
+		d.DayStart = timeFromNano(dayStart)
+		d.WindowStart = timeFromNano(windowStart)
+		d.WindowEnd = timeFromNano(windowEnd)
+		d.FetchedAt = timeFromNano(fetchedAt)
+		out = append(out, d)
+	}
+	return out, rows.Err()
 }
 
 // UpsertAdminRateLimits replaces the stored rate-limit rows for scope with
