@@ -21,7 +21,7 @@ import (
 // once on the $0.02 total instead gives $0.01 -- the two must differ.
 func TestComputeBatchRoundsPerClass(t *testing.T) {
 	table := Table{
-		"test-model": rate("test-model", 1000, 1000, 20, "shipped"),
+		"test-model": rate("test-model", "10.00", "10.00", "0.20", "shipped"),
 	}
 	usage := parse.Usage{InputTokens: 1000, OutputTokens: 1000}
 
@@ -40,6 +40,93 @@ func TestComputeBatchRoundsPerClass(t *testing.T) {
 	// rounded once -- the value per-class rounding must NOT match.
 	if *perClass == 0.01 {
 		t.Error("per-class rounding produced the same result as rounding the discounted total; fixture no longer distinguishes them")
+	}
+}
+
+// TestPerMTokAcceptsDecimalUSD pins the constructor's decimal-string contract
+// against the integer-cent values it replaced: each literal in the shipped
+// table moved from cents to a string with the same numeric value, so every
+// pre-existing rate must still be bit-identical.
+func TestPerMTokAcceptsDecimalUSD(t *testing.T) {
+	cases := []struct {
+		in   string
+		want *big.Rat
+	}{
+		{"10.00", big.NewRat(1000, 100*1_000_000)}, // the old perMTok(1000)
+		{"0.25", big.NewRat(25, 100*1_000_000)},    // the old perMTok(25)
+		{"0", big.NewRat(0, 1)},
+		// $0.003/MTok -- 0.3 cents. Not an integer number of cents, which is
+		// the whole reason the signature is a string.
+		{"0.003", big.NewRat(3, 1_000_000_000)},
+	}
+	for _, c := range cases {
+		got := perMTok(c.in)
+		if got.Cmp(c.want) != 0 {
+			t.Errorf("perMTok(%q) = %s, want %s", c.in, got.RatString(), c.want.RatString())
+		}
+	}
+
+	if perMTok("0.003").Sign() == 0 {
+		t.Error("perMTok(\"0.003\") is zero -- the sub-cent rate was truncated rather than represented")
+	}
+}
+
+func TestPerMTokPanicsOnUnparseableLiteral(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Error("perMTok(\"garbage\") did not panic")
+		}
+	}()
+	perMTok("garbage")
+}
+
+// TestShippedTableRatesAllNonNil is the backstop for the mechanical row
+// update above: a mistyped literal panics at first call, and a nil rate would
+// otherwise surface only as a confident wrong cost.
+func TestShippedTableRatesAllNonNil(t *testing.T) {
+	for model, r := range ShippedTable() {
+		for name, v := range map[string]*big.Rat{
+			"input_rate":          r.InputRate,
+			"output_rate":         r.OutputRate,
+			"cache_write_5m_rate": r.CacheWrite5mRate,
+			"cache_write_1h_rate": r.CacheWrite1hRate,
+			"cache_read_rate":     r.CacheReadRate,
+		} {
+			if v == nil {
+				t.Errorf("%s: %s is nil", model, name)
+			}
+		}
+	}
+}
+
+// TestRateExactUsesGivenWriteRates: rateExact exists so a model that bills no
+// cache-write premium is expressible at all. The fixture's write rates are
+// neither 1.25x nor 2x its input ($12.50 / $20.00), so a regression to rate's
+// derived form shows up as a mismatch instead of coincidentally agreeing.
+func TestRateExactUsesGivenWriteRates(t *testing.T) {
+	r := rateExact("test-exact", "10.00", "50.00", "1.00", "0.07", "0.09", "shipped")
+
+	for _, c := range []struct {
+		name string
+		got  *big.Rat
+		want string
+	}{
+		{"input_rate", r.InputRate, "10.000000"},
+		{"output_rate", r.OutputRate, "50.000000"},
+		{"cache_read_rate", r.CacheReadRate, "1.000000"},
+		{"cache_write_5m_rate", r.CacheWrite5mRate, "0.070000"}, // not 1.25x input = 12.50
+		{"cache_write_1h_rate", r.CacheWrite1hRate, "0.090000"}, // not 2x input = 20.00
+	} {
+		if got := perTokenToMTok(c.got); got != c.want {
+			t.Errorf("%s = %s/MTok, want %s", c.name, got, c.want)
+		}
+	}
+
+	if r.Source != "shipped" {
+		t.Errorf("Source = %q, want shipped", r.Source)
+	}
+	if !r.EffectiveFrom.Equal(shippedEffectiveFrom) {
+		t.Errorf("EffectiveFrom = %v, want %v", r.EffectiveFrom, shippedEffectiveFrom)
 	}
 }
 
