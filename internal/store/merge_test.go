@@ -102,7 +102,7 @@ func TestMergeWarningLedgerDedup(t *testing.T) {
 		t.Fatalf("UpsertWarnings re-run: %v", err)
 	}
 
-	warnings, err := st.ListWarnings(ctx, id)
+	warnings, err := st.EventWarnings(ctx, id)
 	if err != nil {
 		t.Fatalf("ListWarnings: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestRetryPreservesTwoRows(t *testing.T) {
 		t.Fatalf("event count = %d, want 2", n)
 	}
 
-	warnings, err := st.ListWarnings(ctx, id1)
+	warnings, err := st.EventWarnings(ctx, id1)
 	if err != nil {
 		t.Fatalf("ListWarnings id1: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestMergeCollidingRequestID(t *testing.T) {
 		t.Errorf("InputTokens = %d, want 20 (the winning capture's)", got.InputTokens)
 	}
 
-	warnings, err := st.ListWarnings(ctx, id1)
+	warnings, err := st.EventWarnings(ctx, id1)
 	if err != nil {
 		t.Fatalf("ListWarnings: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestMergePrecedenceTruncatedVsComplete(t *testing.T) {
 		t.Error("CaptureComplete = false after merging in a complete capture, want true")
 	}
 
-	warnings, err := st.ListWarnings(ctx, id1)
+	warnings, err := st.EventWarnings(ctx, id1)
 	if err != nil {
 		t.Fatalf("ListWarnings: %v", err)
 	}

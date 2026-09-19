@@ -163,7 +163,7 @@ func TestConsumerUpstreamErrorCall(t *testing.T) {
 	sk.Submit(call)
 
 	ev := waitForEvents(t, st, 1)[0]
-	warnings, err := st.ListWarnings(context.Background(), ev.ID)
+	warnings, err := st.EventWarnings(context.Background(), ev.ID)
 	if err != nil {
 		t.Fatalf("ListWarnings: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestConsumerPanickingAnalyzerRecovered(t *testing.T) {
 	sk.Submit(basicCall("req-panic"))
 	ev := waitForEvents(t, st, 1)[0]
 
-	warnings, err := st.ListWarnings(context.Background(), ev.ID)
+	warnings, err := st.EventWarnings(context.Background(), ev.ID)
 	if err != nil {
 		t.Fatalf("ListWarnings: %v", err)
 	}
@@ -486,7 +486,7 @@ func TestConsumerSessionRuleAttachesFindingToEarlierRow(t *testing.T) {
 		t.Fatal("could not find req-cache-write's event id")
 	}
 
-	warnings, err := st.ListWarnings(context.Background(), firstID)
+	warnings, err := st.EventWarnings(context.Background(), firstID)
 	if err != nil {
 		t.Fatalf("ListWarnings: %v", err)
 	}

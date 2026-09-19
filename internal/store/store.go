@@ -24,6 +24,12 @@ import (
 //go:embed schema.sql
 var schemaSQL string
 
+// DefaultLimit is the page size ListEvents, ListWarnings, and ListSessions
+// apply when the caller passes Limit <= 0 -- never unbounded. The API layer
+// echoes this same value in the X-Limit pagination header when ?limit is
+// absent, so the header always agrees with the rows actually returned.
+const DefaultLimit = 100
+
 // RedactCheck is the store's copy of the startup self-test: it scans a
 // captured call's stored header JSON for a reachable secret that redaction
 // should already have removed. internal/proxy owns the check (it also runs
@@ -213,7 +219,7 @@ func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]*Event, e
 	where, args := filter.whereClause()
 	limit := filter.Limit
 	if limit <= 0 {
-		limit = 100
+		limit = DefaultLimit
 	}
 	query := eventSelectColumns + " FROM events" + where + " ORDER BY started_at DESC LIMIT ? OFFSET ?"
 	args = append(args, limit, filter.Offset)
@@ -324,12 +330,48 @@ func upsertWarningsTx(ctx context.Context, tx *sql.Tx, eventID int64, warnings [
 	return nil
 }
 
-// ListWarnings returns warnings for eventID.
-func (s *Store) ListWarnings(ctx context.Context, eventID int64) ([]Warning, error) {
+// EventWarnings returns warnings for eventID.
+func (s *Store) EventWarnings(ctx context.Context, eventID int64) ([]Warning, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, event_id, kind, severity, detail, path, created_at
 		FROM warnings WHERE event_id = ? ORDER BY id
 	`, eventID)
+	if err != nil {
+		return nil, fmt.Errorf("store: EventWarnings: %w", err)
+	}
+	defer rows.Close()
+
+	var out []Warning
+	for rows.Next() {
+		var w Warning
+		var createdAt int64
+		if err := rows.Scan(&w.ID, &w.EventID, &w.Kind, &w.Severity, &w.Detail, &w.Path, &createdAt); err != nil {
+			return nil, fmt.Errorf("store: EventWarnings: %w", err)
+		}
+		w.CreatedAt = timeFromNano(createdAt)
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// ListWarnings returns warnings matching filter (Kind, if set), newest
+// first, paginated by filter.Limit/Offset -- the GET /api/warnings global
+// list, distinct from EventWarnings' per-event lookup above.
+func (s *Store) ListWarnings(ctx context.Context, filter WarningFilter) ([]Warning, error) {
+	query := "SELECT id, event_id, kind, severity, detail, path, created_at FROM warnings"
+	var args []any
+	if filter.Kind != "" {
+		query += " WHERE kind = ?"
+		args = append(args, filter.Kind)
+	}
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = DefaultLimit
+	}
+	query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+	args = append(args, limit, filter.Offset)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: ListWarnings: %w", err)
 	}
@@ -519,7 +561,7 @@ func (s *Store) GetSession(ctx context.Context, id string) (*Session, error) {
 // ListSessions returns sessions newest-first.
 func (s *Store) ListSessions(ctx context.Context, limit, offset int) ([]*Session, error) {
 	if limit <= 0 {
-		limit = 100
+		limit = DefaultLimit
 	}
 	rows, err := s.db.QueryContext(ctx, sessionSelectColumns+" FROM sessions ORDER BY last_seen DESC LIMIT ? OFFSET ?", limit, offset)
 	if err != nil {
@@ -536,6 +578,16 @@ func (s *Store) ListSessions(ctx context.Context, limit, offset int) ([]*Session
 		out = append(out, sess)
 	}
 	return out, rows.Err()
+}
+
+// CountSessions returns the total number of sessions, ignoring pagination --
+// sessions have no filterable column, so the total is simply the whole table.
+func (s *Store) CountSessions(ctx context.Context) (int, error) {
+	var n int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sessions").Scan(&n); err != nil {
+		return 0, fmt.Errorf("store: CountSessions: %w", err)
+	}
+	return n, nil
 }
 
 // LatestSessionByPrefix returns the most recently seen session whose

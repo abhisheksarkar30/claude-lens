@@ -354,7 +354,7 @@ func TestWarningUpsertIdempotent(t *testing.T) {
 		t.Fatalf("UpsertWarnings 2: %v", err)
 	}
 
-	warnings, err := st.ListWarnings(ctx, id)
+	warnings, err := st.EventWarnings(ctx, id)
 	if err != nil {
 		t.Fatalf("ListWarnings: %v", err)
 	}
