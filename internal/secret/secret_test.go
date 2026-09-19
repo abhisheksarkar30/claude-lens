@@ -42,6 +42,14 @@ func (f *fakeACL) run(args ...string) (string, error) {
 		b.WriteString("\nSuccessfully processed 1 files; Failed processing 0 files\n")
 		return b.String(), nil
 	}
+	if len(args) == 2 && args[1] == "/reset" {
+		// The fake never simulates the real OS's explicit-ACE-on-a-new-file
+		// quirk /reset exists to work around, so it is always a no-op here.
+		if f.failGrant {
+			return "", errors.New("fake icacls: reset failure")
+		}
+		return "Successfully processed 1 files; Failed processing 0 files\n", nil
+	}
 	if f.failGrant {
 		return "", errors.New("fake icacls: grant failure")
 	}
@@ -202,11 +210,28 @@ func TestWindowsDACLReadBackListsExactlyIntendedPrincipal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read-back: %v", err)
 	}
-	principals, err := parseICACLSPrincipals(out)
+	principals, err := parseICACLSPrincipals(path, out)
 	if err != nil {
 		t.Fatalf("parseICACLSPrincipals: %v", err)
 	}
 	if len(principals) != 1 || !strings.EqualFold(principals[0], "TESTDOMAIN\\tester") {
+		t.Fatalf("principals = %v, want exactly [TESTDOMAIN\\tester]", principals)
+	}
+}
+
+// Real icacls output puts the target path and its first ACE on one shared
+// line ("<path> PRINCIPAL:(PERMS)"), not on separate lines the way
+// fakeACL's simulated output (and this function's own earlier assumption)
+// does -- this regressed a real-machine `clens accounts --set-admin-key`
+// run without ever failing the fake-backed test suite.
+func TestParseICACLSPrincipalsHandlesPathAndFirstACEOnSameLine(t *testing.T) {
+	path := `C:\Users\tester\.clens\secrets.toml`
+	out := path + ` TESTDOMAIN\tester:(F)` + "\n\nSuccessfully processed 1 files; Failed processing 0 files\n"
+	principals, err := parseICACLSPrincipals(path, out)
+	if err != nil {
+		t.Fatalf("parseICACLSPrincipals: %v", err)
+	}
+	if len(principals) != 1 || !strings.EqualFold(principals[0], `TESTDOMAIN\tester`) {
 		t.Fatalf("principals = %v, want exactly [TESTDOMAIN\\tester]", principals)
 	}
 }

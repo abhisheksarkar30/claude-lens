@@ -265,15 +265,27 @@ func applyProtection(path string) error {
 }
 
 // applyWindowsACL grants the current user Full Control over path and
-// removes inherited ACEs, then reads the DACL back and asserts it now
-// contains exactly the intended principal. /inheritance:r is load-bearing,
-// not redundant: a newly created file inherits its parent directory's ACEs,
-// so without it the profile's SYSTEM/Administrators/user entries would
-// remain even after /grant:r ran.
+// removes every other ACE, then reads the DACL back and asserts it now
+// contains exactly the intended principal.
+//
+// /reset runs first and is load-bearing, not redundant: a file Go's
+// os.WriteFile/os.CreateTemp just created on Windows gets explicit (not
+// inherited) ACEs for SYSTEM, Administrators, and the current user --
+// verified against a real icacls read-back, which shows no "(I)" flag on
+// any of them. /inheritance:r only strips *inherited* ACEs, so without
+// /reset first (which discards the file's explicit ACEs and replaces them
+// with whatever its parent directory would grant by inheritance) those
+// three survive untouched, and /grant:r only replaces the named
+// principal's own rights -- it does not remove any other principal's
+// explicit grant. /reset -> /inheritance:r -> /grant:r is the sequence
+// that actually converges on exactly one principal.
 func applyWindowsACL(path string) (string, error) {
 	principal, err := currentPrincipal()
 	if err != nil {
 		return "", err
+	}
+	if _, err := runICACLS(path, "/reset"); err != nil {
+		return "", fmt.Errorf("secret: icacls reset failed for %s: %w", path, err)
 	}
 	if _, err := runICACLS(path, "/inheritance:r", "/grant:r", principal+":F"); err != nil {
 		return "", fmt.Errorf("secret: icacls grant failed for %s: %w", path, err)
@@ -282,7 +294,7 @@ func applyWindowsACL(path string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("secret: icacls read-back failed for %s: %w", path, err)
 	}
-	principals, err := parseICACLSPrincipals(out)
+	principals, err := parseICACLSPrincipals(path, out)
 	if err != nil {
 		return "", fmt.Errorf("secret: icacls read-back for %s: %w", path, err)
 	}
@@ -297,7 +309,7 @@ func windowsProtectionLevel(path string) (string, bool) {
 	if err != nil {
 		return fmt.Sprintf("icacls read-back failed: %v", err), false
 	}
-	principals, err := parseICACLSPrincipals(out)
+	principals, err := parseICACLSPrincipals(path, out)
 	if err != nil {
 		return fmt.Sprintf("icacls read-back unparsable: %v", err), false
 	}
@@ -308,15 +320,25 @@ func windowsProtectionLevel(path string) (string, bool) {
 }
 
 // parseICACLSPrincipals extracts the distinct principal names granted an
-// ACE in icacls's listing output for a single file. icacls prints the file
-// path on the first line, then one "  PRINCIPAL:(PERMS)" line per ACE
-// (continuation lines for a second permission on the same principal are
-// indented further and carry no ':'), and a trailing blank line plus a
-// "Successfully processed..." summary this function ignores.
-func parseICACLSPrincipals(out string) ([]string, error) {
+// ACE in icacls's listing output for a single file. icacls's real output
+// puts the target path and the *first* ACE on one shared line --
+// "<path> PRINCIPAL:(PERMS)" -- with every subsequent ACE on its own
+// indented "  PRINCIPAL:(PERMS)" line (a continuation line for a second
+// permission on the same principal carries no ':' and is skipped), then a
+// trailing blank line plus a "Successfully processed..." summary this
+// function ignores. path is stripped as a literal prefix of the first line
+// before parsing, so a path containing no ACE marker of its own is never
+// mistaken for a principal.
+func parseICACLSPrincipals(path, out string) ([]string, error) {
+	lines := strings.Split(out, "\n")
+	if len(lines) > 0 {
+		if rest, ok := strings.CutPrefix(lines[0], path); ok {
+			lines[0] = rest
+		}
+	}
 	var principals []string
 	seen := map[string]bool{}
-	for _, line := range strings.Split(out, "\n") {
+	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "Successfully processed") {
 			continue
