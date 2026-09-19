@@ -97,7 +97,13 @@ static guard can observe (T1 asserts the wiring; it cannot click).
   the detail replaces the list, for both Calls and Sessions, and the State-management prose describes
   the two modes, the back control, and the tab-click route back.
 - **Neither does `README.md`** — its `:151` row said the same thing and is corrected in the same pass
-  (F1.1); `grep -rn "click a row"` across the repo returns nothing.
+  (F1.1). The check is scoped to the **shipped** docs, where the claim must be gone:
+  `grep -rn "click a row" README.md docs/context/` returns nothing. A repo-wide grep legitimately
+  returns hits — §2.5 of the plan and this bead both *quote* the old wording to record what was
+  corrected, which is the point of the record, so "returns nothing repo-wide" would be false and is
+  not the criterion. (Scoped after the round-2 impl cross-review, F2.1: the first version of this
+  clause said "across the repo", which the §2.5 quotation added by the F1.1 fix makes unsatisfiable —
+  a verification clause that its own fix guarantees to fail.)
 - `docs/context/INDEX.md:40`'s `app.js` line count matches `wc -l` (F1.2).
 - The Assets-are-tested table lists the new `TestAssetsTheCallDetailReplacesTheList` guard.
 - The §5 T5 runbook has been executed once against a real `clens serve` with a populated store, and
