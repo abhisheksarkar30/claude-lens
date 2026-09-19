@@ -322,6 +322,25 @@ step**, not a fact:
   `(model, session_id, started_at ±1s, input/cache-write/cache-read/output token quadruple)`, with
   `request-id` used *when present and matching* to strengthen it.
 
+#### Verification result (br-GI-1-19)
+
+**Status: still open — not captured.** br-GI-1-19's acceptance run is where this was to be
+discharged (`docs/acceptance.md` §"test 11(b)"), and it could not be: a live capture needs a real
+Anthropic credential, and the run had none. The operator's own
+`~/.claude/.credentials.json` is not this tool's to spend.
+
+So the assumption stands exactly as it stood before: **the `request-id` header has no captured
+counterpart**, the fallback key remains the operative identity, and `request-id` continues to be
+used only *when present and matching*. `br-GI-1-11`'s switch has **not** flipped, because nothing
+observed says it should.
+
+The one thing the run did establish is that the fallback path works: a proxied call that returned
+**401** — no `request-id` header at all — was still keyed, stored, and readable, with the composite
+key `proxy:<sha256(body)>:<started_at_ns>:<attempt>` (`docs/acceptance.md` §3).
+
+To close this, an operator with a credential runs the two commands in `docs/acceptance.md`
+§"test 11(b)" against one live call and records the two values here.
+
 `events.request_id` is `NOT NULL UNIQUE`, synthesized deterministically when a source has no usable
 id, so the key is always present:
 
