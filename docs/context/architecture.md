@@ -84,7 +84,7 @@ Two rules a change must not break:
   so what this repo protects is the content: every prompt and every file the
   agent read.
 - **`internal/api` and `internal/web` never import `internal/secret`** (guard:
-  `internal/api/importguard_test.go`), nor `config`/`ingest` (guard:
+  `internal/api/importguard_test.go`), nor `config`/`ingest` (same guard, plus
   `internal/cli/serve_test.go`). A write route reaches its write through an
   injected function-value seam instead, wired in the composition root.
 

@@ -21,6 +21,13 @@ import (
 // test has no business opening the credential store either. config's and
 // ingest's do not -- internal/api/replay_test.go takes config.Account values
 // to build a fixture, which is a data dependency, not a write path.
+//
+// The config/ingest half overlaps TestWriteSeamsDoNotImportConfigOrIngest in
+// internal/cli/serve_test.go, which asserts the same two edges for the same
+// two packages. The duplication is deliberate and cheap: bead 17's acceptance
+// criteria name the cli-side guard, and the containment claim in the api/web
+// package docs is what this one answers. A future third package would have to
+// be added to both.
 var forbiddenImports = []struct {
 	path      string
 	testFiles bool
