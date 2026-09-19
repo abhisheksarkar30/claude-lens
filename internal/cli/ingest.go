@@ -29,6 +29,12 @@ func runIngest(args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// config.Load does not call Validate itself, so this path -- the one
+	// `clens ingest --rebuild` takes -- is validated only here, and before the
+	// store is opened so a bad config cannot half-run against a real database.
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		return fmt.Errorf("ingest: open store: %w", err)
@@ -45,7 +51,7 @@ func runIngest(args []string, w io.Writer) error {
 	}
 
 	tailer := jsonlogs.New(root, st)
-	tailer.SetPriceTable(pricing.NewLoader(pricing.DefaultPath(), nil))
+	tailer.SetPriceTable(newPriceLoader(cfg))
 	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
 		tailer.SetAccount(acct.Name, acct.BillingMode)
 	}
@@ -63,6 +69,23 @@ func runIngest(args []string, w io.Writer) error {
 // ~/.claude/projects convention internal/jsonlogs's package doc names.
 func jsonlRoot() string {
 	return filepath.Join(claudeConfigDir(), "projects")
+}
+
+// resolvedAPIPrefixes resolves the pay-as-you-go model prefixes: nil means
+// "unset -> use the shipped default". A site that missed this resolution would
+// fail silently -- the resolved list is only ever fed to strings.HasPrefix,
+// which never matches over a nil slice, giving zero routing with no error.
+func resolvedAPIPrefixes(cfg *config.Config) []string {
+	if cfg.ApiModelPrefixes == nil {
+		return pricing.ShippedAPIModelPrefixes()
+	}
+	return cfg.ApiModelPrefixes
+}
+
+// newPriceLoader is the one loader shape every pricer in this process wants,
+// so two pricers cannot disagree about the configured off-peak dates.
+func newPriceLoader(cfg *config.Config) *pricing.Loader {
+	return pricing.NewLoader(pricing.DefaultPath(), cfg.PeakOffPeakDates)
 }
 
 // firstAccount returns the first configured account with the given

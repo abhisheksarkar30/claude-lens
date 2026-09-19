@@ -17,6 +17,14 @@ func ShippedAPIModelPrefixes() []string {
 	return slices.Clone(shippedAPIModelPrefixes)
 }
 
+// ShippedOffPeakDates returns the shipped peak-exclusion dates -- the default
+// a nil config key resolves to. A copy, same rule as ShippedAPIModelPrefixes:
+// a caller that wanted to render or count the default must not be able to
+// mutate it.
+func ShippedOffPeakDates() []string {
+	return slices.Clone(deepseekOffPeakDates)
+}
+
 // deepseekOffPeakDates is the 2026 Chinese public holiday calendar: the dates
 // excluded from DeepSeek's peak window. DeepSeek bills peak at exactly 2x
 // off-peak, so a missing holiday leaves a day charged at peak.

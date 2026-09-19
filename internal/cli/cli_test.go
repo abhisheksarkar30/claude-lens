@@ -5,11 +5,14 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/secret"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
@@ -521,4 +524,65 @@ func indexOf(list []string, want string) int {
 		}
 	}
 	panic("indexOf: " + want + " not in list")
+}
+
+// --- Peak / prefix config plumbing (br-GI-3-05) ---
+
+// T10 (resolver half), beside the helper it names. nil means "unset -> use the
+// shipped default", and a site that missed that resolution would fail
+// silently: the resolved list is only ever fed to strings.HasPrefix, which
+// never matches over a nil slice, giving zero routing with no error.
+func TestResolvedAPIPrefixes(t *testing.T) {
+	withHome(t)
+
+	cfg := config.Default()
+	if got := resolvedAPIPrefixes(cfg); len(got) != 1 || got[0] != "deepseek-" {
+		t.Errorf("unset ApiModelPrefixes resolved to %#v, want the shipped [deepseek-]", got)
+	}
+
+	cfg.ApiModelPrefixes = []string{"acme-"}
+	if got := resolvedAPIPrefixes(cfg); len(got) != 1 || got[0] != "acme-" {
+		t.Errorf("a non-nil list resolved to %#v, want [acme-] (it replaces the shipped list wholesale)", got)
+	}
+
+	cfg.ApiModelPrefixes = []string{}
+	if got := resolvedAPIPrefixes(cfg); got == nil || len(got) != 0 {
+		t.Errorf("`none` resolved to %#v, want a non-nil empty slice (no routing at all)", got)
+	}
+}
+
+// The malformed-date case through the exported entry points, since
+// runIngest/runRefresh are unexported. The DBPath points into a directory that
+// does not exist yet, and store.Open creates a missing parent -- so the
+// directory still being absent afterwards is direct evidence that Validate ran
+// before the store was opened, not merely that it ran.
+func TestIngestAndRefreshValidateBeforeOpeningTheStore(t *testing.T) {
+	dir := withHome(t)
+	dbDir := filepath.Join(dir, "db")
+	clensDir := filepath.Join(dir, ".clens")
+	if err := os.MkdirAll(clensDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	cfgFile := filepath.Join(clensDir, "config.toml")
+	body := "PeakOffPeakDates = not-a-date\nDBPath = " + filepath.Join(dbDir, "lens.db") + "\n"
+	if err := os.WriteFile(cfgFile, []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	for name, run := range map[string]func([]string) error{
+		"ingest":  Ingest,
+		"refresh": Refresh,
+	} {
+		err := run(nil)
+		if err == nil {
+			t.Errorf("%s: nil error, want the malformed date rejected", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), "PeakOffPeakDates") {
+			t.Errorf("%s: error %q does not name the offending field", name, err)
+		}
+		if _, serr := os.Stat(dbDir); serr == nil {
+			t.Errorf("%s: the store directory was created; Validate must run before the store is opened", name)
+		}
+	}
 }

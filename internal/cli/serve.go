@@ -15,7 +15,6 @@ import (
 	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/consumer"
 	"github.com/abhisheksarkar30/claude-lens/internal/ingest"
-	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/proxy"
 	"github.com/abhisheksarkar30/claude-lens/internal/secret"
 	"github.com/abhisheksarkar30/claude-lens/internal/session"
@@ -98,7 +97,7 @@ func Serve(args []string) error {
 	cons.SetSessionRule(engine)
 	// A Loader, not the shipped table: it re-reads prices.toml when the file
 	// changes, so `clens prices --set` takes effect without a restart.
-	priceLoader := pricing.NewLoader(pricing.DefaultPath(), nil)
+	priceLoader := newPriceLoader(cfg)
 	cons.SetPriceTable(priceLoader)
 	// The decode limit is the same BodyCapBytes the proxy tees with -- without
 	// a second cap on the decoded form, a small compressed body would expand

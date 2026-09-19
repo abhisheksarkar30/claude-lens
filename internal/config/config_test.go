@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -136,5 +137,106 @@ func TestNoAccountsFileIsNotAnError(t *testing.T) {
 	}
 	if len(cfg.Accounts) != 0 {
 		t.Errorf("Accounts = %+v, want empty", cfg.Accounts)
+	}
+}
+
+// --- Peak / prefix keys (br-GI-3-05) ---
+
+// T10: both keys parse from file and from env. An env value replaces the
+// file's wholesale -- the two are never merged, which is the same precedence
+// every other key follows.
+func TestPeakAndPrefixKeysParseFromFileAndEnv(t *testing.T) {
+	dir := withHome(t)
+	clensDir := filepath.Join(dir, ".clens")
+	if err := os.MkdirAll(clensDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	cfgFile := filepath.Join(clensDir, "config.toml")
+	if err := os.WriteFile(cfgFile, []byte(
+		"PeakOffPeakDates = 2026-01-01,2026-01-02\nApiModelPrefixes = acme-,globex-\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.PeakOffPeakDates; len(got) != 2 || got[0] != "2026-01-01" || got[1] != "2026-01-02" {
+		t.Errorf("PeakOffPeakDates from file = %#v, want the two configured dates", got)
+	}
+	if got := cfg.ApiModelPrefixes; len(got) != 2 || got[0] != "acme-" || got[1] != "globex-" {
+		t.Errorf("ApiModelPrefixes from file = %#v, want the two configured prefixes", got)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate rejected a file-sourced config: %v", err)
+	}
+
+	t.Setenv("CLENS_PEAK_OFF_PEAK_DATES", "none")
+	t.Setenv("CLENS_API_MODEL_PREFIXES", "acme-")
+	cfg, err = Load(nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PeakOffPeakDates == nil || len(cfg.PeakOffPeakDates) != 0 {
+		t.Errorf("PeakOffPeakDates from `none` = %#v, want a non-nil empty slice", cfg.PeakOffPeakDates)
+	}
+	if got := cfg.ApiModelPrefixes; len(got) != 1 || got[0] != "acme-" {
+		t.Errorf("ApiModelPrefixes from env = %#v, want [acme-] (env replaces the file's list wholesale)", got)
+	}
+}
+
+// `none` is the only way a file can say "explicitly empty": applyKV skips a
+// blank value outright, so unset and empty must stay distinguishable.
+func TestPeakAndPrefixKeysUnsetAreNil(t *testing.T) {
+	withHome(t)
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.PeakOffPeakDates != nil {
+		t.Errorf("unset PeakOffPeakDates = %#v, want nil (a distinct state from `none`)", cfg.PeakOffPeakDates)
+	}
+	if cfg.ApiModelPrefixes != nil {
+		t.Errorf("unset ApiModelPrefixes = %#v, want nil", cfg.ApiModelPrefixes)
+	}
+}
+
+func TestValidateRejectsMalformedDatesAndPrefixes(t *testing.T) {
+	withHome(t)
+
+	// A typo'd date silently stays in peak, which over-charges, so it is
+	// rejected rather than absorbed.
+	c := Default()
+	c.PeakOffPeakDates = []string{"2026-01-01", "01/02/2026"}
+	err := c.Validate()
+	if err == nil {
+		t.Error("Validate accepted a malformed date")
+	} else if !strings.Contains(err.Error(), "PeakOffPeakDates") {
+		t.Errorf("error %q does not name the field", err)
+	}
+
+	c = Default()
+	c.ApiModelPrefixes = []string{"acme-", "   "}
+	err = c.Validate()
+	if err == nil {
+		t.Error("Validate accepted a whitespace-only prefix")
+	} else if !strings.Contains(err.Error(), "ApiModelPrefixes") {
+		t.Errorf("error %q does not name the field", err)
+	}
+
+	c = Default()
+	c.PeakOffPeakDates = []string{"2026-01-01"}
+	c.ApiModelPrefixes = []string{"acme-"}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate rejected a valid config: %v", err)
+	}
+
+	// The `none` shape is valid: excluding no dates and routing nothing is a
+	// choice, not a malformed config.
+	c = Default()
+	c.PeakOffPeakDates = []string{}
+	c.ApiModelPrefixes = []string{}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate rejected the `none` shape: %v", err)
 	}
 }
