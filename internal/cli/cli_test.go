@@ -586,3 +586,31 @@ func TestIngestAndRefreshValidateBeforeOpeningTheStore(t *testing.T) {
 		}
 	}
 }
+
+// T18: the `acct.Name != ""` guard in newTailer, read back through the
+// Tailer's Account() accessor. Deleting the guard makes the first case read
+// ("", ""), so the regression fails a test rather than depending on a reviewer
+// noticing it in a diff.
+func TestNewTailerGuardKeepsTheSeededBillingMode(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+
+	// No subscription account configured: the guard skips SetAccount entirely,
+	// so the mode New seeded survives.
+	cfg := config.Default()
+	if name, mode := newTailer(cfg, t.TempDir(), st).Account(); name != "" || mode != "subscription" {
+		t.Errorf("Account() = (%q, %q), want (\"\", subscription) when no subscription account is configured", name, mode)
+	}
+
+	// An api-mode account is not a subscription account, and must not be
+	// adopted as one -- that would mis-attribute every JSONL row.
+	cfg.Accounts = []config.Account{{Name: "payg", BillingMode: "api"}}
+	if name, mode := newTailer(cfg, t.TempDir(), st).Account(); name != "" || mode != "subscription" {
+		t.Errorf("an api-only account was adopted: Account() = (%q, %q), want (\"\", subscription)", name, mode)
+	}
+
+	cfg.Accounts = []config.Account{{Name: "work", BillingMode: "subscription", Plan: "max5x"}}
+	if name, mode := newTailer(cfg, t.TempDir(), st).Account(); name != "work" || mode != "subscription" {
+		t.Errorf("Account() = (%q, %q), want (work, subscription)", name, mode)
+	}
+}

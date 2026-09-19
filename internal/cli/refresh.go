@@ -92,11 +92,7 @@ type collectorStore interface {
 // the dashboard's on-demand trigger) so the two can never drift into
 // different sets of sources.
 func addCollectors(ctx context.Context, r *ingest.Runner, cfg *config.Config, st collectorStore) {
-	tailer := jsonlogs.New(jsonlRoot(), st)
-	tailer.SetPriceTable(newPriceLoader(cfg))
-	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
-		tailer.SetAccount(acct.Name, acct.BillingMode)
-	}
+	tailer := newTailer(cfg, jsonlRoot(), st)
 	r.Add(ingest.SourceJSONL, "root", "jsonl:"+jsonlRoot(), ingest.CollectorFunc(func(ctx context.Context) (int, error) {
 		stats, err := tailer.Poll(ctx)
 		return stats.Inserted, err

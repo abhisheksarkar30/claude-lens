@@ -341,3 +341,39 @@ func appendLine(t *testing.T, path, content string) {
 		t.Fatalf("append %s: %v", path, err)
 	}
 }
+
+// --- Tailer account contract (br-GI-3-06) ---
+
+// New seeds billing_mode "subscription" with no account name: Claude Code's
+// own transcripts are written by the subscription client in the common case.
+func TestNewSeedsSubscriptionBillingMode(t *testing.T) {
+	st := newTestStore(t)
+	name, mode := New(t.TempDir(), st).Account()
+	if name != "" {
+		t.Errorf("account name = %q, want empty (a JSONL line carries no account)", name)
+	}
+	if mode != "subscription" {
+		t.Errorf("billing mode = %q, want subscription (the seed)", mode)
+	}
+}
+
+// SetAccount assigns unconditionally, including a zero Account -- which blanks
+// the mode New seeded. This is the sharp edge the `acct.Name != ""` guard in
+// cli.newTailer exists for, and the reason that guard is load-bearing rather
+// than decorative: without it, an install with no subscription account would
+// blank the mode and mis-bill every row into cost_usd.
+func TestSetAccountAssignsUnconditionally(t *testing.T) {
+	st := newTestStore(t)
+	tailer := New(t.TempDir(), st)
+
+	tailer.SetAccount("", "")
+	if _, mode := tailer.Account(); mode != "" {
+		t.Errorf("billing mode = %q, want \"\" -- SetAccount must not treat a zero Account as a no-op", mode)
+	}
+
+	tailer.SetAccount("work", "api")
+	name, mode := tailer.Account()
+	if name != "work" || mode != "api" {
+		t.Errorf("Account() = (%q, %q), want (work, api)", name, mode)
+	}
+}

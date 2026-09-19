@@ -50,11 +50,7 @@ func runIngest(args []string, w io.Writer) error {
 		}
 	}
 
-	tailer := jsonlogs.New(root, st)
-	tailer.SetPriceTable(newPriceLoader(cfg))
-	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
-		tailer.SetAccount(acct.Name, acct.BillingMode)
-	}
+	tailer := newTailer(cfg, root, st)
 
 	stats, err := tailer.Poll(ctx)
 	if err != nil {
@@ -69,6 +65,27 @@ func runIngest(args []string, w io.Writer) error {
 // ~/.claude/projects convention internal/jsonlogs's package doc names.
 func jsonlRoot() string {
 	return filepath.Join(claudeConfigDir(), "projects")
+}
+
+// newTailer is the one tailer shape both callers want -- `clens ingest` and
+// addCollectors, which serves `clens serve` and `clens refresh`. One place, so
+// the two cannot drift into different price tables or accounts.
+//
+// root is an explicit parameter: runIngest's local root and addCollectors'
+// jsonlRoot() are distinct expressions, and only one of them is the settled
+// default, so a helper that resolved the root itself would silently drop the
+// other's.
+func newTailer(cfg *config.Config, root string, st collectorStore) *jsonlogs.Tailer {
+	t := jsonlogs.New(root, st)
+	t.SetPriceTable(newPriceLoader(cfg))
+	// The guard is load-bearing, not decorative: SetAccount assigns
+	// unconditionally and New seeds "subscription", so a zero Account on an
+	// install with no subscription account would blank the mode and mis-bill
+	// every row into cost_usd.
+	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
+		t.SetAccount(acct.Name, acct.BillingMode)
+	}
+	return t
 }
 
 // resolvedAPIPrefixes resolves the pay-as-you-go model prefixes: nil means

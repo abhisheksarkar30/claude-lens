@@ -98,10 +98,17 @@ func (t *Tailer) SetSessionRule(r SessionRule)         { t.sessionRule = r }
 func (t *Tailer) SetPriceTable(p PriceComputer)        { t.pricer = p }
 
 // SetAccount fixes the account/billing_mode every row from this tailer
-// gets.
+// gets. It assigns unconditionally, so a caller that passes a zero Account
+// blanks the billing mode New seeded.
 func (t *Tailer) SetAccount(name, billingMode string) {
 	t.account = name
 	t.billingMode = billingMode
+}
+
+// Account reports the account and billing mode every row from this tailer
+// gets, unless a model prefix routes it otherwise.
+func (t *Tailer) Account() (name, billingMode string) {
+	return t.account, t.billingMode
 }
 
 // Stats reports one Poll's work, for logging and tests.
