@@ -96,6 +96,9 @@ static guard can observe (T1 asserts the wiring; it cannot click).
 - `docs/context/dashboard.md` no longer says "click a row"; it says the **id** cell is the link and
   the detail replaces the list, for both Calls and Sessions, and the State-management prose describes
   the two modes, the back control, and the tab-click route back.
+- **Neither does `README.md`** — its `:151` row said the same thing and is corrected in the same pass
+  (F1.1); `grep -rn "click a row"` across the repo returns nothing.
+- `docs/context/INDEX.md:40`'s `app.js` line count matches `wc -l` (F1.2).
 - The Assets-are-tested table lists the new `TestAssetsTheCallDetailReplacesTheList` guard.
 - The §5 T5 runbook has been executed once against a real `clens serve` with a populated store, and
   its per-step results (including whether step 10 landed inside its timing window, and whether step
@@ -114,5 +117,14 @@ static guard can observe (T1 asserts the wiring; it cannot click).
 
 - `docs/context/dashboard.md` (modify — correct `:35`/`:36`, refresh the State-management section,
   add the guard row to the Assets-are-tested table)
+- `README.md` (modify — the **same** "click a row" row at `:151`, verbatim). Added after the impl
+  cross-review (F1.1): §2.5 counted the stale claim once when it exists twice, and `README.md` is at
+  the repo root, **outside** the generated `docs/context/` tree, so no Phase 5.6 refresh will ever
+  repair it. Correcting one copy while shipping the other leaves the claim false where a new
+  contributor reads first.
+- `docs/context/INDEX.md` (modify — `:40`'s "741 lines of hand-written JS", stale at **838** the
+  moment br-GI-5-01's fix lands; F1.2). This file is inside the generated tree, so Phase 5.6 owns it
+  — the count is corrected here so the tree is not knowingly wrong in the interim, not because this
+  bead claims the file.
 - `docs/planning/GI-5-call-detail-drilldown.md` (modify — append `## 10. Recorded manual run (T5)`
   with the per-step observed results; the plan's §4 table and §5 T5 name this as the run's home)

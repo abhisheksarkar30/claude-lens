@@ -108,6 +108,19 @@ filters; **click a row** for the full request and response"*. Only the **id cell
 row handler exists, so "click a row" was never true. The code wins; §4 corrects the doc as part of
 this story rather than at some future audit (Phase 5.6).
 
+**The sentence has a second home, found in the impl cross-review (F1.1).** `README.md:151` carries
+the identical row, byte-for-byte:
+
+```
+| Calls | the call log with filters; click a row for the full request and response |
+```
+
+`README.md` is at the repo root — **outside** the generated `docs/context/` tree — so no Phase 5.6
+refresh will ever repair it, and correcting one copy while shipping the other leaves the story's own
+claim false in the place a new contributor reads first. It is corrected in the same pass, and §4's
+inventory gains both files. Recorded here because this section is the story's evidence base: a stale
+claim counted once when it exists twice is how the second copy survives.
+
 ---
 
 ## 3. Design
@@ -509,6 +522,23 @@ two instances. A stale *failure* is the sharper case: an unguarded `[data-call]`
 resets both modes (wiping a newer rendered detail), and switches the view the user has already left.
 The `seq === detailSeq` check on the `catch` leaves only a live failure to fall back.
 
+**One effect is deliberately left unguarded, found by the impl cross-review (F1.3) — an accepted
+ceiling, recorded rather than claimed away.** In the `[data-call]` catch, `setStatus(err.message,
+true)` runs *after* `await show('calls')` and is not re-guarded. A drill-down begun during that
+`await` can therefore have the status line overwritten by the abandoned failure's message. It cannot
+be closed with the same token: `show('calls')` reaches `reveal`, which bumps `detailSeq` itself, so a
+generation re-check after the `await` would always fail and the fallback would never report its error
+at all — observably wrong, since T5 step 7 asserts exactly that status line. The order is
+load-bearing in the other direction too (D4): `setStatus` has to come *after* `show`, because
+`reveal` calls `setStatus('')` and would clear it. Closing this needs a second token, or a generation
+threaded back out of `show` — real machinery for a cosmetic window that is ~5 ms wide (the measured
+`loadCalls` fetch, §10) and self-correcting in its own common case: the newer drill-down is hitting
+the same failing server and writes its own error, and a live failure writes the same
+`Failed to fetch` text either way. So the rule above is precise as **everything a stale fetch
+produces that would be *rendered* is dropped**; the status line is the one channel where an
+abandoned failure's message can briefly land, and it is named here rather than left to be
+rediscovered.
+
 **This does not contradict D2.** D2 derives the *mode* from the DOM rather than keeping a parallel
 boolean, because the mode — which of two containers is on screen — is already in the `hidden` flags,
 and a boolean could only drift from them. `detailSeq` is not that: it does not say which container is
@@ -533,6 +563,8 @@ only its result discarded.
 | `internal/web/style.css` | `scroll-margin-top` on the two detail containers. |
 | `internal/web/assets_test.go` | The wiring guard (§5, T1–T3). |
 | `docs/context/dashboard.md` | Correct "click a row" and document the two modes per view (Phase 5.6). |
+| `README.md` | The same "click a row" row at `:151`, corrected in the same pass (F1.1 — §2.5). It is outside the generated tree, so nothing else repairs it. |
+| `docs/context/INDEX.md` | `:40`'s "741 lines" for `app.js`, stale at 838 the moment this story's fix lands. Phase 5.6 owns this file; the count is corrected here so the tree is not knowingly wrong in the interim (F1.2). |
 | `docs/planning/GI-5-call-detail-drilldown.md` | New §10: the recorded manual run (T5), appended during implementation. |
 
 Nothing else. No Go handler, no store, no schema, no config, no dependency, no build step.

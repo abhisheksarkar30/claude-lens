@@ -37,7 +37,7 @@ Three non-stdlib modules and no more: `modernc.org/sqlite` (pure Go, no cgo),
 | [testing-and-quality.md](testing-and-quality.md) | before writing a test, or wondering what CI gates on | conditional — trigger: 50 test files |
 | [infra-and-deploy.md](infra-and-deploy.md) | before touching a workflow, a hook, or branch policy | conditional — trigger: `.github/workflows/` |
 | [integrations-and-external-services.md](integrations-and-external-services.md) | before changing a collector or adding a dependency | conditional — trigger: four external endpoints, three Go modules |
-| [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 741 lines of hand-written JS under a hard no-build-step rule |
+| [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 838 lines of hand-written JS under a hard no-build-step rule |
 | [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — six genuine forks, each with a rejected alternative a change could reintroduce |
 
 ## Grounding rules for agents

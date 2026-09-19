@@ -148,7 +148,7 @@ updates and hand-rolled inline SVG charts.
 | Tab | Shows |
 |---|---|
 | Overview | totals, and the most recent calls |
-| Calls | the call log with filters; click a row for the full request and response |
+| Calls | the call log with filters; the **id** cell link replaces the list with that call's full request and response, under a `‹ all calls` control |
 | Sessions | one row per run, with both cost models labelled side by side |
 | Warnings | findings by kind, and one row per occurrence |
 | Stats | totals over a window, charted by day, week, or month |
