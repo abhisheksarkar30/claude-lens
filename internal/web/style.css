@@ -1,0 +1,186 @@
+/* Nothing here is fetched: an imported stylesheet or a webfont is a network
+   request from a tool whose premise is that the user's traffic stays local.
+   System font stack instead. (The words for those directives are avoided in
+   this comment on purpose -- internal/api's asset guard scans for them.) */
+
+:root {
+  --bg: #14161a;
+  --panel: #1c1f26;
+  --line: #2b303a;
+  --fg: #e6e8ec;
+  --muted: #8b93a1;
+  --accent: #7aa2f7;
+  /* A second series colour, for the one chart that draws two sources side by
+     side (Reconcile). Two series that had to share a colour would be one
+     series drawn twice. */
+  --accent-2: #9ece6a;
+  --warn: #d7a53f;
+  --error: #f7768e;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f8fa;
+    --panel: #ffffff;
+    --line: #dfe3ea;
+    --fg: #1b1f27;
+    --muted: #667085;
+    --accent: #2f5fd0;
+    --accent-2: #3f7d20;
+    --warn: #8a6100;
+    --error: #b4232f;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+h1 { font-size: 18px; margin: 0; }
+h2 { font-size: 15px; margin: 24px 0 8px; }
+h3 { font-size: 14px; margin: 16px 0 6px; color: var(--muted); }
+
+code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.app-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+  position: sticky;
+  top: 0;
+}
+
+.totals { display: flex; gap: 14px; color: var(--muted); }
+.totals strong { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+.tabs { display: flex; gap: 4px; margin-left: auto; flex-wrap: wrap; }
+
+.tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  font: inherit;
+  padding: 5px 10px;
+}
+.tab:hover { color: var(--fg); border-color: var(--line); }
+.tab.active { color: var(--fg); background: var(--bg); border-color: var(--line); }
+
+main { padding: 20px; }
+
+.muted { color: var(--muted); }
+.error { color: var(--error); }
+
+.view[hidden] { display: none; }
+
+.cards { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 140px;
+  padding: 10px 14px;
+}
+.card-label { color: var(--muted); font-size: 12px; }
+.card-value { font-size: 20px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 10px 0; }
+.row label { color: var(--muted); font-size: 12px; }
+.row.pager { justify-content: center; }
+
+input, select, button {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--fg);
+  font: inherit;
+  padding: 4px 8px;
+}
+input[type="number"] { width: 110px; }
+button { cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--accent); }
+button:disabled { color: var(--muted); cursor: default; opacity: 0.5; }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  background: var(--panel);
+  font-variant-numeric: tabular-nums;
+}
+th, td {
+  border-bottom: 1px solid var(--line);
+  padding: 6px 10px;
+  text-align: left;
+  white-space: nowrap;
+}
+thead th { color: var(--muted); font-size: 12px; font-weight: 600; }
+tbody tr:hover { background: var(--bg); }
+td:nth-child(n + 4) { text-align: right; }
+
+table.kv { background: transparent; }
+table.kv th { color: var(--muted); font-weight: 500; width: 180px; }
+table.kv td { text-align: left; white-space: normal; }
+
+.sev-warning { color: #d7a53f; }
+.sev-error { color: var(--error); }
+.sev-info { color: var(--muted); }
+
+svg.chart {
+  display: block;
+  width: 100%;
+  height: 120px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+svg.chart rect { fill: var(--accent); }
+svg.chart rect:hover { opacity: 0.7; }
+
+/* A viewBox already carries the aspect ratio, so a chart whose intrinsic
+   height is not 120 lets the box follow it rather than letterboxing. */
+svg.chart.auto { height: auto; }
+svg.chart rect.bar-warn { fill: var(--warn); }
+svg.chart rect.sw-computed { fill: var(--accent-2); }
+svg.chart .limit-line { stroke: var(--muted); stroke-dasharray: 4 3; stroke-width: 1; }
+svg.chart .chart-label { fill: var(--muted); font-size: 10px; text-anchor: middle; }
+
+.legend { display: flex; gap: 16px; color: var(--muted); font-size: 12px; margin: 4px 0; }
+.legend span { display: flex; align-items: center; gap: 5px; }
+.legend svg.sw { width: 10px; height: 10px; }
+.legend svg.sw rect { fill: var(--accent); }
+.legend svg.sw rect.sw-computed { fill: var(--accent-2); }
+
+/* A labelled state, never a blank cell: "we have no rate for this" and "this
+   rate carries a caveat" are claims the cells have to make out loud. */
+.label-priced { color: var(--accent-2); }
+.label-unpriced { color: var(--error); }
+.label-provisional { color: var(--warn); }
+
+.status-ok { color: var(--accent-2); }
+.status-error { color: var(--error); }
+.status-unknown { color: var(--muted); }
+
+/* The Sources tab's whole point: a collector that failed is a red row. A
+   warning row (approaching a limit, traffic on an unpriced model) is amber --
+   worth noticing, not a failure. */
+.row-bad td { background: rgba(247, 118, 142, 0.12); }
+.row-warn td { background: rgba(215, 165, 63, 0.12); }
+
+/* Prose in a right-aligned tail column reads badly, so the two tables that end
+   in a reason/snapshot cell opt that cell back to the left. */
+#sources-table td:nth-child(7),
+#quota-body td:nth-child(7) { text-align: left; }

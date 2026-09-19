@@ -19,6 +19,11 @@ default.
 See `docs/planning/GI-1-claude-lens-v1.md` for the converged plan (v6, 7 review rounds). The work
 items are `.beads/GI-1/br-GI-1-01` … `-19`; each bead names its own file list and outcome definition.
 
+**Start from `docs/context/INDEX.md`** for the map to the code — architecture, storage schema, cost
+model, conventions, the CLI and API surfaces, and the decision records. This file states the
+*enforced* conventions and the invariants in their shortest form; the context docs are the map, and
+the code wins wherever they disagree.
+
 ## Setup
 
 One step per clone, with no build system to do it for you:
@@ -85,6 +90,7 @@ there is nothing for it to integrate.
 |---|---|
 | Plan | `docs/planning/GI-<n>-<slug>.md` |
 | Beads | `.beads/GI-<n>/br-GI-<n>-<NN>-<type>-<slug>.md` |
+| Context docs | `docs/context/INDEX.md` — the generated map to the code; read this first |
 | Cross-review artifacts | `docs/planning/GI-<n>-<slug>/review/round-N/` — **gitignored**, never committed |
 
 ## Architecture essentials
@@ -123,3 +129,11 @@ there is nothing for it to integrate.
   modes on Unix and an explicit Windows ACL on Windows (`0600` is a no-op there). Full bodies *are*
   stored, so the content — every prompt and every file the agent read — is the asset this repo is
   protecting. Loopback binding and redaction are load-bearing defaults, not conveniences.
+
+## Compact Instructions
+
+When compacting, always preserve the working state for continuation:
+
+- Keep the current high-level goal and acceptance criteria.
+- Keep the exact list of files modified during this session.
+- Do not preserve verbose terminal outputs or tool logs.

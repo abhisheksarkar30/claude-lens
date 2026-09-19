@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claude Lens</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="app-header">
+  <h1>Claude Lens</h1>
+  <div class="totals" id="totals" aria-label="totals">
+    <span><strong id="total-calls">0</strong> calls</span>
+    <span><strong id="total-tokens">0</strong> tokens</span>
+    <!-- Two labelled totals, never one sum: an api figure and a subscription
+         figure are different billing models (invariant 5). -->
+    <span>api <strong id="total-cost-api">$0.00</strong></span>
+    <span>sub <strong id="total-cost-sub">$0.00</strong></span>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button class="tab active" data-view="overview" type="button">Overview</button>
+    <button class="tab" data-view="calls" type="button">Calls</button>
+    <button class="tab" data-view="sessions" type="button">Sessions</button>
+    <button class="tab" data-view="warnings" type="button">Warnings</button>
+    <button class="tab" data-view="stats" type="button">Stats</button>
+    <button class="tab" data-view="sources" type="button">Sources</button>
+    <button class="tab" data-view="quota" type="button">Quota</button>
+    <button class="tab" data-view="reconcile" type="button">Reconcile</button>
+    <button class="tab" data-view="models" type="button">Models</button>
+    <button class="tab" data-view="settings" type="button">Settings</button>
+  </nav>
+</header>
+
+<main id="main">
+  <p class="muted" id="status">loading…</p>
+
+  <section class="view" id="view-overview" hidden>
+    <div class="cards" id="overview-cards"></div>
+    <h2>Recent calls</h2>
+    <div id="overview-calls"></div>
+  </section>
+
+  <section class="view" id="view-calls" hidden>
+    <div class="row">
+      <label>source <input id="f-source" placeholder="proxy | jsonl"></label>
+      <label>model <input id="f-model" placeholder="claude-sonnet-5"></label>
+      <label>billing <select id="f-billing">
+        <option value="">any</option>
+        <option value="api">api</option>
+        <option value="subscription">subscription</option>
+      </select></label>
+      <button type="button" id="f-apply">Filter</button>
+    </div>
+    <div id="calls-table"></div>
+    <div class="row pager">
+      <button type="button" id="calls-prev">‹ prev</button>
+      <span id="calls-range" class="muted"></span>
+      <button type="button" id="calls-next">next ›</button>
+    </div>
+    <div id="call-detail"></div>
+  </section>
+
+  <section class="view" id="view-sessions" hidden>
+    <div id="sessions-table"></div>
+    <div id="session-detail"></div>
+  </section>
+
+  <section class="view" id="view-warnings" hidden>
+    <div id="warnings-summary"></div>
+    <div id="warnings-table"></div>
+  </section>
+
+  <section class="view" id="view-stats" hidden>
+    <div class="row">
+      <label>since <input id="s-since" placeholder="24h or RFC3339"></label>
+      <label>until <input id="s-until" placeholder="RFC3339"></label>
+      <label>by <select id="s-granularity">
+        <option value="day">day</option>
+        <option value="week">week</option>
+        <option value="month">month</option>
+      </select></label>
+      <button type="button" id="s-apply">Apply</button>
+    </div>
+    <div id="stats-body"></div>
+  </section>
+
+  <section class="view" id="view-sources" hidden>
+    <div class="row">
+      <button type="button" id="src-collect">Collect now</button>
+      <span class="muted">Runs every collector once. A failed source stays listed, with its reason —
+      a dead collector must be visible here rather than a quietly short chart.</span>
+    </div>
+    <div id="sources-table"></div>
+  </section>
+
+  <section class="view" id="view-quota" hidden>
+    <p class="muted">A percentage appears only when a limit is configured. With no limit the row says
+    <code>unconfigured</code>: Claude Lens never guesses that a plan name means a number.</p>
+    <div class="row">
+      <label>5h limit <input id="q-5h" data-window="5h" type="number" min="1" placeholder="tokens"></label>
+      <label>7d limit <input id="q-7d" data-window="7d" type="number" min="1" placeholder="tokens"></label>
+      <button type="button" id="q-apply">Apply</button>
+    </div>
+    <div id="quota-body"></div>
+  </section>
+
+  <section class="view" id="view-reconcile" hidden>
+    <div class="cards" id="reconcile-cards"></div>
+    <p class="muted" id="reconcile-scope"></p>
+    <div id="reconcile-chart"></div>
+    <div id="reconcile-table"></div>
+  </section>
+
+  <section class="view" id="view-models" hidden>
+    <p class="muted">Every model the catalogue knows plus every model traffic used. A model with no
+    rate is <code>unpriced</code> — a labelled gap, never a $0.00.</p>
+    <div id="models-table"></div>
+  </section>
+
+  <section class="view" id="view-settings" hidden>
+    <h2>Health</h2>
+    <div id="health-cards" class="cards"></div>
+    <h2>Prices</h2>
+    <p class="muted">Rates are USD per token. An edited row is written to the override file and
+    prices the next call the consumer sees. An unset rate stays unset — leave a field blank rather
+    than typing 0, which would claim the model is free.</p>
+    <div id="prices-table"></div>
+  </section>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
