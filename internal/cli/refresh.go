@@ -11,7 +11,6 @@ import (
 	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/ingest"
 	"github.com/abhisheksarkar30/claude-lens/internal/jsonlogs"
-	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/secret"
 	"github.com/abhisheksarkar30/claude-lens/internal/snapshot"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
@@ -44,6 +43,11 @@ func Refresh(args []string) error {
 func runRefresh(args []string, w io.Writer) error {
 	cfg, err := config.Load(args)
 	if err != nil {
+		return err
+	}
+	// Validated here rather than in addCollectors: addCollectors has no error
+	// return, so a Validate() inside it could only be discarded.
+	if err := cfg.Validate(); err != nil {
 		return err
 	}
 	st, err := store.Open(cfg.DBPath)
@@ -88,11 +92,7 @@ type collectorStore interface {
 // the dashboard's on-demand trigger) so the two can never drift into
 // different sets of sources.
 func addCollectors(ctx context.Context, r *ingest.Runner, cfg *config.Config, st collectorStore) {
-	tailer := jsonlogs.New(jsonlRoot(), st)
-	tailer.SetPriceTable(pricing.NewLoader(pricing.DefaultPath()))
-	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
-		tailer.SetAccount(acct.Name, acct.BillingMode)
-	}
+	tailer := newTailer(cfg, jsonlRoot(), st)
 	r.Add(ingest.SourceJSONL, "root", "jsonl:"+jsonlRoot(), ingest.CollectorFunc(func(ctx context.Context) (int, error) {
 		stats, err := tailer.Poll(ctx)
 		return stats.Inserted, err

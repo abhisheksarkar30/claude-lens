@@ -60,14 +60,73 @@ either direction ([internal/analyze/rules.go](../../internal/analyze/rules.go)).
 carries a `Source` of `shipped` (cited to a doc line in the comment) or `provisional` (bundled but
 unverified). A user override is written to a separate file and carries `user`.
 
-`Cost(model, usage)` returns `(nil, "unpriced")` for a model with no rate — never a numeric zero a
-caller could store as `$0.00`. The full vocabulary of `cost_source` is
-`shipped | provisional | user | approximate:<reason> | unpriced`; `approximate:` marks a rate
+`Compute(model, usage, speed, serviceTier, at)` returns `(nil, "unpriced")` for a model with no
+rate — never a numeric zero a caller could store as `$0.00`. The full vocabulary of `cost_source`
+is `shipped | provisional | user | approximate:<reason> | unpriced`; `approximate:` marks a rate
 applied where only a flat cache count was available (e.g. `approximate:cache_ttl_unknown`), so the
 caveat survives into the stored row instead of being rounded away.
 
 `prices` is append-only — a rate change is a new `(model, effective_from)` row, and the row in
 force for an event is the one with the greatest `effective_from ≤ started_at`.
+
+### Exact money, rounded per token class
+
+Every rate is an exact `*big.Rat` **dollars per token**, never a float. A class costs
+`tokens × rate`; `batch` halves it and the peak multiplier scales it; then **each class is rounded
+to cents before the sum**
+([pricing.go:112-134](../../internal/pricing/pricing.go#L112-L134)). Multiplying the already-rounded
+total instead would drift — the same hazard `TestComputeBatchRoundsPerClass` guards on the batch
+half. Rates enter the shipped table as decimal USD strings per million tokens
+(`perMTok("0.15")`), which **panics at init** on an unparseable literal rather than silently
+pricing at zero.
+
+### Peak and off-peak
+
+`Rate.Peak` is a `*PeakWindow`; **`nil` means flat-priced**. The window is per-`Rate` and never
+global, because `ShippedTable()` legitimately mixes flat Anthropic rows with time-varying DeepSeek
+ones — an unconditional multiply would double every Claude cost
+([pricing.go:38-47](../../internal/pricing/pricing.go#L38-L47)).
+
+| | |
+|---|---|
+| Shipped window | DeepSeek only: peak = **2× off-peak** |
+| Hours | `[01:00, 04:00)` and `[06:00, 10:00)` — **UTC**, half-open |
+| Days | Monday–Friday, excluding the off-peak dates |
+| Off-peak dates | the 33 bundled **2026** Chinese public holidays |
+
+`IsPeak(at)` ([:52](../../internal/pricing/pricing.go#L52)) checks in that order: weekend in UTC →
+false; date in `OffPeakDates` → false; hour inside a span → true. `Compute` resolves `peak`
+**once per call** and applies it per class immediately before that class's single `roundHalfUp`
+([:106-134](../../internal/pricing/pricing.go#L106-L134)).
+
+Two things to know before touching the date list:
+
+- **It expires.** It is 2026-only, and past it every weekday hour prices at peak — an
+  **over**-charge. That direction is deliberate and named in the `ponytail:` comment in
+  [table.go](../../internal/pricing/table.go).
+- **It is configurable.** The bundled list and the peak hours can be replaced or cleared from
+  config — see the config knobs in [build-and-run.md](build-and-run.md).
+
+`PeakComputer` ([:153](../../internal/pricing/pricing.go#L153)) is an **optional** interface —
+`PeakAt(model, at) bool` — implemented by `Table` and `*Loader` and pinned by a compile-time
+assertion. It is separate from `Compute` so widening the pricing seam does not force every fake
+behind `PriceComputer` to change; a pricer not implementing it simply yields no `peak_pricing`
+warning, which is one of the two thirds of that kind's trigger described in the README's
+warning-kind table.
+
+### Third-party models and the zero-write rule
+
+Three DeepSeek rows ship in the table — `deepseek-flash`, `deepseek-v4-pro`, `deepseek-v4-flash` —
+all `shipped`, with **zero** cache-write rates because that endpoint bills no cache write.
+`ZeroWriteShippedRates(model)` is the single home for that rule: `LoadOverrides` inherits the zeros
+for such a model *before* deriving the usual write rates from the input rate, so an override that
+sets only input/output does not silently acquire a 1.25×/2× write rate. Unknown models and
+non-zero-write rows return false and the derivation proceeds as before.
+
+Which models bill pay-as-you-go is a **prefix list, not a code rule** —
+`shippedAPIModelPrefixes = ["deepseek-"]`, overridable from config. The routing it drives lives in
+the collector rather than here: see [workflows.md](workflows.md) and
+[internal/jsonlogs](../../internal/jsonlogs/).
 
 ## Quota
 
@@ -99,7 +158,7 @@ Admin cost report, per `(day, model)`. Divergence past an absolute-dollar thresh
 
 `source_mismatch` is the other half: the same `request_id` arriving from two sources with
 disagreeing token counts. It is raised by the store's merge, not by an analyze rule, and is one of
-the four kinds in `nonAnalyzeKinds` ([internal/analyze/kinds.go](../../internal/analyze/kinds.go)) —
+the five kinds in `nonAnalyzeKinds` ([internal/analyze/kinds.go](../../internal/analyze/kinds.go)) —
 the list a README check uses to expect a kind with no rule in that package. See the README's
 warning-kind table, which `internal/analyze/readme_test.go` pins against `AllKinds()`.
 
@@ -131,7 +190,11 @@ A newer generation having a *lower* minimum than an older one is why this cannot
 comparison. The marked prefix is measured from the captured request body, and the estimator is
 `len(body)/4` — marked `ponytail:` in the source, with both error modes argued safe because the
 table's steps are far coarser than the estimate's error. `TestMinimumCacheablePrefixCoversShippedModels`
-fails if a shipped model has no entry here.
+fails if a shipped model has no entry here — **except** the three third-party DeepSeek rows, which
+are carried as a named exception list with the reason recorded (“no cited cache minimum; the
+endpoint exposes no cache-write billing”). That is a literal in the test, not a derived predicate,
+so adding another model to it stays a visible, reviewable edit rather than something a predicate
+decides silently.
 
 Note the rule only fires when the model is **known** and the body was **captured**: an
 unrecognised model, or `--body-policy off`, means no warning rather than a guess.

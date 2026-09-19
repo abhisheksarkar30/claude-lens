@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strconv"
 	"testing"
 )
 
@@ -420,5 +421,286 @@ func TestMergeRederivesSessionTotals(t *testing.T) {
 	// run with zero calls.
 	if sess, err := st.GetSession(ctx, incoming); err == nil {
 		t.Errorf("incoming session %q has a row (request_count=%d); a merge must not fold into it", incoming, sess.RequestCount)
+	}
+}
+
+// T8: billing_mode moves with the winning cost columns. This is the
+// regression for the story's own defect -- before it, preferNonEmpty kept the
+// existing mode (always non-empty, so a merge could never change it) while the
+// incoming cost landed, producing a row marked subscription carrying a real
+// cost_usd. Re-ingesting a DeepSeek call is exactly that shape: the tailer
+// routes deepseek-* to the api account, so the incoming side is priced in
+// cost_usd.
+func TestMergeMovesBillingModeWithCost(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	sub := fullEvent("req-merge-billing")
+	sub.Source = "proxy"
+	sub.ModelResolved = "deepseek-flash"
+	sub.BillingMode = "subscription"
+	sub.CostUSD = nil
+	sub.ApiEquivalentCostUSD = f64(0.42)
+	sub.CostSource = "shipped"
+	id, _, err := st.InsertEvent(ctx, sub)
+	if err != nil {
+		t.Fatalf("InsertEvent subscription: %v", err)
+	}
+
+	api := fullEvent("req-merge-billing")
+	api.Source = "jsonl"
+	api.ModelResolved = "deepseek-flash"
+	api.BillingMode = "api"
+	api.CostUSD = f64(0.42)
+	api.ApiEquivalentCostUSD = nil
+	api.CostSource = "shipped"
+	id2, _, err := st.InsertEvent(ctx, api)
+	if err != nil {
+		t.Fatalf("InsertEvent api (merge): %v", err)
+	}
+	if id2 != id {
+		t.Fatalf("merge produced a new row: %d vs %d", id, id2)
+	}
+
+	got, err := st.GetEvent(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	if got.BillingMode != "api" {
+		t.Errorf("BillingMode = %q, want api (it must move with the cost columns, not stay preferNonEmpty)", got.BillingMode)
+	}
+	if got.CostUSD == nil || *got.CostUSD != 0.42 {
+		t.Errorf("CostUSD = %v, want 0.42 (the winning capture's)", got.CostUSD)
+	}
+	if got.ApiEquivalentCostUSD != nil {
+		t.Errorf("ApiEquivalentCostUSD = %v, want nil (invariant 5: the two are never both set)", *got.ApiEquivalentCostUSD)
+	}
+}
+
+// T9c: the winner can hand over no mode at all. billingModeForAuthKind returns
+// "" for a credential authkind.go does not classify, so a capture-complete proxy
+// row can carry an empty mode -- and every cost aggregate matches on
+// billing_mode = 'api' / 'subscription', so a blanked mode drops the row out of
+// every total. The label follows the money instead: the winner's populated cost
+// column names it. The session totals are asserted, not just the row, because
+// invisibility in the totals is the harm and that is where it shows.
+func TestMergeDerivesBillingModeFromWinningCostColumn(t *testing.T) {
+	cases := []struct {
+		name            string
+		storedMode      string
+		storedCost      *float64
+		storedEq        *float64
+		winCost         *float64
+		winEq           *float64
+		winSource       string
+		wantMode        string
+		wantCost        *float64
+		wantEq          *float64
+		wantSessionCost *float64
+		wantSessionEq   *float64
+	}{
+		{
+			name:            "winner priced cost_usd: the cost names it api, not the stored subscription",
+			storedMode:      "subscription",
+			storedEq:        f64(0.42),
+			winCost:         f64(0.42),
+			winSource:       "shipped",
+			wantMode:        "api",
+			wantCost:        f64(0.42),
+			wantSessionCost: f64(0.42),
+		},
+		{
+			name:          "winner priced api_equivalent_cost_usd: subscription",
+			storedMode:    "api",
+			storedCost:    f64(0.42),
+			winEq:         f64(0.30),
+			winSource:     "shipped",
+			wantMode:      "subscription",
+			wantEq:        f64(0.30),
+			wantSessionEq: f64(0.30),
+		},
+		{
+			name:       "winner priced nothing: the stored mode survives rather than blanking",
+			storedMode: "subscription",
+			storedEq:   f64(0.42),
+			winSource:  "unpriced",
+			wantMode:   "subscription",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			ctx := context.Background()
+
+			stored := fullEvent("req-merge-billing-empty")
+			stored.BillingMode = tc.storedMode
+			stored.CostUSD = tc.storedCost
+			stored.ApiEquivalentCostUSD = tc.storedEq
+			if err := st.UpsertSession(ctx, stored.SessionID, "", stored.StartedAt); err != nil {
+				t.Fatalf("UpsertSession: %v", err)
+			}
+			id, _, err := st.InsertEvent(ctx, stored)
+			if err != nil {
+				t.Fatalf("InsertEvent stored: %v", err)
+			}
+
+			// CaptureComplete, proxy-sourced, with an empty BillingMode and an
+			// unclassified credential -- exactly the combination
+			// billingModeForAuthKind produces "", and the ordering that made
+			// winner = incoming and blanked the stored mode. (A JSONL row
+			// cannot be the source of an empty mode: the tailer always
+			// resolves one, by account default or by model prefix.)
+			winner := fullEvent("req-merge-billing-empty")
+			winner.Source = "proxy"
+			winner.AuthKind = "unknown"
+			winner.BillingMode = ""
+			winner.CostUSD = tc.winCost
+			winner.ApiEquivalentCostUSD = tc.winEq
+			winner.CostSource = tc.winSource
+			id2, _, err := st.InsertEvent(ctx, winner)
+			if err != nil {
+				t.Fatalf("InsertEvent winner: %v", err)
+			}
+			if id2 != id {
+				t.Fatalf("merge produced a new row: %d vs %d", id, id2)
+			}
+
+			got, err := st.GetEvent(ctx, id)
+			if err != nil {
+				t.Fatalf("GetEvent: %v", err)
+			}
+			if got.BillingMode != tc.wantMode {
+				t.Errorf("BillingMode = %q, want %q", got.BillingMode, tc.wantMode)
+			}
+			if !sameF64(got.CostUSD, tc.wantCost) {
+				t.Errorf("CostUSD = %v, want %v", ptrStr(got.CostUSD), ptrStr(tc.wantCost))
+			}
+			if !sameF64(got.ApiEquivalentCostUSD, tc.wantEq) {
+				t.Errorf("ApiEquivalentCostUSD = %v, want %v", ptrStr(got.ApiEquivalentCostUSD), ptrStr(tc.wantEq))
+			}
+			if got.CostUSD != nil && got.ApiEquivalentCostUSD != nil {
+				t.Errorf("both cost columns set (invariant 5: the two are never both set)")
+			}
+
+			sess, err := st.GetSession(ctx, "s_1")
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if !sameF64(sess.TotalCostUSD, tc.wantSessionCost) {
+				t.Errorf("session TotalCostUSD = %v, want %v", ptrStr(sess.TotalCostUSD), ptrStr(tc.wantSessionCost))
+			}
+			if !sameF64(sess.TotalApiEquivalentCostUSD, tc.wantSessionEq) {
+				t.Errorf("session TotalApiEquivalentCostUSD = %v, want %v", ptrStr(sess.TotalApiEquivalentCostUSD), ptrStr(tc.wantSessionEq))
+			}
+		})
+	}
+}
+
+func sameF64(got, want *float64) bool {
+	if got == nil || want == nil {
+		return got == nil && want == nil
+	}
+	return *got == *want
+}
+
+func ptrStr(p *float64) string {
+	if p == nil {
+		return "nil"
+	}
+	return strconv.FormatFloat(*p, 'f', -1, 64)
+}
+
+// T9: an incomplete incoming capture wins nothing, so billing_mode is
+// unchanged and its cost does not land either. 0-vs-N is not a disagreement.
+func TestMergeIncompleteIncomingKeepsBillingMode(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	existing := fullEvent("req-merge-incomplete")
+	existing.Source = "proxy"
+	existing.BillingMode = "subscription"
+	existing.CostUSD = nil
+	existing.ApiEquivalentCostUSD = f64(0.10)
+	existing.CostSource = "shipped"
+	id, _, err := st.InsertEvent(ctx, existing)
+	if err != nil {
+		t.Fatalf("InsertEvent existing: %v", err)
+	}
+
+	incoming := fullEvent("req-merge-incomplete")
+	incoming.Source = "jsonl"
+	incoming.CaptureComplete = false
+	incoming.BillingMode = "api"
+	incoming.CostUSD = f64(0.10)
+	incoming.ApiEquivalentCostUSD = nil
+	incoming.CostSource = "shipped"
+	id2, _, err := st.InsertEvent(ctx, incoming)
+	if err != nil {
+		t.Fatalf("InsertEvent incomplete (merge): %v", err)
+	}
+	if id2 != id {
+		t.Fatalf("merge produced a new row")
+	}
+
+	got, err := st.GetEvent(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	if got.BillingMode != "subscription" {
+		t.Errorf("BillingMode = %q, want subscription (an incomplete incoming capture wins nothing)", got.BillingMode)
+	}
+	if got.CostUSD != nil {
+		t.Errorf("CostUSD = %v, want nil (the incomplete side's cost must not land)", got.CostUSD)
+	}
+}
+
+// T9b: Account and AuthKind stay on preferNonEmpty even when the incoming side
+// demonstrably wins the cost columns. The proxy-only columns are backfilled in
+// both directions, but these two are not -- the JSONL line carries no auth
+// signal, so a winner-based Account would blank the live proxy row's name.
+func TestMergeKeepsExistingAccountAndAuthKind(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	existing := fullEvent("req-merge-account")
+	existing.Source = "proxy"
+	existing.Account = "work"
+	existing.AuthKind = "oauth"
+	existing.BillingMode = "api"
+	existing.CostUSD = f64(0.10)
+	id, _, err := st.InsertEvent(ctx, existing)
+	if err != nil {
+		t.Fatalf("InsertEvent existing: %v", err)
+	}
+
+	incoming := fullEvent("req-merge-account")
+	incoming.Source = "jsonl"
+	incoming.Account = ""         // structurally absent from a JSONL line
+	incoming.AuthKind = "api_key" // deliberately different, so a winner-based assignment is visible
+	incoming.BillingMode = "api"
+	incoming.CostUSD = f64(0.20)
+	id2, _, err := st.InsertEvent(ctx, incoming)
+	if err != nil {
+		t.Fatalf("InsertEvent incoming (merge): %v", err)
+	}
+	if id2 != id {
+		t.Fatalf("merge produced a new row")
+	}
+
+	got, err := st.GetEvent(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	// The premise: the incoming side did win the cost columns. Without this,
+	// the assertions below would pass for the wrong reason.
+	if got.CostUSD == nil || *got.CostUSD != 0.20 {
+		t.Fatalf("CostUSD = %v, want 0.20 (the incoming capture won)", got.CostUSD)
+	}
+	if got.Account != "work" {
+		t.Errorf("Account = %q, want work (preferNonEmpty keeps the proxy row's name)", got.Account)
+	}
+	if got.AuthKind != "oauth" {
+		t.Errorf("AuthKind = %q, want oauth (preferNonEmpty, even though the incoming side won the costs)", got.AuthKind)
 	}
 }

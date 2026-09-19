@@ -2,10 +2,14 @@ package jsonlogs
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/parse"
+	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
@@ -340,4 +344,267 @@ func appendLine(t *testing.T, path, content string) {
 	if _, err := f.WriteString(content + "\n"); err != nil {
 		t.Fatalf("append %s: %v", path, err)
 	}
+}
+
+// --- Tailer account contract (br-GI-3-06) ---
+
+// New seeds billing_mode "subscription" with no account name: Claude Code's
+// own transcripts are written by the subscription client in the common case.
+func TestNewSeedsSubscriptionBillingMode(t *testing.T) {
+	st := newTestStore(t)
+	name, mode := New(t.TempDir(), st).Account()
+	if name != "" {
+		t.Errorf("account name = %q, want empty (a JSONL line carries no account)", name)
+	}
+	if mode != "subscription" {
+		t.Errorf("billing mode = %q, want subscription (the seed)", mode)
+	}
+}
+
+// SetAccount assigns unconditionally, including a zero Account -- which blanks
+// the mode New seeded. This is the sharp edge the `acct.Name != ""` guard in
+// cli.newTailer exists for, and the reason that guard is load-bearing rather
+// than decorative: without it, an install with no subscription account would
+// blank the mode and mis-bill every row into cost_usd.
+func TestSetAccountAssignsUnconditionally(t *testing.T) {
+	st := newTestStore(t)
+	tailer := New(t.TempDir(), st)
+
+	tailer.SetAccount("", "")
+	if _, mode := tailer.Account(); mode != "" {
+		t.Errorf("billing mode = %q, want \"\" -- SetAccount must not treat a zero Account as a no-op", mode)
+	}
+
+	tailer.SetAccount("work", "api")
+	name, mode := tailer.Account()
+	if name != "work" || mode != "api" {
+		t.Errorf("Account() = (%q, %q), want (work, api)", name, mode)
+	}
+}
+
+// --- Per-row billing routing (br-GI-3-07) ---
+
+// writeLines writes a JSONL transcript from the given lines.
+func writeLines(t *testing.T, path string, lines ...string) {
+	t.Helper()
+	body := ""
+	for _, l := range lines {
+		body += l + "\n"
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatalf("WriteFile %s: %v", path, err)
+	}
+}
+
+// assistantLine is one assistant-with-usage transcript line, the only shape
+// dedup and token extraction consider. With no timestamp, parseTimestamp
+// falls back to now.
+func assistantLine(requestID, sessionID, model string, inputTokens int) string {
+	return assistantLineUsage(requestID, sessionID, model, inputTokens, "")
+}
+
+// assistantLineAt is assistantLine pinned to an explicit timestamp, so a test
+// can place a row inside or outside a peak window rather than depending on
+// when it happens to run.
+func assistantLineAt(requestID, sessionID, model string, at time.Time) string {
+	return assistantLineUsage(requestID, sessionID, model, 1000, at.UTC().Format(time.RFC3339))
+}
+
+func assistantLineUsage(requestID, sessionID, model string, inputTokens int, ts string) string {
+	stamp := ""
+	if ts != "" {
+		stamp = fmt.Sprintf(`"timestamp":%q,`, ts)
+	}
+	return fmt.Sprintf(
+		`{"type":"assistant",%s"sessionId":%q,"uuid":"u-%s","requestId":%q,"message":{"model":%q,"stop_reason":"end_turn","usage":{"input_tokens":%d,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}`,
+		stamp, sessionID, requestID, requestID, model, inputTokens)
+}
+
+// T7: one tailer, two models. A prefix-matched row bills to the api account
+// with a real cost in cost_usd; a Claude row from the same tailer still bills
+// to the subscription account with its cost in the hypothetical column. That
+// the two resolve differently from one tailer is the entire point -- resolving
+// once per tailer is what the api* seam replaced.
+func TestPollRoutesAPIPrefixedModelsPerRow(t *testing.T) {
+	root := t.TempDir()
+	writeLines(t, filepath.Join(root, "log.jsonl"),
+		assistantLine("req_ds", "sess_route", "deepseek-flash", 1_000_000),
+		assistantLine("req_cl", "sess_route", "claude-sonnet-5", 1_000_000),
+	)
+
+	st := newTestStore(t)
+	tailer := New(root, st)
+	tailer.SetPriceTable(pricing.ShippedTable())
+	// The exact value resolvedAPIPrefixes(cfg) returns on an unconfigured
+	// install, so this is the shipped default's behaviour, not a hand-rolled
+	// list.
+	tailer.SetModelBilling(pricing.ShippedAPIModelPrefixes(), "", "api")
+
+	if _, err := tailer.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	evs := eventsByRequestID(t, st)
+	ds, ok := evs["req_ds"]
+	if !ok {
+		t.Fatalf("no event for req_ds: %v", evs)
+	}
+	if ds.BillingMode != "api" {
+		t.Errorf("deepseek row BillingMode = %q, want api", ds.BillingMode)
+	}
+	if ds.CostUSD == nil {
+		t.Error("deepseek row CostUSD = nil, want a real cost in cost_usd")
+	}
+	if ds.ApiEquivalentCostUSD != nil {
+		t.Errorf("deepseek row ApiEquivalentCostUSD = %v, want nil (invariant 5: never both)", *ds.ApiEquivalentCostUSD)
+	}
+
+	cl, ok := evs["req_cl"]
+	if !ok {
+		t.Fatalf("no event for req_cl: %v", evs)
+	}
+	if cl.BillingMode != "subscription" {
+		t.Errorf("claude row BillingMode = %q, want subscription", cl.BillingMode)
+	}
+	if cl.ApiEquivalentCostUSD == nil {
+		t.Error("claude row ApiEquivalentCostUSD = nil, want the hypothetical cost")
+	}
+	if cl.CostUSD != nil {
+		t.Errorf("claude row CostUSD = %v, want nil", *cl.CostUSD)
+	}
+}
+
+// The nil-list case. SetModelBilling(nil, ...) routes nothing, which is
+// exactly how a call site that forgot resolvedAPIPrefixes would fail --
+// silently, because strings.HasPrefix over a nil slice simply never matches
+// and nothing returns an error.
+func TestSetModelBillingNilRoutesNothing(t *testing.T) {
+	root := t.TempDir()
+	writeLines(t, filepath.Join(root, "log.jsonl"),
+		assistantLine("req_nil", "sess_nil", "deepseek-flash", 1000))
+
+	st := newTestStore(t)
+	tailer := New(root, st)
+	tailer.SetPriceTable(pricing.ShippedTable())
+	tailer.SetModelBilling(nil, "payg", "api")
+
+	if _, err := tailer.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	ev := eventsByRequestID(t, st)["req_nil"]
+	if ev == nil {
+		t.Fatal("no event for req_nil")
+	}
+	if ev.BillingMode != "subscription" {
+		t.Errorf("BillingMode = %q, want subscription (a nil prefix list routes nothing)", ev.BillingMode)
+	}
+}
+
+// ModelBilling returns a copy, so a caller cannot mutate the tailer's own
+// slice -- the same rule AllKinds() follows.
+func TestModelBillingReturnsACopy(t *testing.T) {
+	tailer := New(t.TempDir(), newTestStore(t))
+	tailer.SetModelBilling([]string{"deepseek-"}, "payg", "api")
+
+	prefixes, account, mode := tailer.ModelBilling()
+	if len(prefixes) != 1 || prefixes[0] != "deepseek-" || account != "payg" || mode != "api" {
+		t.Fatalf("ModelBilling() = (%v, %q, %q), want ([deepseek-], payg, api)", prefixes, account, mode)
+	}
+	prefixes[0] = "mutated"
+	if again, _, _ := tailer.ModelBilling(); again[0] != "deepseek-" {
+		t.Errorf("mutating the returned slice changed the tailer's own: next call returned %q", again[0])
+	}
+}
+
+// --- peak_pricing warning (br-GI-3-10) ---
+
+// warningKinds reads back one row's finding kinds.
+func warningKinds(t *testing.T, st *store.Store, id int64) map[string]bool {
+	t.Helper()
+	warnings, err := st.EventWarnings(context.Background(), id)
+	if err != nil {
+		t.Fatalf("EventWarnings: %v", err)
+	}
+	out := map[string]bool{}
+	for _, w := range warnings {
+		out[w.Kind] = true
+	}
+	return out
+}
+
+// T11 (insert path): peak_pricing fires on a peak-billed *priced* row, not on
+// the same row off peak, and not on an unpriced row at a peak instant -- an
+// unpriced row was never billed at any rate, so claiming it was billed at peak
+// would be a lie.
+func TestInsertAttachesPeakPricingWarning(t *testing.T) {
+	// 2026-09-21 is a Monday; the shipped window is [01:00,04:00) UTC.
+	peakAt := time.Date(2026, time.September, 21, 2, 0, 0, 0, time.UTC)
+	offAt := time.Date(2026, time.September, 21, 0, 30, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name  string
+		model string
+		at    time.Time
+		want  bool
+	}{
+		{"priced at peak", "deepseek-flash", peakAt, true},
+		{"priced off peak", "deepseek-flash", offAt, false},
+		{"unpriced at peak", "claude-nonesuch-9", peakAt, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeLines(t, filepath.Join(root, "log.jsonl"),
+				assistantLineAt("req_peak", "sess_peak", tc.model, tc.at))
+
+			st := newTestStore(t)
+			tailer := New(root, st)
+			tailer.SetPriceTable(pricing.ShippedTable())
+
+			if _, err := tailer.Poll(context.Background()); err != nil {
+				t.Fatalf("Poll: %v", err)
+			}
+			ev := eventsByRequestID(t, st)["req_peak"]
+			if ev == nil {
+				t.Fatal("no event for req_peak")
+			}
+			if got := warningKinds(t, st, ev.ID)["peak_pricing"]; got != tc.want {
+				t.Errorf("peak_pricing present = %v, want %v (cost_source=%q, model=%q, at=%s)",
+					got, tc.want, ev.CostSource, ev.ModelResolved, tc.at.Format(time.RFC3339))
+			}
+		})
+	}
+}
+
+// A pricer that does not implement PeakComputer yields no warning rather than
+// a panic or a spurious one. This is the property that keeps the interface
+// optional, and it is what every existing fake relies on.
+func TestPeakWarningSkippedForAPricerWithoutPeakAt(t *testing.T) {
+	root := t.TempDir()
+	writeLines(t, filepath.Join(root, "log.jsonl"),
+		assistantLineAt("req_nopeak", "sess_nopeak", "deepseek-flash",
+			time.Date(2026, time.September, 21, 2, 0, 0, 0, time.UTC)))
+
+	st := newTestStore(t)
+	tailer := New(root, st)
+	tailer.SetPriceTable(plainPricer{})
+
+	if _, err := tailer.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	ev := eventsByRequestID(t, st)["req_nopeak"]
+	if ev == nil {
+		t.Fatal("no event for req_nopeak")
+	}
+	if warningKinds(t, st, ev.ID)["peak_pricing"] {
+		t.Error("peak_pricing attached for a pricer with no PeakAt method")
+	}
+}
+
+// plainPricer implements PriceComputer and nothing more, which is the shape
+// every existing fake has.
+type plainPricer struct{}
+
+func (plainPricer) Compute(string, parse.Usage, string, string, time.Time) (*float64, string) {
+	usd := 1.0
+	return &usd, "shipped"
 }

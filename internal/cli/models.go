@@ -31,7 +31,7 @@ func runModels(args []string, w io.Writer) error {
 	}
 	defer st.Close()
 
-	table := pricing.NewLoader(pricing.DefaultPath()).Table()
+	table := pricing.NewLoader(pricing.DefaultPath(), nil).Table()
 
 	fmt.Fprintln(w, "catalogue:")
 	names := make([]string, 0, len(table))

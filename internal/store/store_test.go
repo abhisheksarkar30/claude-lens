@@ -257,6 +257,48 @@ func TestBillingModeInvariants(t *testing.T) {
 			t.Errorf("%s: ApiEquivalentCostUSD = %v, want nil=%v", tc.name, got.ApiEquivalentCostUSD, tc.wantApiNil)
 		}
 	}
+
+	// The merge path. The loop above exercises inserts only, which is why a
+	// merge that moved cost_usd without moving billing_mode could write the
+	// forbidden pair (billing_mode='subscription' with a real cost_usd) and
+	// fail nothing: the merge, not the insert, is what picks which side's mode
+	// and which side's cost survive.
+	sub := fullEvent("req-merge-invariant")
+	sub.BillingMode = "subscription"
+	sub.CostUSD = nil
+	sub.ApiEquivalentCostUSD = f64(0.10)
+	sub.CostSource = "shipped"
+	subID, _, err := st.InsertEvent(ctx, sub)
+	if err != nil {
+		t.Fatalf("merge path: InsertEvent subscription: %v", err)
+	}
+
+	api := fullEvent("req-merge-invariant")
+	api.BillingMode = "api"
+	api.CostUSD = f64(0.10)
+	api.ApiEquivalentCostUSD = nil
+	api.CostSource = "shipped"
+	apiID, _, err := st.InsertEvent(ctx, api)
+	if err != nil {
+		t.Fatalf("merge path: InsertEvent api: %v", err)
+	}
+	if apiID != subID {
+		t.Fatalf("merge path: rows did not merge (sub=%d api=%d)", subID, apiID)
+	}
+
+	merged, err := st.GetEvent(ctx, subID)
+	if err != nil {
+		t.Fatalf("merge path: GetEvent: %v", err)
+	}
+	if merged.BillingMode != "api" {
+		t.Errorf("merge path: BillingMode = %q, want api (the mode must follow the winning cost)", merged.BillingMode)
+	}
+	if merged.CostUSD == nil {
+		t.Error("merge path: CostUSD = nil, want the winning capture's cost")
+	}
+	if merged.ApiEquivalentCostUSD != nil {
+		t.Errorf("merge path: ApiEquivalentCostUSD = %v, want nil (invariant 5: never both)", *merged.ApiEquivalentCostUSD)
+	}
 }
 
 // Session split: a mixed session (one api row, one subscription row) has

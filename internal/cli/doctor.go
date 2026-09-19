@@ -9,10 +9,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/ingest"
+	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/secret"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
@@ -38,6 +40,36 @@ type doctorCheck struct {
 	Detail string
 }
 
+// effectivePeakDates renders the resolved off-peak date list for doctor: the
+// shipped count when the key is unset, "none" when it is explicitly empty,
+// otherwise the configured count. Printing len() raw would show 0 in exactly
+// the state where the shipped 33-date default is in force -- the state this
+// row exists to show.
+func effectivePeakDates(configured []string) string {
+	switch {
+	case configured == nil:
+		return fmt.Sprintf("%d (default)", len(pricing.ShippedOffPeakDates()))
+	case len(configured) == 0:
+		return "none"
+	default:
+		return fmt.Sprintf("%d", len(configured))
+	}
+}
+
+// effectiveAPIPrefixes is effectivePeakDates' counterpart for the prefix list,
+// which shows the values rather than a count: the resolved default, "none", or
+// the configured list.
+func effectiveAPIPrefixes(cfg *config.Config) string {
+	switch {
+	case cfg.ApiModelPrefixes == nil:
+		return strings.Join(resolvedAPIPrefixes(cfg), ", ") + " (default)"
+	case len(cfg.ApiModelPrefixes) == 0:
+		return "none"
+	default:
+		return strings.Join(cfg.ApiModelPrefixes, ", ")
+	}
+}
+
 func runDoctor(args []string, w io.Writer) error {
 	cfg, err := config.Load(args)
 	if err != nil {
@@ -57,6 +89,8 @@ func runDoctor(args []string, w io.Writer) error {
 		{"retention_days", fmt.Sprintf("%d", cfg.RetentionDays)},
 		{"replay_enabled", fmt.Sprintf("%t", cfg.ReplayEnabled)},
 		{"accounts_configured", fmt.Sprintf("%d", len(cfg.Accounts))},
+		{"peak_off_peak_dates", effectivePeakDates(cfg.PeakOffPeakDates)},
+		{"api_model_prefixes", effectiveAPIPrefixes(cfg)},
 	}
 	for _, row := range cfgRows {
 		fmt.Fprintf(w, "  %-20s %s\n", row[0], row[1])

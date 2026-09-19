@@ -65,7 +65,7 @@ These are `TEXT` columns, not SQL enums — the valid vocabulary lives in Go and
 | `events.auth_kind` | `oauth` \| `api_key` \| `admin` \| `cloud` \| `unknown` | [cost-and-quota.md](cost-and-quota.md) |
 | `events.billing_mode` | `subscription` \| `api` | `TestBillingModeInvariants` |
 | `events.cost_source` | `shipped` \| `provisional` \| `user` \| `approximate:<reason>` \| `unpriced` | `TestBillingModeInvariants` |
-| `warnings.kind` | the 22 kinds in [internal/analyze/kinds.go](../../internal/analyze/kinds.go) | `internal/analyze/readme_test.go` |
+| `warnings.kind` | the 23 kinds in [internal/analyze/kinds.go](../../internal/analyze/kinds.go) | `internal/analyze/readme_test.go` |
 | `warnings.severity` | `info` \| `warn` \| `error` | [internal/analyze/kinds.go](../../internal/analyze/kinds.go) |
 | `quota_snapshots.status` | the endpoint's own reported status, stored verbatim | [internal/snapshot](../../internal/snapshot/) |
 | `ingest_state.status` | per-collector outcome; `error` carries the message | [internal/ingest](../../internal/ingest/) |
@@ -93,6 +93,16 @@ Two billing models that must never be summed, carried by *which column the figur
 No `SUM(cost_usd)` — with or without a JOIN — can merge them, because they are never in the same
 column. `sessions` mirrors the split with `total_cost_usd` and `total_api_equivalent_cost_usd`. See
 [decisions/001](decisions/001-billing-split-by-column.md).
+
+**A cross-source merge is what can desync the pair, so the merge moves both together.** The winning
+capture supplies the cost columns *and* the `billing_mode` that labels them; when the winner carries
+no mode at all — possible, since `billing_mode` is `TEXT NOT NULL DEFAULT ''` and an unclassified
+credential yields `''` — the label is derived from the column the winner priced rather than taken
+from the losing side
+([internal/store/merge.go](../../internal/store/merge.go), `TestMergeDerivesBillingModeFromWinningCostColumn`).
+Note the aggregates key on the value: `SUM(CASE WHEN billing_mode = 'api' THEN cost_usd END)` and
+its `'subscription'` mirror, so a row whose mode is `''` matches neither and is absent from **both**
+totals ([internal/store/store.go:500-501](../../internal/store/store.go#L500-L501)).
 
 `cost_source` labels how the figure was arrived at: `shipped` (from the bundled table),
 `provisional` (bundled but unverified), `user` (an override), `approximate:<reason>` (a rate

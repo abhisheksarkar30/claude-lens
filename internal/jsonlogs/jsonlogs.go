@@ -17,6 +17,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -59,6 +60,30 @@ type PriceComputer interface {
 	Compute(model string, usage parse.Usage, speed, serviceTier string, at time.Time) (usd *float64, costSource string)
 }
 
+// peakComputer mirrors pricing.PeakComputer, the way PriceComputer mirrors the
+// same seam: an optional refinement a pricer may or may not implement, so the
+// assertion is what decides whether a peak_pricing warning is possible at all.
+type peakComputer interface {
+	PeakAt(model string, at time.Time) bool
+}
+
+// peakWarning reports whether ev was billed at a peak rate, as a warning. Two
+// conditions gate it: the pricer must implement peakComputer, and the row must
+// actually be priced -- an unpriced row was never billed at any rate, so
+// claiming it was billed at peak would be a lie (invariant 5).
+func peakWarning(pricer PriceComputer, ev *store.Event) (store.Warning, bool) {
+	pc, ok := pricer.(peakComputer)
+	if !ok || ev.CostSource == "unpriced" || !pc.PeakAt(ev.ModelResolved, ev.StartedAt) {
+		return store.Warning{}, false
+	}
+	return store.Warning{
+		Kind:      "peak_pricing",
+		Severity:  "warn",
+		Detail:    fmt.Sprintf("%s billed at peak; the same call off-peak costs less", ev.ModelResolved),
+		CreatedAt: ev.StartedAt,
+	}, true
+}
+
 // Tailer walks a Claude Code projects directory and ingests every
 // distinct request found there through the same cold-path steps a proxy
 // row goes through in internal/consumer -- session, cost, analyzer -- via
@@ -73,14 +98,22 @@ type Tailer struct {
 	sessionRule SessionRule
 	pricer      PriceComputer
 
-	// account/billingMode are fixed for every row this tailer writes.
+	// account/billingMode are the default for every row this tailer writes.
 	// ponytail: a JSONL line carries no auth signal to disambiguate
 	// between multiple configured accounts, so this is one value for the
 	// whole tailer rather than a per-row resolution; ceiling: a multi-
 	// account setup with more than one subscription account can't tell
 	// their JSONL history apart -- revisit if that becomes real.
+	//
+	// The api* fields below are the one exception, and they do not reopen that
+	// ceiling: a model prefix is a signal the line *does* carry, so a
+	// prefix-matched row resolves per row rather than taking the default.
 	account     string
 	billingMode string
+
+	apiPrefixes    []string
+	apiAccount     string
+	apiBillingMode string
 }
 
 // New returns a Tailer walking root, writing to st. Every optional seam
@@ -98,10 +131,33 @@ func (t *Tailer) SetSessionRule(r SessionRule)         { t.sessionRule = r }
 func (t *Tailer) SetPriceTable(p PriceComputer)        { t.pricer = p }
 
 // SetAccount fixes the account/billing_mode every row from this tailer
-// gets.
+// gets. It assigns unconditionally, so a caller that passes a zero Account
+// blanks the billing mode New seeded.
 func (t *Tailer) SetAccount(name, billingMode string) {
 	t.account = name
 	t.billingMode = billingMode
+}
+
+// Account reports the account and billing mode every row from this tailer
+// gets, unless a model prefix routes it otherwise.
+func (t *Tailer) Account() (name, billingMode string) {
+	return t.account, t.billingMode
+}
+
+// SetModelBilling lists the model prefixes that bill pay-as-you-go, and the
+// account/billing mode such a model's rows get. A prefix list consumed only
+// behind a tailer.
+func (t *Tailer) SetModelBilling(prefixes []string, apiAccount, apiBillingMode string) {
+	t.apiPrefixes = prefixes
+	t.apiAccount = apiAccount
+	t.apiBillingMode = apiBillingMode
+}
+
+// ModelBilling reports the prefixes that route a row to the api account, and
+// the account/billing mode such a row gets. prefixes is a copy, so a caller
+// cannot mutate the tailer's own slice -- the same rule AllKinds() follows.
+func (t *Tailer) ModelBilling() (prefixes []string, account, billingMode string) {
+	return slices.Clone(t.apiPrefixes), t.apiAccount, t.apiBillingMode
 }
 
 // Stats reports one Poll's work, for logging and tests.
@@ -309,14 +365,26 @@ func (t *Tailer) buildEvent(l *line, f walkedFile) (*store.Event, parse.Meta, pa
 		CliEntrypoint: l.CliEntrypoint,
 	}
 
+	// Account and billing mode resolve per row, not once for the tailer: one
+	// transcript tree holds both Claude and DeepSeek traffic, and a model whose
+	// prefix is configured pay-as-you-go must land in the api account with a
+	// real cost rather than the hypothetical column.
+	account, billingMode := t.account, t.billingMode
+	for _, p := range t.apiPrefixes {
+		if strings.HasPrefix(usage.Model, p) {
+			account, billingMode = t.apiAccount, t.apiBillingMode
+			break
+		}
+	}
+
 	startedAt := parseTimestamp(l.Timestamp)
 	ev := &store.Event{
 		RequestID:          requestKey(l),
 		Source:             "jsonl",
 		FirstSource:        "jsonl",
 		StartedAt:          startedAt,
-		Account:            t.account,
-		BillingMode:        t.billingMode,
+		Account:            account,
+		BillingMode:        billingMode,
 		ModelRequested:     usage.Model,
 		ModelResolved:      usage.Model,
 		InputTokens:        usage.InputTokens,
@@ -373,6 +441,11 @@ func (t *Tailer) insert(ctx context.Context, ev *store.Event, meta parse.Meta, u
 	var warnings []store.Warning
 	for _, a := range t.analyzers {
 		warnings = append(warnings, t.runAnalyzer(a, meta, usage, ev)...)
+	}
+	// Attached here rather than in buildEvent, which returns no warnings slice
+	// to append to.
+	if w, ok := peakWarning(t.pricer, ev); ok {
+		warnings = append(warnings, w)
 	}
 	if len(warnings) > 0 {
 		if err := t.st.UpsertWarnings(ctx, id, warnings); err != nil {

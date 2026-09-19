@@ -24,6 +24,14 @@ The rule extends past storage:
 - The dashboard header renders **two labelled totals** — `api` and `sub` — never one sum.
 - An unpriced row leaves both columns NULL and carries `cost_source='unpriced'`. It is never `$0.00`,
   which reads as "this was free".
+- **A cross-source merge moves `billing_mode` together with the cost columns** it labels, rather
+  than keeping whichever value was stored first. The merge is the one place the pair can desync —
+  it adopts the winning capture's cost, so it must adopt that capture's label. When the winner
+  carries no label (an unclassified credential yields `''`), the label is derived from the column
+  the winner priced, since that is what this ADR says the column *means*; adopting the losing
+  side's label instead would put a real `cost_usd` on a `subscription` row, which is precisely the
+  shape this decision forbids. See [../workflows.md](../workflows.md) §2 and
+  [../storage-schema.md](../storage-schema.md).
 - The quota side has the same shape: no configured limit renders `unconfigured`, never a percentage
   of an invented ceiling.
 

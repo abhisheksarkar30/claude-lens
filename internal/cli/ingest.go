@@ -29,6 +29,12 @@ func runIngest(args []string, w io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// config.Load does not call Validate itself, so this path -- the one
+	// `clens ingest --rebuild` takes -- is validated only here, and before the
+	// store is opened so a bad config cannot half-run against a real database.
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
 		return fmt.Errorf("ingest: open store: %w", err)
@@ -44,11 +50,7 @@ func runIngest(args []string, w io.Writer) error {
 		}
 	}
 
-	tailer := jsonlogs.New(root, st)
-	tailer.SetPriceTable(pricing.NewLoader(pricing.DefaultPath()))
-	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
-		tailer.SetAccount(acct.Name, acct.BillingMode)
-	}
+	tailer := newTailer(cfg, root, st)
 
 	stats, err := tailer.Poll(ctx)
 	if err != nil {
@@ -63,6 +65,49 @@ func runIngest(args []string, w io.Writer) error {
 // ~/.claude/projects convention internal/jsonlogs's package doc names.
 func jsonlRoot() string {
 	return filepath.Join(claudeConfigDir(), "projects")
+}
+
+// newTailer is the one tailer shape both callers want -- `clens ingest` and
+// addCollectors, which serves `clens serve` and `clens refresh`. One place, so
+// the two cannot drift into different price tables or accounts.
+//
+// root is an explicit parameter: runIngest's local root and addCollectors'
+// jsonlRoot() are distinct expressions, and only one of them is the settled
+// default, so a helper that resolved the root itself would silently drop the
+// other's.
+func newTailer(cfg *config.Config, root string, st collectorStore) *jsonlogs.Tailer {
+	t := jsonlogs.New(root, st)
+	t.SetPriceTable(newPriceLoader(cfg))
+	// The guard is load-bearing, not decorative: SetAccount assigns
+	// unconditionally and New seeds "subscription", so a zero Account on an
+	// install with no subscription account would blank the mode and mis-bill
+	// every row into cost_usd.
+	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
+		t.SetAccount(acct.Name, acct.BillingMode)
+	}
+	// The api side has no such guard, and needs none: billing_mode is the
+	// literal "api" and is never the empty string, while a zero apiAccount is
+	// the value the consumer path already permits. The column invariant 5 keys
+	// off is billing_mode, not account.
+	t.SetModelBilling(resolvedAPIPrefixes(cfg), firstAccount(cfg, "api").Name, "api")
+	return t
+}
+
+// resolvedAPIPrefixes resolves the pay-as-you-go model prefixes: nil means
+// "unset -> use the shipped default". A site that missed this resolution would
+// fail silently -- the resolved list is only ever fed to strings.HasPrefix,
+// which never matches over a nil slice, giving zero routing with no error.
+func resolvedAPIPrefixes(cfg *config.Config) []string {
+	if cfg.ApiModelPrefixes == nil {
+		return pricing.ShippedAPIModelPrefixes()
+	}
+	return cfg.ApiModelPrefixes
+}
+
+// newPriceLoader is the one loader shape every pricer in this process wants,
+// so two pricers cannot disagree about the configured off-peak dates.
+func newPriceLoader(cfg *config.Config) *pricing.Loader {
+	return pricing.NewLoader(pricing.DefaultPath(), cfg.PeakOffPeakDates)
 }
 
 // firstAccount returns the first configured account with the given

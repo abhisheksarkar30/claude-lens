@@ -1,6 +1,8 @@
 package api
 
 import (
+	"encoding/json"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,7 +16,7 @@ import (
 func TestGetPricesRendersShippedTable(t *testing.T) {
 	st := newTestStore(t)
 	handler, _, _, _ := newTestAPI(t, st)
-	handler.SetPricing(pricing.NewLoader(filepath.Join(t.TempDir(), "prices.toml")))
+	handler.SetPricing(pricing.NewLoader(filepath.Join(t.TempDir(), "prices.toml"), nil))
 
 	rr := getOK(t, handler, "/api/prices")
 	got := decodeJSON[pricesResponse](t, rr.Body)
@@ -35,7 +37,7 @@ func TestGetPricesReflectsUserOverride(t *testing.T) {
 	}
 	st := newTestStore(t)
 	handler, _, _, _ := newTestAPI(t, st)
-	handler.SetPricing(pricing.NewLoader(path))
+	handler.SetPricing(pricing.NewLoader(path, nil))
 
 	got := decodeJSON[pricesResponse](t, getOK(t, handler, "/api/prices").Body)
 	found := false
@@ -79,7 +81,7 @@ func TestSetPricesWithoutLoaderIs503(t *testing.T) {
 func TestSetPricesWritesOverrideAndRendersIt(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "prices.toml")
 	handler, _, _, _ := newTestAPI(t, newTestStore(t))
-	handler.SetPricing(pricing.NewLoader(path))
+	handler.SetPricing(pricing.NewLoader(path, nil))
 
 	rr := postPrices(t, handler, `{"model":"claude-custom-1","input_rate":0.000003,"output_rate":0.000015}`)
 	if rr.Code != http.StatusOK {
@@ -111,9 +113,72 @@ func TestSetPricesWritesOverrideAndRendersIt(t *testing.T) {
 
 	// And the write is on disk, in the file the Loader is watching -- a fresh
 	// Loader over the same path sees it too.
-	fresh := pricing.NewLoader(path)
+	fresh := pricing.NewLoader(path, nil)
 	if _, ok := fresh.Table()["claude-custom-1"]; !ok {
 		t.Error("the override is not in the file a fresh Loader reads")
+	}
+}
+
+// T5 (API half): a partial POST must not reintroduce an Anthropic-shaped
+// cache-write fee on a model that charges none. The payload builder sends only
+// what was posted, so the file holds input/output alone -- and without the
+// zero-write inheritance, reading it back would price DeepSeek cache writes at
+// 1.25x/2x input, a fee the model does not charge.
+func TestSetPricesPartialPostKeepsZeroWriteRates(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prices.toml")
+	handler, _, _, _ := newTestAPI(t, newTestStore(t))
+	handler.SetPricing(pricing.NewLoader(path, nil))
+
+	rr := postPrices(t, handler, `{"model":"deepseek-flash","input_rate":0.0000002,"output_rate":0.0000008}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+
+	// Read back through a fresh Loader: the claim is about what the written
+	// file now means, and the wired Loader's reload is mtime-driven, whose
+	// resolution is coarser than one test.
+	r, ok := pricing.NewLoader(path, nil).Table()["deepseek-flash"]
+	if !ok {
+		t.Fatal("deepseek-flash missing from the table after the POST")
+	}
+	if r.Source != "user" {
+		t.Errorf("Source = %q, want user", r.Source)
+	}
+	if r.CacheWrite5mRate == nil || r.CacheWrite5mRate.Sign() != 0 {
+		t.Errorf("deepseek cache_write_5m = %v, want 0 (inherited from the shipped row, not re-derived at 1.25x input)", r.CacheWrite5mRate)
+	}
+	if r.CacheWrite1hRate == nil || r.CacheWrite1hRate.Sign() != 0 {
+		t.Errorf("deepseek cache_write_1h = %v, want 0 (inherited from the shipped row, not re-derived at 2x input)", r.CacheWrite1hRate)
+	}
+	if r.Peak == nil {
+		t.Error("Peak = nil after the POST; the written override reverted the model to flat pricing")
+	}
+
+	// The same partial POST on a shipped Claude row keeps the derivation, so
+	// its writes follow the *posted* input rather than the shipped one.
+	rr = postPrices(t, handler, `{"model":"claude-sonnet-5","input_rate":0.000005}`)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	c := pricing.NewLoader(path, nil).Table()["claude-sonnet-5"]
+	if c.InputRate == nil {
+		t.Fatal("claude-sonnet-5 has no input rate after the POST")
+	}
+	for _, w := range []struct {
+		name string
+		got  *big.Rat
+		mult *big.Rat
+	}{
+		{"cache_write_5m", c.CacheWrite5mRate, big.NewRat(5, 4)},
+		{"cache_write_1h", c.CacheWrite1hRate, big.NewRat(2, 1)},
+	} {
+		want := new(big.Rat).Mul(c.InputRate, w.mult)
+		if w.got == nil || w.got.Cmp(want) != 0 {
+			t.Errorf("claude %s = %v, want %v (derived from the posted input, not inherited)", w.name, w.got, want)
+		}
+		if w.got.Sign() == 0 {
+			t.Errorf("claude %s = 0; the shipped zero-write inheritance leaked onto a Claude row", w.name)
+		}
 	}
 }
 
@@ -122,7 +187,7 @@ func TestSetPricesWritesOverrideAndRendersIt(t *testing.T) {
 func TestSetPricesRejectsNegativeAndNonFiniteRates(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "prices.toml")
 	handler, _, _, _ := newTestAPI(t, newTestStore(t))
-	handler.SetPricing(pricing.NewLoader(path))
+	handler.SetPricing(pricing.NewLoader(path, nil))
 
 	for _, body := range []string{
 		`{"model":"claude-custom-1","input_rate":-1}`,
@@ -140,7 +205,7 @@ func TestSetPricesRejectsNegativeAndNonFiniteRates(t *testing.T) {
 
 func TestSetPricesRejectsMalformedBodies(t *testing.T) {
 	handler, _, _, _ := newTestAPI(t, newTestStore(t))
-	handler.SetPricing(pricing.NewLoader(filepath.Join(t.TempDir(), "prices.toml")))
+	handler.SetPricing(pricing.NewLoader(filepath.Join(t.TempDir(), "prices.toml"), nil))
 
 	for _, tc := range []struct{ name, body string }{
 		// A typo'd key must be named, not silently dropped: a dropped rate
@@ -154,5 +219,86 @@ func TestSetPricesRejectsMalformedBodies(t *testing.T) {
 		if rr.Code != http.StatusBadRequest {
 			t.Errorf("%s: status = %d, want 400: %s", tc.name, rr.Code, rr.Body.String())
 		}
+	}
+}
+
+// T16: the rendered row must carry no peak_multiplier, and the rate fields it
+// does carry must POST back cleanly. The round-trip is of the *rate fields*,
+// not the whole row, which is what the dashboard actually sends -- it rebuilds
+// its payload from the rate inputs alone.
+func TestPricesRowRoundTripsWithoutSource(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prices.toml")
+	handler, _, _, _ := newTestAPI(t, newTestStore(t))
+	handler.SetPricing(pricing.NewLoader(path, nil))
+
+	// A DeepSeek row, so the peak window is in play -- the thing whose absence
+	// from the wire this guards.
+	rr := getOK(t, handler, "/api/prices")
+
+	// The wire bytes, not the struct: the guard is about what a client
+	// receives.
+	var raw struct {
+		Models []map[string]json.RawMessage `json:"models"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw response: %v", err)
+	}
+	var rawRow map[string]json.RawMessage
+	for _, m := range raw.Models {
+		var name string
+		if json.Unmarshal(m["model"], &name) == nil && name == "deepseek-flash" {
+			rawRow = m
+			break
+		}
+	}
+	if rawRow == nil {
+		t.Fatal("deepseek-flash is not in GET /api/prices")
+	}
+	if _, ok := rawRow["peak_multiplier"]; ok {
+		t.Error("the rendered price row carries peak_multiplier; Peak is config-derived, so a settable field would silently no-op")
+	}
+
+	var got *priceModel
+	decoded := decodeJSON[pricesResponse](t, rr.Body)
+	for i, m := range decoded.Models {
+		if m.Model == "deepseek-flash" {
+			got = &decoded.Models[i]
+		}
+	}
+	if got == nil {
+		t.Fatal("deepseek-flash missing from the decoded table")
+	}
+
+	// Rebuild the payload from the rate fields alone, the way the dashboard
+	// does. `source` is not among them.
+	payload, err := json.Marshal(map[string]any{
+		"model":               got.Model,
+		"input_rate":          got.InputRate,
+		"output_rate":         got.OutputRate,
+		"cache_write_5m_rate": got.CacheWrite5mRate,
+		"cache_write_1h_rate": got.CacheWrite1hRate,
+		"cache_read_rate":     got.CacheReadRate,
+	})
+	if err != nil {
+		t.Fatalf("Marshal payload: %v", err)
+	}
+	if post := postPrices(t, handler, string(payload)); post.Code != http.StatusOK {
+		t.Errorf("POST of the row's rate fields = %d, want 200: %s", post.Code, post.Body.String())
+	}
+
+	// The negative half, so the guard has teeth: the GET row posted *verbatim*
+	// is a 400 naming "source". This pins the not-client-settable contract
+	// instead of merely tolerating it, and stops a future reader from
+	// "fixing" the 400 by widening setPricesRequest to accept a forged
+	// provenance.
+	verbatim, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("Marshal verbatim row: %v", err)
+	}
+	post := postPrices(t, handler, string(verbatim))
+	if post.Code != http.StatusBadRequest {
+		t.Errorf("POST of the verbatim GET row = %d, want 400 (source is server-derived, not client-settable): %s", post.Code, post.Body.String())
+	} else if !strings.Contains(post.Body.String(), "source") {
+		t.Errorf("400 body %q does not name the offending field `source`", post.Body.String())
 	}
 }

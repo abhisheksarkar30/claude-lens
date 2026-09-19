@@ -93,3 +93,77 @@ func TestClientConfigCheckNoSettingsFile(t *testing.T) {
 		t.Fatalf("clientConfigCheck with no settings.json: status = %v, want PASS", c.Status)
 	}
 }
+
+// doctorRow returns the rendered value of one configuration row, found by
+// field rather than by exact column position -- the row table's padding is not
+// the contract under test.
+func doctorRow(t *testing.T, out, name string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if f := strings.Fields(line); len(f) >= 2 && f[0] == name {
+			return strings.Join(f[1:], " ")
+		}
+	}
+	t.Fatalf("doctor printed no %q row:\n%s", name, out)
+	return ""
+}
+
+// T15: doctor's job is "print effective config", so both keys render their
+// *resolved* value. Printing the raw slice length would print 0 in exactly the
+// state where the shipped default is in force -- the state the row exists to
+// show.
+func TestDoctorPrintsResolvedPeakAndPrefixRows(t *testing.T) {
+	withHome(t)
+	var buf bytes.Buffer
+	if err := runDoctor(nil, &buf); err != nil {
+		t.Fatalf("runDoctor: %v\noutput:\n%s", err, buf.String())
+	}
+	out := buf.String()
+
+	if got := doctorRow(t, out, "peak_off_peak_dates"); got != "33 (default)" {
+		t.Errorf("peak_off_peak_dates = %q, want %q", got, "33 (default)")
+	}
+	if got := doctorRow(t, out, "api_model_prefixes"); got != "deepseek- (default)" {
+		t.Errorf("api_model_prefixes = %q, want %q", got, "deepseek- (default)")
+	}
+}
+
+func TestDoctorPrintsConfiguredPeakAndPrefixRows(t *testing.T) {
+	withHome(t)
+	t.Setenv("CLENS_PEAK_OFF_PEAK_DATES", "2026-01-01,2026-01-02")
+	t.Setenv("CLENS_API_MODEL_PREFIXES", "acme-,globex-")
+
+	var buf bytes.Buffer
+	if err := runDoctor(nil, &buf); err != nil {
+		t.Fatalf("runDoctor: %v\noutput:\n%s", err, buf.String())
+	}
+	out := buf.String()
+
+	if got := doctorRow(t, out, "peak_off_peak_dates"); got != "2" {
+		t.Errorf("peak_off_peak_dates = %q, want %q", got, "2")
+	}
+	if got := doctorRow(t, out, "api_model_prefixes"); got != "acme-, globex-" {
+		t.Errorf("api_model_prefixes = %q, want %q", got, "acme-, globex-")
+	}
+}
+
+// `none` is a real state, not a synonym for unset -- doctor has to be able to
+// tell an operator which one is in force.
+func TestDoctorPrintsNoneForExplicitlyEmptyKeys(t *testing.T) {
+	withHome(t)
+	t.Setenv("CLENS_PEAK_OFF_PEAK_DATES", "none")
+	t.Setenv("CLENS_API_MODEL_PREFIXES", "none")
+
+	var buf bytes.Buffer
+	if err := runDoctor(nil, &buf); err != nil {
+		t.Fatalf("runDoctor: %v\noutput:\n%s", err, buf.String())
+	}
+	out := buf.String()
+
+	if got := doctorRow(t, out, "peak_off_peak_dates"); got != "none" {
+		t.Errorf("peak_off_peak_dates = %q, want %q", got, "none")
+	}
+	if got := doctorRow(t, out, "api_model_prefixes"); got != "none" {
+		t.Errorf("api_model_prefixes = %q, want %q", got, "none")
+	}
+}

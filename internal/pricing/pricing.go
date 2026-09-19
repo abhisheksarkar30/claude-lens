@@ -32,6 +32,38 @@ type Rate struct {
 	FastOutputRate   *big.Rat
 	EffectiveFrom    time.Time
 	Source           string // "shipped" | "provisional" | "user"
+	Peak             *PeakWindow
+}
+
+// PeakWindow describes a model whose rate varies by time of day. A nil
+// *PeakWindow on a Rate means the model is flat-priced, which is why the
+// window is per-Rate and never global: ShippedTable() legitimately mixes
+// flat-priced Anthropic rows with time-varying DeepSeek ones, and an
+// unconditional multiply would double every Claude cost.
+type PeakWindow struct {
+	Multiplier   *big.Rat            // peak = off-peak x Multiplier (DeepSeek: 2)
+	Hours        [][2]int            // [start,end) UTC hour ranges: {{1,4},{6,10}}
+	OffPeakDates map[string]struct{} // "2006-01-02" UTC dates excluded from peak
+}
+
+// IsPeak reports whether at falls in the peak window: UTC, Monday-Friday, not
+// an OffPeakDates date, and inside one of the [start,end) hour ranges. The
+// caller is expected to have checked the window is non-nil.
+func (w *PeakWindow) IsPeak(at time.Time) bool {
+	utc := at.UTC()
+	if d := utc.Weekday(); d == time.Saturday || d == time.Sunday {
+		return false
+	}
+	if _, off := w.OffPeakDates[utc.Format("2006-01-02")]; off {
+		return false
+	}
+	h := utc.Hour()
+	for _, span := range w.Hours {
+		if h >= span[0] && h < span[1] {
+			return true
+		}
+	}
+	return false
 }
 
 // Table is a rate table keyed by model id.
@@ -71,6 +103,12 @@ func (t Table) Compute(model string, usage parse.Usage, speed, serviceTier strin
 	// service_tier == "priority" applies no rate change: the skill bundle
 	// documents no per-token Priority rate, so none is asserted here.
 
+	// Peak is resolved once per call and applied per class, in the same place
+	// batch halving sits: two exact multiplications, one rounding. Multiplying
+	// the already-rounded total instead would drift, the same way it would for
+	// batch (TestComputeBatchRoundsPerClass guards that half).
+	peak := r.Peak != nil && r.Peak.IsPeak(at)
+
 	total := new(big.Rat)
 	for _, class := range []struct {
 		tokens int
@@ -89,6 +127,9 @@ func (t Table) Compute(model string, usage parse.Usage, speed, serviceTier strin
 		if batch {
 			cost.Mul(cost, big.NewRat(1, 2))
 		}
+		if peak {
+			cost.Mul(cost, r.Peak.Multiplier)
+		}
 		total.Add(total, roundHalfUp(cost, centsPerUnit))
 	}
 
@@ -98,6 +139,35 @@ func (t Table) Compute(model string, usage parse.Usage, speed, serviceTier strin
 		source = "approximate:cache_ttl_unknown"
 	}
 	return &f, source
+}
+
+// PeakComputer is an optional refinement of PriceComputer: a pricer that can
+// also report whether a given call fell in a model's peak window. A pricer
+// that does not implement it simply yields no peak_pricing warning.
+//
+// It is a separate interface rather than a third return value on Compute
+// because widening Compute would force an update to both PriceComputer seams
+// and to every fake behind them, for a warning only some pricers can raise.
+// The two call sites type-assert against a local mirror of this method set,
+// the same way they mirror PriceComputer.
+type PeakComputer interface {
+	PeakAt(model string, at time.Time) bool
+}
+
+// The assertion is what keeps this interface honest: without it, a change to
+// either method set would leave PeakComputer describing something nothing
+// implements.
+var (
+	_ PeakComputer = Table{}
+	_ PeakComputer = (*Loader)(nil)
+)
+
+// PeakAt reports whether a call to model at this instant falls in that model's
+// peak window. False for an unknown model and for a flat-priced one, which are
+// the same answer for a caller deciding whether to warn.
+func (t Table) PeakAt(model string, at time.Time) bool {
+	r, ok := t[model]
+	return ok && r.Peak != nil && r.Peak.IsPeak(at)
 }
 
 // roundHalfUp rounds r to the nearest multiple of unit (e.g. 1/100 for
@@ -216,6 +286,20 @@ func LoadOverrides(path string) (Table, error) {
 			}
 			*field(&r) = rate
 		}
+		// A model that bills no cache-write premium must not acquire one here.
+		// The shipped row's zero write rates are inherited ahead of the
+		// derivation, so a partial override on a DeepSeek model keeps writes at
+		// 0 instead of pricing them at 1.25x the override's input. A shipped
+		// Claude row is untouched by this branch, so its writes are still
+		// derived from the *effective* input -- the invariant rate() holds.
+		if w5m, w1h, ok := ZeroWriteShippedRates(model); ok {
+			if r.CacheWrite5mRate == nil {
+				r.CacheWrite5mRate = w5m
+			}
+			if r.CacheWrite1hRate == nil {
+				r.CacheWrite1hRate = w1h
+			}
+		}
 		if r.CacheWrite5mRate == nil && r.InputRate != nil {
 			r.CacheWrite5mRate = new(big.Rat).Mul(r.InputRate, big.NewRat(5, 4))
 		}
@@ -292,6 +376,10 @@ func UnsetOverride(path, model string) error {
 // effect without a restart.
 type Loader struct {
 	path string
+	// offPeakDates is the configured peak-exclusion list: nil means "unset ->
+	// use the shipped default", a non-nil list replaces it wholesale (an empty
+	// one excludes nothing).
+	offPeakDates []string
 
 	mu    sync.Mutex
 	mtime time.Time
@@ -305,19 +393,61 @@ type Loader struct {
 func (l *Loader) Path() string { return l.path }
 
 // NewLoader returns a Loader for the override file at path, performing an
-// initial load immediately.
-func NewLoader(path string) *Loader {
-	l := &Loader{path: path}
+// initial load immediately. offPeakDates is a required argument deliberately:
+// it forces the compiler to enumerate every call site rather than trusting a
+// caller to remember a SetOffPeakDates call.
+func NewLoader(path string, offPeakDates []string) *Loader {
+	l := &Loader{path: path, offPeakDates: offPeakDates}
 	l.reload()
 	return l
 }
 
+// resolvedOffPeakDates is the date set this Loader excludes from peak. A fresh
+// map per call, so no two pricers can share one window's dates.
+func (l *Loader) resolvedOffPeakDates() map[string]struct{} {
+	if l.offPeakDates == nil {
+		return shippedOffPeakDates()
+	}
+	dates := make(map[string]struct{}, len(l.offPeakDates))
+	for _, d := range l.offPeakDates {
+		dates[d] = struct{}{}
+	}
+	return dates
+}
+
 func (l *Loader) reload() {
 	merged := ShippedTable()
+
+	// Which models are time-varying, and the window each ships with, read
+	// before the override merge below replaces whole rows.
+	shippedPeaks := map[string]*PeakWindow{}
+	for model, r := range merged {
+		if r.Peak != nil {
+			shippedPeaks[model] = r.Peak
+		}
+	}
+
 	if overrides, err := LoadOverrides(l.path); err == nil {
 		for model, r := range overrides {
 			merged[model] = r
 		}
+	}
+
+	// Re-take Peak from the shipped row as the final step. An override replaces
+	// the whole Rate and so carries no window; without this,
+	// `clens prices --set deepseek-flash` would silently revert the model to
+	// flat pricing. Taking the window from the *shipped* row -- never the
+	// override, which has none -- is what stops an override clobbering the
+	// configured dates. One place, applied uniformly, which is also why the
+	// POST /api/prices path needs no separate handling.
+	for model, window := range shippedPeaks {
+		r := merged[model]
+		r.Peak = &PeakWindow{
+			Multiplier:   window.Multiplier,
+			Hours:        window.Hours,
+			OffPeakDates: l.resolvedOffPeakDates(),
+		}
+		merged[model] = r
 	}
 
 	l.mu.Lock()
@@ -353,4 +483,10 @@ func (l *Loader) Table() Table {
 // Compute prices usage against the Loader's current table.
 func (l *Loader) Compute(model string, usage parse.Usage, speed, serviceTier string, at time.Time) (*float64, string) {
 	return l.Table().Compute(model, usage, speed, serviceTier, at)
+}
+
+// PeakAt delegates to the Loader's current table, so a call site holding a
+// Loader sees the same peak answer its Compute just used.
+func (l *Loader) PeakAt(model string, at time.Time) bool {
+	return l.Table().PeakAt(model, at)
 }

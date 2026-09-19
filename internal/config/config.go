@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Account is one configured account clens can attribute captured traffic to.
@@ -39,6 +40,12 @@ type Config struct {
 	ReplayEnabled     bool
 	AccountsPath      string
 	Accounts          []Account
+
+	// Both are deliberately absent from Default(): nil means "no key set ->
+	// use the shipped default", which is a distinct state from an explicitly
+	// empty list (the `none` sentinel in applyKV).
+	PeakOffPeakDates []string
+	ApiModelPrefixes []string
 }
 
 // Default returns the built-in defaults.
@@ -95,6 +102,26 @@ var fieldsByEnv = map[string]string{
 	"CLENS_RETENTION_DAYS":      "RetentionDays",
 	"CLENS_REPLAY_ENABLED":      "ReplayEnabled",
 	"CLENS_ACCOUNTS_PATH":       "AccountsPath",
+	"CLENS_PEAK_OFF_PEAK_DATES": "PeakOffPeakDates",
+	"CLENS_API_MODEL_PREFIXES":  "ApiModelPrefixes",
+}
+
+// splitList parses a comma-separated value into a slice, trimming blank
+// entries. The `none` sentinel yields a non-nil empty slice: applyKV skips a
+// blank value entirely, so `none` is the only way a file can say "explicitly
+// empty" rather than "unset".
+func splitList(val string) []string {
+	if val == "none" {
+		return []string{}
+	}
+	parts := strings.Split(val, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func envKV() map[string]string {
@@ -168,6 +195,10 @@ func applyKV(cfg *Config, kv map[string]string) error {
 			cfg.ReplayEnabled, err = strconv.ParseBool(val)
 		case "AccountsPath":
 			cfg.AccountsPath = val
+		case "PeakOffPeakDates":
+			cfg.PeakOffPeakDates = splitList(val)
+		case "ApiModelPrefixes":
+			cfg.ApiModelPrefixes = splitList(val)
 		default:
 			return fmt.Errorf("config: apply: unknown key %q", key)
 		}
@@ -304,6 +335,18 @@ func (c *Config) Validate() error {
 	}
 	if c.RetentionDays < 0 {
 		return fmt.Errorf("config: validate: RetentionDays: must not be negative, got %d", c.RetentionDays)
+	}
+	// A typo'd date silently stays in peak, which over-charges, so it is
+	// rejected here rather than absorbed.
+	for _, d := range c.PeakOffPeakDates {
+		if _, err := time.Parse("2006-01-02", d); err != nil {
+			return fmt.Errorf("config: validate: PeakOffPeakDates: invalid value %q (want YYYY-MM-DD)", d)
+		}
+	}
+	for _, p := range c.ApiModelPrefixes {
+		if strings.TrimSpace(p) == "" {
+			return fmt.Errorf("config: validate: ApiModelPrefixes: empty or whitespace-only prefix")
+		}
 	}
 	return nil
 }

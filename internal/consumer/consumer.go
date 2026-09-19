@@ -332,8 +332,36 @@ func (c *Consumer) processCall(call *sink.CapturedCall) *pendingEvent {
 		})
 	}
 	warnings = append(warnings, c.runAnalyzers(meta, usage, ev)...)
+	if w, ok := peakWarning(c.pricer, ev, call.StartedAt); ok {
+		warnings = append(warnings, w)
+	}
 
 	return &pendingEvent{ev: ev, warnings: warnings}
+}
+
+// peakComputer mirrors pricing.PeakComputer, the way PriceComputer mirrors the
+// same seam: an optional refinement a pricer may or may not implement, so the
+// assertion below is what decides whether a peak_pricing warning is possible
+// at all.
+type peakComputer interface {
+	PeakAt(model string, at time.Time) bool
+}
+
+// peakWarning reports whether ev was billed at a peak rate, as a warning. Two
+// conditions gate it: the pricer must implement peakComputer, and the row must
+// actually be priced -- an unpriced row was never billed at any rate, so
+// claiming it was billed at peak would be a lie.
+func peakWarning(pricer PriceComputer, ev *store.Event, at time.Time) (store.Warning, bool) {
+	pc, ok := pricer.(peakComputer)
+	if !ok || ev.CostSource == "unpriced" || !pc.PeakAt(ev.ModelResolved, at) {
+		return store.Warning{}, false
+	}
+	return store.Warning{
+		Kind:      "peak_pricing",
+		Severity:  "warn",
+		Detail:    fmt.Sprintf("%s billed at peak; the same call off-peak costs less", ev.ModelResolved),
+		CreatedAt: at,
+	}, true
 }
 
 // runAnalyzers runs every registered analyzer, recovering a panic in any

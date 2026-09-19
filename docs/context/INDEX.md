@@ -71,3 +71,20 @@ context docs existed without an index — `architecture.md`, `cost-and-quota.md`
 factual claims was re-checked against the code. One was wrong and is corrected here:
 `storage-schema.md` said "nine tables" and listed ten. The module plan above was produced by the
 skill's stack-detection pass, and each conditional module names the signal that earned it a place.
+
+**2026-09-19 — REFRESH, scoped to `GI-3-deepseek-peak-pricing`** (beads `br-GI-3-01` … `-10`; plan
+`docs/planning/GI-3-deepseek-peak-pricing.md` v9). **No module was added or retired** — the stack,
+the module set, and the decision count are unchanged, so the plan above stands; `decisions/` gained
+no ADR because the merge question is an application of 001, not a new fork, so a bullet went there.
+**Ten module files changed — this index makes eleven — and the rest came back *no changes
+needed*:** `cost-and-quota.md` (peak and
+off-peak, exact money rounded per token class, the third-party zero-write rule, the
+cache-minimum exception list), `storage-schema.md` (23 kinds; the merge that moves `billing_mode`
+with the cost columns), `glossary.md` (five `nonAnalyzeKinds`; peak window, off-peak dates,
+third-party prefix), `build-and-run.md` (two file-and-env-only config keys, and the CRLF caveat
+under `gofmt`), `workflows.md` §2 (the merge's billing rules), `cli-and-tooling.md` (`--rebuild`
+is the re-pricing path), `conventions.md` (the seam-interfaces paragraph, which claimed `api.Store`
+was the codebase's one interface — there are 26, and GI#3 added three), `decisions/001` (the merge
+as the one place the pair can desync), `architecture.md` (its pricing row named a `Cost()` symbol
+that does not exist — the entry point is `Compute()`), and `testing-and-quality.md` (the size
+figures, re-measured).

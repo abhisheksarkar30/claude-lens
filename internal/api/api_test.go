@@ -333,7 +333,7 @@ func TestWriteSeamsAreAssignableAndUnsetIsSupported(t *testing.T) {
 	}
 
 	var calls atomic.Int64
-	handler.SetPricing(pricing.NewLoader(filepath.Join(t.TempDir(), "prices.toml")))
+	handler.SetPricing(pricing.NewLoader(filepath.Join(t.TempDir(), "prices.toml"), nil))
 	handler.SetCredentialWriter(func(name, value string) error { calls.Add(1); return nil })
 	handler.SetAccountWriter(func() error { calls.Add(1); return nil })
 	handler.SetIngestTrigger(func(context.Context) error { calls.Add(1); return nil })

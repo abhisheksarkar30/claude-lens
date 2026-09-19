@@ -47,12 +47,31 @@ func TestAnalyzeCacheBreakpointsExceeded(t *testing.T) {
 // irrelevant; the size is the whole point.
 func bodyOfTokens(n int) []byte { return bytes.Repeat([]byte("x"), n*4) }
 
+// thirdPartyWithoutCacheMinimum names shipped models that have no cited cache
+// minimum, because their endpoint exposes no cache-write billing at all.
+// An explicit, reviewable entry per model rather than a derived predicate:
+// adding another third-party model must stay a visible edit to this literal,
+// not something a heuristic silently absorbs.
+//
+// Production already declines for these models -- minimumCacheablePrefixFor
+// reports not-ok for any model absent from its table, so
+// ruleCachePrefixBelowMinimum never fires for them. This literal makes that
+// decline an explicit claim instead of an implicit side effect.
+var thirdPartyWithoutCacheMinimum = []string{"deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"}
+
 // The rule is only as good as its lookup: a typo'd match string silently
 // disables it for that one model, and no other test would notice. Driven
 // off the shipped price table so a model added there without a minimum
 // here fails loudly instead of quietly going uncovered.
 func TestMinimumCacheablePrefixCoversShippedModels(t *testing.T) {
+	exempt := make(map[string]bool, len(thirdPartyWithoutCacheMinimum))
+	for _, m := range thirdPartyWithoutCacheMinimum {
+		exempt[m] = true
+	}
 	for model := range pricing.ShippedTable() {
+		if exempt[model] {
+			continue
+		}
 		if _, ok := minimumCacheablePrefixFor(model); !ok {
 			t.Errorf("shipped model %q has no minimum cacheable prefix", model)
 		}
