@@ -545,10 +545,15 @@ func TestMergeDerivesBillingModeFromWinningCostColumn(t *testing.T) {
 				t.Fatalf("InsertEvent stored: %v", err)
 			}
 
-			// CaptureComplete with an empty BillingMode: this is the ordering
-			// that made winner = incoming and blanked the stored mode.
+			// CaptureComplete, proxy-sourced, with an empty BillingMode and an
+			// unclassified credential -- exactly the combination
+			// billingModeForAuthKind produces "", and the ordering that made
+			// winner = incoming and blanked the stored mode. (A JSONL row
+			// cannot be the source of an empty mode: the tailer always
+			// resolves one, by account default or by model prefix.)
 			winner := fullEvent("req-merge-billing-empty")
-			winner.Source = "jsonl"
+			winner.Source = "proxy"
+			winner.AuthKind = "unknown"
 			winner.BillingMode = ""
 			winner.CostUSD = tc.winCost
 			winner.ApiEquivalentCostUSD = tc.winEq
