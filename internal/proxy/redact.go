@@ -52,6 +52,12 @@ func redactHeaders(h http.Header) http.Header {
 // sessionKey, or sk-ant-admin… value that redaction should already have
 // removed, so a regression in redactHeaders is caught before traffic
 // flows, not after.
+//
+// No error here ever quotes the value it found. The caller's job is to write
+// the error to a log, and a log is less protected than the database this check
+// exists to keep the value out of -- quoting it would move the credential
+// rather than catch it. The header name and the length are enough to find the
+// row.
 func RedactCheck(headerJSON []byte) error {
 	var h map[string][]string
 	if err := json.Unmarshal(headerJSON, &h); err != nil {
@@ -66,7 +72,7 @@ func RedactCheck(headerJSON []byte) error {
 			switch lname {
 			case "x-api-key", "authorization", "cookie", "sessionkey":
 				if v != redactedValue {
-					return fmt.Errorf("proxy: RedactCheck: header %q is not redacted: %q", name, v)
+					return fmt.Errorf("proxy: RedactCheck: header %q is not redacted (holds %d bytes that should not be there)", name, len(v))
 				}
 			}
 		}

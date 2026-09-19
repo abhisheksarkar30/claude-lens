@@ -54,7 +54,40 @@ func runRefresh(args []string, w io.Writer) error {
 
 	ctx := context.Background()
 	r := ingest.New(st)
+	addCollectors(ctx, r, cfg, st)
 
+	outcomes := r.RunOnce(ctx)
+	failed := false
+	for _, o := range outcomes {
+		if o.Status != "ok" {
+			failed = true
+			fmt.Fprintf(w, "%-8s %-8s FAIL rows=%d %s\n", o.Source, o.Name, o.Rows, o.Error)
+			continue
+		}
+		fmt.Fprintf(w, "%-8s %-8s ok   rows=%d\n", o.Source, o.Name, o.Rows)
+	}
+	if failed {
+		return fmt.Errorf("refresh: one or more sources failed")
+	}
+	return nil
+}
+
+// collectorStore is the write surface every collector needs. Both the bare
+// *store.Store and api.PublishingStore satisfy it structurally; `clens serve`
+// passes the publishing one so a collector's rows also reach the dashboard's
+// SSE feed, while `clens refresh` -- which has no broker -- passes the bare
+// store.
+type collectorStore interface {
+	jsonlogs.Store
+	snapshot.Store
+	adminrep.Store
+}
+
+// addCollectors registers every non-proxy source against r. Shared by
+// `clens refresh` (one-shot, on a timer) and `clens serve` (its scheduler and
+// the dashboard's on-demand trigger) so the two can never drift into
+// different sets of sources.
+func addCollectors(ctx context.Context, r *ingest.Runner, cfg *config.Config, st collectorStore) {
 	tailer := jsonlogs.New(jsonlRoot(), st)
 	tailer.SetPriceTable(pricing.NewLoader(pricing.DefaultPath()))
 	if acct := firstAccount(cfg, "subscription"); acct.Name != "" {
@@ -70,7 +103,7 @@ func runRefresh(args []string, w io.Writer) error {
 	// not a failure" state doctor's secretProtectionCheck and clens
 	// accounts already report. Without this, an install that only ever
 	// set up a JSONL/subscription-only workflow would FAIL every
-	// unattended refresh run on sources nobody asked for.
+	// unattended run on sources nobody asked for.
 	if secret.Exists("sessionKey") {
 		for _, acct := range cfg.Accounts {
 			if acct.BillingMode != "subscription" {
@@ -95,21 +128,6 @@ func runRefresh(args []string, w io.Writer) error {
 			return res.Rows, nil
 		}))
 	}
-
-	outcomes := r.RunOnce(ctx)
-	failed := false
-	for _, o := range outcomes {
-		if o.Status != "ok" {
-			failed = true
-			fmt.Fprintf(w, "%-8s %-8s FAIL rows=%d %s\n", o.Source, o.Name, o.Rows, o.Error)
-			continue
-		}
-		fmt.Fprintf(w, "%-8s %-8s ok   rows=%d\n", o.Source, o.Name, o.Rows)
-	}
-	if failed {
-		return fmt.Errorf("refresh: one or more sources failed")
-	}
-	return nil
 }
 
 // adaptResult adapts a fail-soft (Result, error)-returning Poll method to
@@ -132,7 +150,7 @@ func adaptResult(poll func(context.Context) (snapshot.Result, error)) ingest.Col
 // last run (its own "until" becomes this run's "since"), falling back to a
 // 30-day lookback on a first run -- the same "empty cursor means start of
 // history" convention internal/jsonlogs' cursor.go uses.
-func adminWindow(ctx context.Context, st *store.Store) (since, until time.Time) {
+func adminWindow(ctx context.Context, st collectorStore) (since, until time.Time) {
 	until = time.Now().UTC()
 	since = until.Add(-30 * 24 * time.Hour)
 	if s, ok, err := st.GetIngestState(ctx, "admin:usage"); err == nil && ok {
