@@ -86,6 +86,12 @@ main { padding: 20px; }
 
 .view[hidden] { display: none; }
 
+/* 72px is the single-row .app-header height: the sticky header would otherwise
+   cover the ‹ all calls control, which is the first element of the detail a
+   drill-down scrolls to. A header that wraps to two rows is taller than 72px
+   and can still overlap the control; that ceiling is recorded in the plan's R4. */
+#call-detail, #session-detail { scroll-margin-top: 72px; }
+
 .cards { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
 
 .card {
