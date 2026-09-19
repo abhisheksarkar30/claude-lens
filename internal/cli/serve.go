@@ -144,6 +144,50 @@ func Serve(args []string) error {
 	})
 	go ingest.NewScheduler(runner, collectorInterval).Run(ctx)
 
+	// The two read seams br-GI-1-18 adds. They are seams for the same reason
+	// the write ones are: a collector's health lives in internal/ingest and an
+	// account's plan in internal/config, and internal/api may import neither.
+	dashAPI.SetSourceHealth(func(ctx context.Context) ([]api.SourceHealth, error) {
+		health, err := runner.SourcesHealth(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]api.SourceHealth, 0, len(health))
+		for _, h := range health {
+			out = append(out, api.SourceHealth{
+				Source:        string(h.Source),
+				Status:        h.Status,
+				LastSuccessAt: atOrNil(h.LastSuccessAt),
+				LastErrorAt:   atOrNil(h.LastErrorAt),
+				// The error text is the collector's own and never contains a
+				// credential: every collector error in this repo is built from
+				// a status code, a URL and a parse failure (see internal/ingest).
+				LastError:      h.LastError,
+				RowsWritten:    h.RowsWritten,
+				CursorPosition: h.CursorPosition,
+			})
+		}
+		return out, nil
+	})
+	// Accounts and credentials both read internal/secret's presence/LastUsed
+	// only. Get is never called on this path, so a credential's value has no
+	// route from the secrets file to the dashboard.
+	dashAPI.SetAccounts(func(context.Context) (api.Accounts, error) {
+		accts := api.Accounts{
+			List: make([]api.Account, 0, len(cfg.Accounts)),
+			Credentials: map[string]api.Credential{
+				"sessionKey": credentialState("sessionKey"),
+				"admin":      credentialState("admin"),
+			},
+		}
+		for _, acct := range cfg.Accounts {
+			accts.List = append(accts.List, api.Account{
+				Name: acct.Name, BillingMode: acct.BillingMode, Plan: acct.Plan,
+			})
+		}
+		return accts, nil
+	})
+
 	dashSrv := &http.Server{Addr: cfg.DashboardAddr, Handler: dashAPI}
 
 	printBanner(os.Stdout, cfg)
@@ -261,6 +305,27 @@ func purgeOnStartup(ctx context.Context, st *store.Store, days int, logf func(st
 func reloadAccounts() error {
 	_, err := config.Load(nil)
 	return err
+}
+
+// atOrNil converts ingest's non-pointer timestamps to the API's nullable
+// ones. A collector that has never succeeded records the zero time; the
+// dashboard must render that as "never", not as the year 1.
+func atOrNil(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+// credentialState is presence and last-use for one slot. It calls Exists and
+// LastUsed and never Get: the value is what this whole package arrangement
+// exists to keep out of the dashboard.
+func credentialState(name string) api.Credential {
+	c := api.Credential{Present: secret.Exists(name)}
+	if used := secret.LastUsed(name); !used.IsZero() {
+		c.LastUsed = &used
+	}
+	return c
 }
 
 // printBanner prints the copy-pasteable ANTHROPIC_BASE_URL line, the dashboard

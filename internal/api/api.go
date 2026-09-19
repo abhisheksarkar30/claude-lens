@@ -6,13 +6,20 @@
 // Slice A of br-GI-1-16; the write routes (POST /api/prices,
 // /api/requests/{id}/replay), the injected write seams, the Origin/Host
 // allowlist and internal/web's asset mount are Slice B. br-GI-1-18 adds eight
-// more routes on top.
+// more routes on top: five reads (sources, quota, accounts, models,
+// reconcile) and three writes (accounts, secrets, ingest).
 //
 // Credential containment (br-GI-1-16 test 18) is a mechanical property of this
 // package, not a review habit: it never imports internal/secret. A route that
 // has to write a credential reaches the write through an injected seam
 // (SetCredentialWriter and friends), so there is no import edge a future
 // handler could accidentally use to read one back.
+//
+// The same containment applies to internal/config and internal/ingest, which
+// are the two other packages a route here would otherwise have to import
+// (asserted by internal/cli/serve_test.go). GET /api/sources and
+// GET /api/accounts read through SetSourceHealth and SetAccounts for exactly
+// that reason.
 package api
 
 import (
@@ -53,6 +60,11 @@ type Store interface {
 	StatsByModel(ctx context.Context, f store.EventFilter) ([]store.ModelStats, error)
 	StatsByPeriod(ctx context.Context, f store.EventFilter, granularity string) ([]store.PeriodStats, error)
 	StatsByCostSource(ctx context.Context, f store.EventFilter) ([]store.CostSourceStats, error)
+
+	// br-GI-1-18's two additions. Both were already on *store.Store; they
+	// were absent here only because no route read them yet.
+	ListQuotaSnapshots(ctx context.Context, account string, limit int) ([]store.QuotaSnapshot, error)
+	ListAdminCostDays(ctx context.Context, since, until time.Time) ([]store.AdminCostDay, error)
 }
 
 type api struct {
@@ -91,6 +103,19 @@ type api struct {
 	credentialWriter func(name, value string) error
 	accountWriter    func() error
 	ingestTrigger    func(ctx context.Context) error
+
+	// The two read seams br-GI-1-18 adds. They exist for the same
+	// containment reason as the write seams above, one layer out: a
+	// collector's health lives in internal/ingest and an account's plan in
+	// internal/config, and this package may import neither. So /api/sources
+	// and /api/accounts are declared against api-local types and the
+	// composition root converts.
+	//
+	// Unlike the write seams, an unwired read seam is not silently empty --
+	// an empty source list and a broken one look identical in a UI. Both
+	// routes answer 503 instead, and the tab shows the error.
+	sourceHealth func(ctx context.Context) ([]SourceHealth, error)
+	accounts     func(ctx context.Context) (Accounts, error)
 }
 
 // SetPricing wires GET/POST /api/prices to loader's table and override file.
@@ -108,6 +133,16 @@ func (a *api) SetAccountWriter(fn func() error) { a.accountWriter = fn }
 
 // SetIngestTrigger wires the route that runs every collector once to fn.
 func (a *api) SetIngestTrigger(fn func(ctx context.Context) error) { a.ingestTrigger = fn }
+
+// SetSourceHealth wires GET /api/sources to fn, which reads per-collector
+// health out of internal/ingest. Leaving it unset is supported: the route
+// answers 503 rather than an empty list.
+func (a *api) SetSourceHealth(fn func(ctx context.Context) ([]SourceHealth, error)) { a.sourceHealth = fn }
+
+// SetAccounts wires GET /api/accounts (and the subscription half of
+// GET /api/quota) to fn, which reads the configured accounts out of
+// internal/config. Unset is supported: both routes answer 503.
+func (a *api) SetAccounts(fn func(ctx context.Context) (Accounts, error)) { a.accounts = fn }
 
 // ServeHTTP delegates to the stored mux, so *api satisfies http.Handler.
 func (a *api) ServeHTTP(w http.ResponseWriter, r *http.Request) { a.mux.ServeHTTP(w, r) }
@@ -144,6 +179,18 @@ func New(st Store, sk *sink.Sink, cons *consumer.Consumer, broker *Broker, asset
 	mux.HandleFunc("/api/health", methodGet(a.health))
 	mux.HandleFunc("/api/prices", methodGet(a.getPrices))
 	mux.HandleFunc("POST /api/prices", a.setPrices)
+
+	// br-GI-1-18. The five reads are methodGet-wrapped; the three writes each
+	// run originReject before anything else (see secrets.go).
+	mux.HandleFunc("/api/sources", methodGet(a.sources))
+	mux.HandleFunc("/api/quota", methodGet(a.quota))
+	mux.HandleFunc("/api/accounts", methodGet(a.listAccounts))
+	mux.HandleFunc("/api/models", methodGet(a.models))
+	mux.HandleFunc("/api/reconcile", methodGet(a.reconcile))
+	mux.HandleFunc("POST /api/accounts", a.saveAccounts)
+	mux.HandleFunc("POST /api/secrets", a.setSecret)
+	mux.HandleFunc("POST /api/ingest", a.triggerIngest)
+
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 	a.mux = mux
 	return a

@@ -7,9 +7,10 @@
 // Wire-format note: store.Event/Session/Warning and the stats shapes carry no
 // JSON tags, so their keys are the Go field names ("ID", "TotalPromptTokens",
 // "ApiEquivalentCostUSD"). The api-local response types (statsResponse,
-// pricesResponse, healthResponse) DO carry tags, so those keys are lowercase.
-// Mixing the two up is the one easy mistake here; each render below names the
-// keys it expects.
+// pricesResponse, healthResponse, sourcesResponse, quotaResponse,
+// reconcileResponse, modelsResponse) DO carry tags, so those keys are
+// lowercase — and snake_case, not Go's casing. Mixing the two up is the one
+// easy mistake here; each render below names the keys it expects.
 
 const $ = (id) => document.getElementById(id);
 
@@ -32,6 +33,13 @@ function fmtTime(iso) {
   const d = new Date(iso);
   if (isNaN(d)) return '--';
   return d.toLocaleString();
+}
+
+// fmtPct renders a percentage that is allowed to be absent. Utilization against
+// a limit nobody configured is exactly that case, and it must not print as 0%.
+function fmtPct(v) {
+  if (v === null || v === undefined) return '--';
+  return Number(v).toFixed(1) + '%';
 }
 
 function esc(s) {
@@ -72,16 +80,18 @@ function setStatus(text, isError) {
 
 // table renders rows into a container. cols is [{head, cell}], and an empty
 // row set renders the label rather than an empty box, so "no data" never looks
-// like "still loading".
-function table(container, cols, rows, emptyLabel) {
+// like "still loading". rowClass is optional: it returns a class for a row, or
+// '' for none, which is how the Sources tab paints a dead collector red.
+function table(container, cols, rows, emptyLabel, rowClass) {
   if (!rows || rows.length === 0) {
     container.innerHTML = '<p class="muted">' + esc(emptyLabel || 'nothing here yet') + '</p>';
     return;
   }
   const head = cols.map((c) => '<th>' + esc(c.head) + '</th>').join('');
-  const body = rows.map((r) => {
+  const body = rows.map((r, i) => {
     const tds = cols.map((c) => '<td>' + c.cell(r) + '</td>').join('');
-    return '<tr>' + tds + '</tr>';
+    const cls = rowClass ? rowClass(r, i) : '';
+    return '<tr' + (cls ? ' class="' + esc(cls) + '"' : '') + '>' + tds + '</tr>';
   }).join('');
   container.innerHTML = '<table><thead><tr>' + head + '</tr></thead><tbody>' + body + '</tbody></table>';
 }
@@ -304,8 +314,7 @@ function wrap(rows, what, empty) {
 // Inline SVG rather than a charting library because a library is a build step
 // or a CDN, both of which embed.go's rationale rules out. It charts request
 // COUNT only: height is a ratio, and the two cost columns are different
-// billing models that must never be summed onto one axis (invariant 5). The
-// real charts land in br-GI-1-18.
+// billing models that must never be summed onto one axis (invariant 5).
 function chartByPeriod(periods) {
   if (!periods.length) return '';
   const w = 640, h = 120, gap = 2;
@@ -320,6 +329,190 @@ function chartByPeriod(periods) {
   }).join('');
   return '<h3>Requests per period</h3><svg class="chart" viewBox="0 0 ' + w + ' ' + h +
     '" preserveAspectRatio="none" role="img" aria-label="requests per period">' + bars + '</svg>';
+}
+
+// ------------------------------------------------------------ view: sources
+
+// loadSources is the tab that makes "it is collecting" checkable. One row per
+// source, and a source that errored gets a red row -- not an absent one.
+//
+// A collector that has never run reports status "unknown" and null timestamps.
+// That is neither health nor failure, so it is neither red nor dated: the
+// status cell says unknown and last-success says "never".
+async function loadSources() {
+  const { body } = await api('/api/sources');
+  table($('sources-table'), [
+    { head: 'source', cell: (s) => esc(s.source) },
+    { head: 'status', cell: (s) => '<span class="status-' + esc(s.status) + '">' + esc(s.status) + '</span>' },
+    { head: 'last success', cell: (s) => (s.last_success_at ? esc(fmtTime(s.last_success_at)) : 'never') },
+    { head: 'last error', cell: (s) => (s.last_error_at ? esc(fmtTime(s.last_error_at)) : '--') },
+    { head: 'rows written', cell: (s) => fmtInt(s.rows_written) },
+    { head: 'cursor', cell: (s) => (s.cursor_position ? mono(s.cursor_position) : '--') },
+    { head: 'reason', cell: (s) => esc(s.last_error || '--') },
+  ], body.sources || [], 'no collectors have reported yet — run `clens ingest`',
+    (s) => (s.status === 'error' ? 'row-bad' : ''));
+}
+
+// -------------------------------------------------------------- view: quota
+
+// loadQuota renders one block per subscription account. Limits arrive as query
+// params because nothing else configures them (internal/api/quota.go), so the
+// two inputs here are the whole limit configuration.
+//
+// A percentage is rendered only when the route says limit_state is
+// "configured". Otherwise the cell states the literal "unconfigured" -- the
+// alternative, a percentage of an invented ceiling, is the one figure this tab
+// must never show.
+async function loadQuota() {
+  const q = new URLSearchParams();
+  document.querySelectorAll('#view-quota [data-window]').forEach((el) => {
+    const v = el.value.trim();
+    if (v) q.set('limit_' + el.dataset.window, v);
+  });
+  const { body } = await api('/api/quota' + (q.toString() ? '?' + q.toString() : ''));
+  const accounts = body.accounts || [];
+  if (!accounts.length) {
+    $('quota-body').innerHTML = '<p class="muted">no subscription account is configured</p>';
+    return;
+  }
+
+  $('quota-body').innerHTML = accounts.map((a) => {
+    // Rebuilt rather than appended to a real container, so the table() helper's
+    // empty-label still applies: give it a throwaway node, then read it back.
+    const holder = document.createElement('div');
+    table(holder, [
+      { head: 'window', cell: (r) => esc(r.window) },
+      { head: 'tokens burned', cell: (r) => fmtInt(r.tokens) },
+      { head: 'requests', cell: (r) => fmtInt(r.requests) },
+      { head: 'limit', cell: (r) => (r.limit_state === 'configured' ? fmtInt(r.limit) : '<span class="muted">unconfigured</span>') },
+      { head: 'of limit', cell: (r) => (r.limit_state === 'configured' ? fmtPct(r.utilization_pct) : '--') },
+      { head: 'approaching', cell: (r) => (r.limit_state === 'configured' ? (r.approaching ? 'yes' : 'no') : '--') },
+      { head: 'last snapshot', cell: (r) => (r.last_snapshot
+        ? esc(fmtTime(r.last_snapshot.observed_at)) + ' ' + fmtPct(r.last_snapshot.utilization_pct)
+        : '<span class="muted">never polled</span>') },
+    ], a.windows || [], 'no window rows', (r) => (r.approaching ? 'row-warn' : ''));
+
+    const learned = (a.calibration || []).map((c) =>
+      '<li>' + esc(c.window) + ': ' + fmtInt(c.tokens_at_100) + ' tokens reached 100% on ' +
+      esc(fmtTime(c.observed_at)) + '</li>').join('');
+
+    return '<h2>' + esc(a.account) + (a.plan ? ' <span class="muted">' + esc(a.plan) + '</span>' : '') + '</h2>' +
+      chartQuota(a.windows || []) +
+      holder.innerHTML +
+      (learned ? '<h3>Candidate limits (offered, not applied)</h3><ul>' + learned + '</ul>' : '');
+  }).join('');
+}
+
+// chartQuota draws tokens burned per rolling window, with each window's
+// configured limit as a dashed line when there is one. Bars are scaled to the
+// tallest of (our burn, the configured limit), so a limit line lands inside the
+// box instead of clipping. With no limit the bars are scaled to our own
+// measurements alone -- a ratio of what was observed, which is all there is,
+// and it invents no ceiling.
+function chartQuota(windows) {
+  if (!windows || !windows.length) return '';
+  const w = 640, h = 120, gap = 8;
+  const bw = (w - gap * (windows.length - 1)) / windows.length;
+  const top = Math.max.apply(null, windows.map((r) => Math.max(r.tokens, r.limit || 0))) || 1;
+  const bars = windows.map((r, i) => {
+    const x = i * (bw + gap);
+    const bh = Math.max(1, Math.round((r.tokens / top) * (h - 24)));
+    let s = '<rect class="' + (r.approaching ? 'bar-warn' : '') + '" x="' + x.toFixed(1) +
+      '" y="' + (h - bh) + '" width="' + bw.toFixed(1) + '" height="' + bh + '"><title>' +
+      esc(r.window) + ': ' + fmtInt(r.tokens) + ' tokens</title></rect>';
+    if (r.limit_state === 'configured' && r.limit > 0) {
+      const ly = h - Math.max(1, Math.round((r.limit / top) * (h - 24)));
+      s += '<line class="limit-line" x1="' + x.toFixed(1) + '" x2="' + (x + bw).toFixed(1) +
+        '" y1="' + ly + '" y2="' + ly + '"><title>limit: ' + fmtInt(r.limit) + ' tokens</title></line>';
+    }
+    s += '<text class="chart-label" x="' + (x + bw / 2).toFixed(1) + '" y="' + (h - 6) + '">' +
+      esc(r.window) + '</text>';
+    return s;
+  }).join('');
+  return '<svg class="chart auto" viewBox="0 0 ' + w + ' ' + h + '" role="img" ' +
+    'aria-label="tokens burned per rolling window">' + bars + '</svg>';
+}
+
+// ---------------------------------------------------------- view: reconcile
+
+// loadReconcile shows the two sources' figures side by side, never combined.
+// computed and billed are different sources' answers about the same usage, so
+// they are two labelled series on one scale -- not two halves of a total
+// (invariant 5). A row with no computed figure draws only the billed bar;
+// there is no zero to draw, and a zero-height bar would claim there is.
+async function loadReconcile() {
+  const { body } = await api('/api/reconcile');
+  const rows = body.rows || [];
+  $('reconcile-scope').textContent = body.scope || '';
+
+  cards($('reconcile-cards'), [
+    { label: 'drift threshold', value: fmtUSD(body.threshold_usd) },
+    { label: 'rows compared', value: fmtInt(rows.length) },
+    { label: 'drifted', value: fmtInt(rows.filter((r) => r.cost_drift).length) },
+    { label: 'source mismatches', value: fmtInt(body.source_mismatch_count) },
+  ]);
+  $('reconcile-chart').innerHTML = chartReconcile(rows);
+
+  table($('reconcile-table'), [
+    { head: 'day', cell: (r) => esc(fmtTime(r.day)) },
+    { head: 'model', cell: (r) => esc(r.model) },
+    { head: 'computed (ours)', cell: (r) => fmtUSD(r.computed_usd) },
+    { head: 'billed (admin)', cell: (r) => fmtUSD(r.billed_usd) },
+    { head: 'diverged', cell: (r) => fmtUSD(r.diverged_usd) },
+    { head: 'drift', cell: (r) => (r.cost_drift ? 'yes' : 'no') },
+  ], rows, 'nothing billed yet — the Admin cost report is the billing side',
+    (r) => (r.cost_drift ? 'row-bad' : ''));
+}
+
+// chartReconcile draws computed and billed as two bars per row. Both series
+// share one scale, so the two heights are directly comparable, and they are
+// never stacked: stacking would draw a sum neither source reports. Only a row
+// with a computed figure gets a computed bar.
+function chartReconcile(rows) {
+  const drawable = (rows || []).filter((r) => r.billed_usd || r.computed_usd !== null);
+  if (!drawable.length) return '';
+  const w = 640, h = 140, gap = 10;
+  const slot = (w - gap * (drawable.length - 1)) / drawable.length;
+  const bw = Math.max(3, (slot - 4) / 2);
+  const top = Math.max.apply(null, drawable.map((r) => Math.max(r.billed_usd || 0, r.computed_usd || 0))) || 1;
+  const bars = drawable.map((r, i) => {
+    const x = i * (slot + gap);
+    const scale = (v) => Math.max(1, Math.round((v / top) * (h - 26)));
+    let s = '<rect x="' + x.toFixed(1) + '" y="' + (h - scale(r.billed_usd)) + '" width="' + bw.toFixed(1) +
+      '" height="' + scale(r.billed_usd) + '"><title>billed ' + esc(fmtUSD(r.billed_usd)) + '</title></rect>';
+    if (r.computed_usd !== null && r.computed_usd !== undefined) {
+      s += '<rect class="sw-computed" x="' + (x + bw + 2).toFixed(1) + '" y="' + (h - scale(r.computed_usd)) +
+        '" width="' + bw.toFixed(1) + '" height="' + scale(r.computed_usd) + '"><title>computed ' +
+        esc(fmtUSD(r.computed_usd)) + '</title></rect>';
+    }
+    s += '<text class="chart-label" x="' + (x + slot / 2).toFixed(1) + '" y="' + (h - 8) + '">' +
+      esc(r.model.replace(/^claude-/, '').slice(0, 10)) + '</text>';
+    return s;
+  }).join('');
+  return '<h3>Computed vs billed</h3><div class="legend">' +
+    '<span><svg class="sw" viewBox="0 0 10 10"><rect width="10" height="10"/></svg>billed (admin report)</span>' +
+    '<span><svg class="sw" viewBox="0 0 10 10"><rect class="sw-computed" width="10" height="10"/></svg>computed (ours)</span>' +
+    '</div><svg class="chart auto" viewBox="0 0 ' + w + ' ' + h + '" role="img" ' +
+    'aria-label="computed versus billed cost per day and model">' + bars + '</svg>';
+}
+
+// --------------------------------------------------------------- view: models
+
+// loadModels lists every model the catalogue knows plus every one traffic used,
+// each with a coverage label. An unpriced model is a labelled gap: this table
+// has no cost column at all, so there is no cell a $0.00 could land in.
+async function loadModels() {
+  const { body } = await api('/api/models');
+  table($('models-table'), [
+    { head: 'model', cell: (m) => esc(m.model) + (m.display_name ? ' <span class="muted">' + esc(m.display_name) + '</span>' : '') },
+    { head: 'known from', cell: (m) => esc(m.source) },
+    { head: 'pricing', cell: (m) => '<span class="label-' + esc(m.pricing) + '">' + esc(m.pricing) + '</span>' +
+        (m.rate_source && m.rate_source !== m.pricing ? ' <span class="muted">' + esc(m.rate_source) + '</span>' : '') },
+    { head: 'requests', cell: (m) => fmtInt(m.requests) },
+    { head: 'priced', cell: (m) => fmtInt(m.priced_count) },
+    { head: 'unpriced', cell: (m) => fmtInt(m.unpriced_count) },
+  ], body.models || [], 'the catalogue is empty',
+    (m) => (m.pricing === 'unpriced' && m.requests > 0 ? 'row-warn' : ''));
 }
 
 // ----------------------------------------------------------- view: settings
@@ -412,6 +605,10 @@ const loaders = {
   sessions: loadSessions,
   warnings: loadWarnings,
   stats: loadStats,
+  sources: loadSources,
+  quota: loadQuota,
+  reconcile: loadReconcile,
+  models: loadModels,
   settings: loadSettings,
 };
 
@@ -474,6 +671,28 @@ $('calls-next').addEventListener('click', () => {
   loadCalls();
 });
 $('s-apply').addEventListener('click', loadStats);
+$('q-apply').addEventListener('click', loadQuota);
+
+// The collect button is the one place the dashboard makes outbound calls (to
+// claude.ai and the Admin API) rather than reading what is already stored, so
+// it is a button and not something a view load does on its own. Re-reading
+// /api/sources afterwards is what proves the run happened -- and shows a
+// collector that failed during it as the red row it is.
+$('src-collect').addEventListener('click', async (ev) => {
+  ev.target.disabled = true;
+  setStatus('collecting…');
+  try {
+    await api('/api/ingest', { method: 'POST' });
+    setStatus('');
+  } catch (err) {
+    // A 500 here means the run finished with a failing collector, whose detail
+    // is on the table below. The status line says so rather than swallowing it.
+    setStatus(err.message, true);
+  } finally {
+    ev.target.disabled = false;
+    await loadSources();
+  }
+});
 
 // The header totals come from the same stats call the Overview uses, minus the
 // 24h window: they are all-time, which is what a header total should be.

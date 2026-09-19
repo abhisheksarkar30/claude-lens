@@ -10,6 +10,11 @@
   --fg: #e6e8ec;
   --muted: #8b93a1;
   --accent: #7aa2f7;
+  /* A second series colour, for the one chart that draws two sources side by
+     side (Reconcile). Two series that had to share a colour would be one
+     series drawn twice. */
+  --accent-2: #9ece6a;
+  --warn: #d7a53f;
   --error: #f7768e;
 }
 
@@ -21,6 +26,8 @@
     --fg: #1b1f27;
     --muted: #667085;
     --accent: #2f5fd0;
+    --accent-2: #3f7d20;
+    --warn: #8a6100;
     --error: #b4232f;
   }
 }
@@ -142,3 +149,38 @@ svg.chart {
 }
 svg.chart rect { fill: var(--accent); }
 svg.chart rect:hover { opacity: 0.7; }
+
+/* A viewBox already carries the aspect ratio, so a chart whose intrinsic
+   height is not 120 lets the box follow it rather than letterboxing. */
+svg.chart.auto { height: auto; }
+svg.chart rect.bar-warn { fill: var(--warn); }
+svg.chart rect.sw-computed { fill: var(--accent-2); }
+svg.chart .limit-line { stroke: var(--muted); stroke-dasharray: 4 3; stroke-width: 1; }
+svg.chart .chart-label { fill: var(--muted); font-size: 10px; text-anchor: middle; }
+
+.legend { display: flex; gap: 16px; color: var(--muted); font-size: 12px; margin: 4px 0; }
+.legend span { display: flex; align-items: center; gap: 5px; }
+.legend svg.sw { width: 10px; height: 10px; }
+.legend svg.sw rect { fill: var(--accent); }
+.legend svg.sw rect.sw-computed { fill: var(--accent-2); }
+
+/* A labelled state, never a blank cell: "we have no rate for this" and "this
+   rate carries a caveat" are claims the cells have to make out loud. */
+.label-priced { color: var(--accent-2); }
+.label-unpriced { color: var(--error); }
+.label-provisional { color: var(--warn); }
+
+.status-ok { color: var(--accent-2); }
+.status-error { color: var(--error); }
+.status-unknown { color: var(--muted); }
+
+/* The Sources tab's whole point: a collector that failed is a red row. A
+   warning row (approaching a limit, traffic on an unpriced model) is amber --
+   worth noticing, not a failure. */
+.row-bad td { background: rgba(247, 118, 142, 0.12); }
+.row-warn td { background: rgba(215, 165, 63, 0.12); }
+
+/* Prose in a right-aligned tail column reads badly, so the two tables that end
+   in a reason/snapshot cell opt that cell back to the left. */
+#sources-table td:nth-child(7),
+#quota-body td:nth-child(7) { text-align: left; }
