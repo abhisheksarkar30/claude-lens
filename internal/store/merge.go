@@ -188,11 +188,11 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	// preferNonEmpty like its neighbours. It is the one column a cross-source
 	// merge is expected to contradict: the JSONL tailer resolves it per row by
 	// model prefix, so re-ingesting a DeepSeek call flips it subscription ->
-	// api. Since existing.BillingMode is always non-empty, preferNonEmpty could
-	// never apply that flip, and the merge would write the incoming priced
-	// cost_usd onto a row still marked subscription -- exactly the pair
-	// invariant 5 forbids, silently, because TestBillingModeInvariants covered
-	// the insert path only.
+	// api. Since existing.BillingMode is non-empty for every row reachable
+	// today, preferNonEmpty could never apply that flip, and the merge would
+	// write the incoming priced cost_usd onto a row still marked subscription
+	// -- exactly the pair invariant 5 forbids, silently, because
+	// TestBillingModeInvariants covered the insert path only.
 	//
 	// Account above stays preferNonEmpty deliberately: it is a column the JSONL
 	// tailer structurally cannot supply (the JSONL line carries no auth
@@ -202,10 +202,46 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	//
 	// Known gap: a merge whose two sides genuinely disagree on the mode (a
 	// credential resolving to subscription on a prefix-api model) now takes the
-	// incoming side's mode and is not surfaced. auth_kind_anomaly fires on
+	// winner's mode and is not surfaced. auth_kind_anomaly fires on
 	// api_key + subscription, which is a different case, and this change
 	// removes the only production path that produced its trigger.
 	merged.BillingMode = winner.BillingMode
+	// The winner's capture could not classify its credential, so it hands over
+	// no mode -- billing_modeForAuthKind returns "" for anything authkind.go
+	// does not recognize. Assigning it unconditionally would blank a non-empty
+	// stored mode, and an empty mode matches none of the three aggregates'
+	// CASE WHEN billing_mode = 'api' / 'subscription' branches, so the row
+	// would silently drop out of every cost total.
+	//
+	// Invariant 5 carries a figure's billing model in the column it lives in,
+	// so derive the label from the column the winner actually priced. Both
+	// cold-path pricers route cost by
+	// `switch ev.BillingMode { case "subscription": ApiEquivalentCostUSD;
+	// default: CostUSD }`, so an empty mode already means "the money went to
+	// cost_usd". The label follows the money.
+	//
+	// Adopting the loser's mode instead -- the obvious-looking repair -- is
+	// worse than the defect: it pairs the winner's CostUSD with a subscription
+	// label, which is the very invariant-5 violation this function was changed
+	// to remove, and it contributes 0 to both aggregates anyway because the
+	// subscription sum reads the column the winner left NULL.
+	if merged.BillingMode == "" {
+		switch {
+		case winner.CostUSD != nil:
+			merged.BillingMode = "api"
+		case winner.ApiEquivalentCostUSD != nil:
+			merged.BillingMode = "subscription"
+		default:
+			// The winner priced nothing, so there is no cost column for an
+			// adopted label to contradict -- the risk that rules the loser's
+			// mode out above is absent here. Keep the stored mode rather than
+			// blanking it: an empty mode drops the row out of every
+			// billing_mode-keyed grouping for no gain, and a DeepSeek call the
+			// proxy could not classify should keep the JSONL row's
+			// prefix-derived api.
+			merged.BillingMode = existing.BillingMode
+		}
+	}
 
 	// The columns A (proxy) structurally cannot supply.
 	merged.ClientVersion = preferNonEmpty(existing.ClientVersion, incoming.ClientVersion)

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strconv"
 	"testing"
 )
 
@@ -474,6 +475,135 @@ func TestMergeMovesBillingModeWithCost(t *testing.T) {
 	if got.ApiEquivalentCostUSD != nil {
 		t.Errorf("ApiEquivalentCostUSD = %v, want nil (invariant 5: the two are never both set)", *got.ApiEquivalentCostUSD)
 	}
+}
+
+// T9c: the winner can hand over no mode at all. billingModeForAuthKind returns
+// "" for a credential authkind.go does not classify, so a capture-complete proxy
+// row can carry an empty mode -- and every cost aggregate matches on
+// billing_mode = 'api' / 'subscription', so a blanked mode drops the row out of
+// every total. The label follows the money instead: the winner's populated cost
+// column names it. The session totals are asserted, not just the row, because
+// invisibility in the totals is the harm and that is where it shows.
+func TestMergeDerivesBillingModeFromWinningCostColumn(t *testing.T) {
+	cases := []struct {
+		name            string
+		storedMode      string
+		storedCost      *float64
+		storedEq        *float64
+		winCost         *float64
+		winEq           *float64
+		winSource       string
+		wantMode        string
+		wantCost        *float64
+		wantEq          *float64
+		wantSessionCost *float64
+		wantSessionEq   *float64
+	}{
+		{
+			name:            "winner priced cost_usd: the cost names it api, not the stored subscription",
+			storedMode:      "subscription",
+			storedEq:        f64(0.42),
+			winCost:         f64(0.42),
+			winSource:       "shipped",
+			wantMode:        "api",
+			wantCost:        f64(0.42),
+			wantSessionCost: f64(0.42),
+		},
+		{
+			name:          "winner priced api_equivalent_cost_usd: subscription",
+			storedMode:    "api",
+			storedCost:    f64(0.42),
+			winEq:         f64(0.30),
+			winSource:     "shipped",
+			wantMode:      "subscription",
+			wantEq:        f64(0.30),
+			wantSessionEq: f64(0.30),
+		},
+		{
+			name:       "winner priced nothing: the stored mode survives rather than blanking",
+			storedMode: "subscription",
+			storedEq:   f64(0.42),
+			winSource:  "unpriced",
+			wantMode:   "subscription",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			ctx := context.Background()
+
+			stored := fullEvent("req-merge-billing-empty")
+			stored.BillingMode = tc.storedMode
+			stored.CostUSD = tc.storedCost
+			stored.ApiEquivalentCostUSD = tc.storedEq
+			if err := st.UpsertSession(ctx, stored.SessionID, "", stored.StartedAt); err != nil {
+				t.Fatalf("UpsertSession: %v", err)
+			}
+			id, _, err := st.InsertEvent(ctx, stored)
+			if err != nil {
+				t.Fatalf("InsertEvent stored: %v", err)
+			}
+
+			// CaptureComplete with an empty BillingMode: this is the ordering
+			// that made winner = incoming and blanked the stored mode.
+			winner := fullEvent("req-merge-billing-empty")
+			winner.Source = "jsonl"
+			winner.BillingMode = ""
+			winner.CostUSD = tc.winCost
+			winner.ApiEquivalentCostUSD = tc.winEq
+			winner.CostSource = tc.winSource
+			id2, _, err := st.InsertEvent(ctx, winner)
+			if err != nil {
+				t.Fatalf("InsertEvent winner: %v", err)
+			}
+			if id2 != id {
+				t.Fatalf("merge produced a new row: %d vs %d", id, id2)
+			}
+
+			got, err := st.GetEvent(ctx, id)
+			if err != nil {
+				t.Fatalf("GetEvent: %v", err)
+			}
+			if got.BillingMode != tc.wantMode {
+				t.Errorf("BillingMode = %q, want %q", got.BillingMode, tc.wantMode)
+			}
+			if !sameF64(got.CostUSD, tc.wantCost) {
+				t.Errorf("CostUSD = %v, want %v", ptrStr(got.CostUSD), ptrStr(tc.wantCost))
+			}
+			if !sameF64(got.ApiEquivalentCostUSD, tc.wantEq) {
+				t.Errorf("ApiEquivalentCostUSD = %v, want %v", ptrStr(got.ApiEquivalentCostUSD), ptrStr(tc.wantEq))
+			}
+			if got.CostUSD != nil && got.ApiEquivalentCostUSD != nil {
+				t.Errorf("both cost columns set (invariant 5: the two are never both set)")
+			}
+
+			sess, err := st.GetSession(ctx, "s_1")
+			if err != nil {
+				t.Fatalf("GetSession: %v", err)
+			}
+			if !sameF64(sess.TotalCostUSD, tc.wantSessionCost) {
+				t.Errorf("session TotalCostUSD = %v, want %v", ptrStr(sess.TotalCostUSD), ptrStr(tc.wantSessionCost))
+			}
+			if !sameF64(sess.TotalApiEquivalentCostUSD, tc.wantSessionEq) {
+				t.Errorf("session TotalApiEquivalentCostUSD = %v, want %v", ptrStr(sess.TotalApiEquivalentCostUSD), ptrStr(tc.wantSessionEq))
+			}
+		})
+	}
+}
+
+func sameF64(got, want *float64) bool {
+	if got == nil || want == nil {
+		return got == nil && want == nil
+	}
+	return *got == *want
+}
+
+func ptrStr(p *float64) string {
+	if p == nil {
+		return "nil"
+	}
+	return strconv.FormatFloat(*p, 'f', -1, 64)
 }
 
 // T9: an incomplete incoming capture wins nothing, so billing_mode is
