@@ -594,25 +594,31 @@ func (s *Store) Vacuum(ctx context.Context) error {
 // (jsonlogs), a last-fetched window (adminrep), or a last-poll marker
 // (snapshot). Value is the collector's own encoding; Status/Error are
 // collector-defined progress signals for doctor/dashboard surfacing, never
-// interpreted by the store itself.
+// interpreted by the store itself. UpdatedAt is this row's last write time,
+// which br-GI-1-14's health surface reads as "last success"/"last error"
+// depending on which key (a collector's own cursor key, or one of the
+// ingest package's separate health:* keys) it was read from.
 type IngestState struct {
-	Value  string
-	Status string
-	Error  string
+	Value     string
+	Status    string
+	Error     string
+	UpdatedAt time.Time
 }
 
 // GetIngestState reads key's stored cursor. ok is false when the key has
 // never been written -- a collector's first poll, not an error.
 func (s *Store) GetIngestState(ctx context.Context, key string) (IngestState, bool, error) {
 	var st IngestState
-	err := s.db.QueryRowContext(ctx, `SELECT value, status, error FROM ingest_state WHERE key = ?`, key).
-		Scan(&st.Value, &st.Status, &st.Error)
+	var updatedAt int64
+	err := s.db.QueryRowContext(ctx, `SELECT value, status, error, updated_at FROM ingest_state WHERE key = ?`, key).
+		Scan(&st.Value, &st.Status, &st.Error, &updatedAt)
 	if err == sql.ErrNoRows {
 		return IngestState{}, false, nil
 	}
 	if err != nil {
 		return IngestState{}, false, fmt.Errorf("store: GetIngestState: %w", err)
 	}
+	st.UpdatedAt = timeFromNano(updatedAt)
 	return st, true, nil
 }
 
