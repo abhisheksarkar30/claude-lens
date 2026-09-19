@@ -88,3 +88,22 @@ was the codebase's one interface — there are 26, and GI#3 added three), `decis
 as the one place the pair can desync), `architecture.md` (its pricing row named a `Cost()` symbol
 that does not exist — the entry point is `Compute()`), and `testing-and-quality.md` (the size
 figures, re-measured).
+
+**2026-09-19 — REFRESH, scoped to `GI-5-call-detail-drilldown`** (beads `br-GI-5-01` … `-03`; plan
+`docs/planning/GI-5-call-detail-drilldown.md` v6.1). **No module was added or retired** — no new
+dependency, route, entity, or build step, so the plan above stands and `decisions/` gained no ADR —
+the drill-down's design record is the plan's own D1–D10.
+**Three module files changed — this index makes four:** `dashboard.md` (the two-mode Calls and
+Sessions pattern, the `reveal`/`show` split, the `detailSeq` generation token, the corrected route
+rows and asset line counts), `decisions/006-dashboard-with-no-build-step.md` (its list of
+`TestAssets*` guards read as a closed set of three; GI#5 added three more, and the list now defers to
+`dashboard.md`'s table), and `testing-and-quality.md` (the size figures, re-measured). Everything
+else came back *no changes needed*.
+
+**One claim was caught by this refresh rather than by the story's own review**, and it is worth
+naming because of how it got there: `dashboard.md`'s `detailSeq` paragraph — hand-written during
+GI#5 — said the token is compared "after every `await`". It is not. In the `[data-call]` catch,
+`setStatus` runs after `await show('calls')` with no re-check, and cannot be re-checked with the
+same token, because `show` bumps the generation itself. The plan's D10 already records that ceiling;
+the doc did not, and an overclaim in a doc whose whole job is telling an agent which guard is
+load-bearing is exactly the failure this tree exists to prevent. Corrected in place.

@@ -80,12 +80,16 @@ and the pager hide with it.
 - **A session drill-down switches no view** (D8): Sessions is already on screen, so the detail
   replaces the sessions list in place.
 - **`detailSeq` is a generation token**, taken by `reveal` and by each drill-down, and compared after
-  every `await` in `showCall` / `showSession` and in both `catch` branches. A response whose
-  generation is no longer current is dropped rather than rendered, success and failure alike — a
-  stale *rejection* would otherwise run the fail-open fallback and snap the view back to a tab the
-  user had already left (D10). This is a deliberate exception to the derive-don't-track rule above:
-  the mode still derives from `hidden`, but *which* pending response is allowed to set it needs a
-  sequence.
+  each detail fetch resolves (`showCall`, `showSession`) and at the top of both `catch` branches. A
+  response whose generation is no longer current is dropped rather than rendered, success and
+  failure alike — a stale *rejection* would otherwise run the fail-open fallback and snap the view
+  back to a tab the user had already left (D10). One effect is deliberately unguarded, so do not
+  read the guard as total: in the `[data-call]` catch, `setStatus` runs *after* `await show('calls')`
+  and nothing re-checks the generation there — it cannot, because `show` bumps `detailSeq` itself,
+  so a re-check would always fail and the fallback would never report its error at all. The plan's
+  D10 records that ceiling, its width, and why it self-corrects. The token is a deliberate exception
+  to the derive-don't-track rule above: the mode still derives from `hidden`, but *which* pending
+  response is allowed to set it needs a sequence.
 
 ## The three charts
 

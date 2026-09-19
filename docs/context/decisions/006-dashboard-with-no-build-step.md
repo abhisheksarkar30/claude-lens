@@ -25,8 +25,9 @@ npm, no `package.json`, no bundler.
 - **The no-build-step rule is enforced by tests, not by convention**, because with no bundler there
   is nothing else to catch a broken reference:
   `TestAssetsEveryLookupHasAMount`, `TestAssetsTheFourNewTabsHaveTheirMountPoints`, and
-  `TestAssetsChartsAreInlineSVG` (see [../dashboard.md](../dashboard.md)). A chart that loses its
-  `<title>` labels, or a tab whose mount point disappears, fails a test.
+  `TestAssetsChartsAreInlineSVG` are the oldest, and GI#5's drill-down added three more — the
+  current set is tabulated in [../dashboard.md](../dashboard.md) rather than repeated here. A chart
+  that loses its `<title>` labels, or a tab whose mount point disappears, fails a test.
 - Adding a real frontend framework is a design change, not a refactor — it would reverse this
   decision and the two above it.
 - Because there is no framework, escaping is manual: every interpolated value passes through `esc()`,

@@ -9,9 +9,9 @@
 | Unit + integration | Go's stdlib `testing` only — no assertion library, no mocking framework | `*_test.go` beside the code | [go.mod](../../go.mod) has no test dependency |
 | End-to-end | none — no suite; one recorded manual run instead | [docs/acceptance.md](../acceptance.md) | the doc states which half could not be run |
 
-**50 test files, 12,794 lines** against 13,895 lines of non-test Go (re-measured at
-`GI-3-deepseek-peak-pricing`; the file count is unchanged because GI#3 added tests to existing
-files rather than new ones). Real components are used
+**50 test files, 13,010 lines** against 13,895 lines of non-test Go (re-measured at
+`GI-5-call-detail-drilldown`; the file count is unchanged since GI#3 because both stories added
+tests to existing files rather than new ones). Real components are used
 rather than mocked: tests open a real temp SQLite store, run a real `httptest.Server` upstream, and
 drive the real `ServeMux`.
 
