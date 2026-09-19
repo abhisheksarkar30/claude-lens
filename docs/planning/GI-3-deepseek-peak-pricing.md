@@ -1,6 +1,6 @@
 # GI-3 — DeepSeek peak/off-peak pricing and third-party rate support
 
-**Ticket**: GI#3 · **Branch**: `GI-3-deepseek-peak-pricing` · **Base**: `main` · **Plan version**: 7 · **Status**: polished (Phase 4) — re-review pending
+**Ticket**: GI#3 · **Branch**: `GI-3-deepseek-peak-pricing` · **Base**: `main` · **Plan version**: 8 · **Status**: converged
 
 Problem statement: [issue #3](https://github.com/abhisheksarkar30/claude-lens/issues/3).
 
@@ -623,12 +623,13 @@ hide it.
 | `internal/pricing/pricing_test.go` | Update for the new constructor; add the peak tests below |
 | `internal/config/config.go` | 2 fields (both **`nil` in `Default()`** = "use shipped default"; the prefix default resolves via `pricing.ShippedAPIModelPrefixes()`), 2 `fieldsByEnv` entries, 2 `applyKV` cases, `Validate` date/prefix check, `none` sentinel |
 | `internal/config/config_test.go` | New-key parse + reject cases |
-| `internal/jsonlogs/jsonlogs.go` | Per-row account/billing resolution by model prefix; `SetModelBilling(prefixes, apiAccount, apiBillingMode)`; the **`PeakComputer`** assertion + `peak_pricing` attach in **`insert`** ([jsonlogs.go:366-381](internal/jsonlogs/jsonlogs.go#L366-L381), the site that owns the warnings slice — not `buildEvent`) (F2.7) |
+| `internal/jsonlogs/jsonlogs.go` | Per-row account/billing resolution by model prefix; `SetModelBilling(prefixes, apiAccount, apiBillingMode)`; the **`PeakComputer`** assertion + `peak_pricing` attach in **`insert`** ([jsonlogs.go:366-381](internal/jsonlogs/jsonlogs.go#L366-L381), the site that owns the warnings slice — not `buildEvent`) (F2.7); plus the read-only `Account()`/`ModelBilling()` accessors (D5, v7) |
 | `internal/jsonlogs/jsonlogs_test.go` | Prefix routing test; `insert`-path `peak_pricing` test |
 | `internal/cli/refresh.go` | Wire off-peak dates + the **resolved** prefixes through `newPriceLoader(cfg)` / `resolvedAPIPrefixes(cfg)` (F3.2) + api-account source; **`addCollectors` builds its tailer through the shared `newTailer(cfg, jsonlRoot(), st)`** (escalation (b)); **call `cfg.Validate()` in `runRefresh`** — before `addCollectors` is reached — since only `runRefresh` returns an error and can refuse a malformed date (F5.2) |
 | `internal/cli/ingest.go` | Same wiring through the shared `newPriceLoader`/`resolvedAPIPrefixes` helpers, which **live here beside `firstAccount`** ([ingest.go:70](internal/cli/ingest.go#L70)) so all three sites can reach them (F3.2); **hosts `newTailer(cfg, root, st)`** — the pure-extract helper that collapses the tailer-construction block, **root passed explicitly** so `runIngest`'s `root` and `refresh`'s `jsonlRoot()` stay distinct (escalation (b), **lands before the D5 wiring bead**); **call `cfg.Validate()`** |
 | `internal/cli/serve.go`, `internal/cli/prices.go`, `internal/cli/models.go` | `NewLoader` call sites (6 production calls across these 5 files); **`serve.go:101` builds the consumer's loader via `newPriceLoader(cfg)`** — the same helper (and so the same resolved value) `addCollectors` gives the tailer, so two pricers in one process cannot disagree (F2.4, F3.2), though it carries **no** prefix resolution (the consumer resolves from `AuthKind`). The three **display-only** sites — `models.go:34`, `prices.go:50`, `prices.go:94` — pass **`nil`** for the new second argument: the shipped list is what a display-only loader wants, and `runPrices` never loads config at all ([prices.go:26-31](internal/cli/prices.go#L26-L31)), so it has no `cfg` to pass (F4.4) |
 | `internal/cli/doctor.go` | Add `peak_off_peak_dates` + `api_model_prefixes` to the config table, each **resolved before printing** (`33 (default)`/`none`/`N`; `deepseek- (default)`/`none`/list) (F2.5) |
+| `internal/cli/cli_test.go` | The `newTailer` guard case read through `Account()` (**T18**, br-GI-3-06 / bead 4b); **T14** read through `ModelBilling()` (br-GI-3-07) (D5, v7) |
 | `internal/api/prices.go` | The partial-`Rate` builder inherits write rates **only from a zero-write shipped row** (F2.2). **No `peak_multiplier`** field on the row or on `setPricesRequest` (F2.6 — `Peak` is config-derived, so the field would silently no-op *and* break the GET→POST round-trip, which decodes with `DisallowUnknownFields`) |
 | `internal/api/api_test.go`, `internal/api/prices_test.go` | `NewLoader` call-site updates (7 sites); plus a zero-write-inheritance behavioural case on the POST builder — a shipped zero-write row, not the no-shipped-row `claude-custom-1` fixture (T5, F5.3) |
 | `internal/store/merge.go` | D6 fix — `BillingMode` moves with `winner` (only) |
@@ -665,6 +666,7 @@ interface beside it rather than widening it), `Table.Compute`'s signature,
 | T12 | `readme_test.go` passes unchanged — proving the new kind's spelling, severity, and emitted-by cell all agree | D8 bookkeeping |
 | T13 | A **custom one-date** off-peak list plus an override on `deepseek-flash` still excludes exactly that one date (the override does **not** revert the model to the shipped 33); `none` still yields no exclusions (F2.3 ordering) | D4 ordering |
 | T14 | **Assert the prefix wiring on `newTailer` itself, through the `ModelBilling()` accessor (D5, v7).** `newTailer(cfg, root, st)` with neither key set reports `{"deepseek-"}`, `""`, `"api"`; with `CLENS_API_MODEL_PREFIXES=acme-` it reports `{"acme-"}` — so "resolved, not raw" is pinned in both directions, and the helper is proven to consume the resolver rather than a hand-rolled list. `resolvedAPIPrefixes`'s own nil→shipped contract stays br-GI-3-05's T10; T14 pins that the wiring **uses** it, which an assertion on `SetModelBilling` alone could not. `Serve()`/`addCollectors` remain unreachable and are still not asserted. (Reframed twice: per F4.2, `newPriceLoader(cfg)` is a pure function of `cfg`, so "two `newPriceLoader(cfg)` instances price a call identically" **cannot fail** and evidences nothing — that clause is dropped. Per v7, the read-only accessors replace the previous "assert on the helpers, not on the wiring" framing, which made T14 evidence nothing about the two tailer sites.) | D5/F2.4 wiring |
+| T18 | **The `acct.Name != ""` guard, read through the `Account()` accessor (D5, v7).** `newTailer(cfg, root, st)` on a config with **no** subscription account reports `("", "subscription")`; on a config **with** one it reports that account's name and billing mode. Deleting the guard makes the first case read `("", "")` — so the regression fails a test instead of depending on a reviewer spotting it in a diff. **Owned by br-GI-3-06 (bead 4b)** — the guard is part of the block that bead moves. This is the *`Account()`* half and is deliberately **not** folded into T14: T14 is br-GI-3-07's wiring case on `ModelBilling()`, a different test for a different bead (F7.2). | D5 guard (br-GI-3-06, F5.1) |
 | T15 | `clens doctor` prints `33 (default)` and `deepseek- (default)` when both keys are unset, and `none`/`N` (and the joined list) when set (F2.5) | D4 doctor rendering |
 | T16 | GET a model row and **POST it back verbatim → 200** (no `400` naming an unknown field); the row carries no `peak_multiplier` (F2.6) | D-API round-trip |
 | T17 | **Deterministic freshness guard — must not depend on `-race`.** Build a loader with a **non-default** date list (e.g. exactly one date) and assert (a) `ShippedTable()`'s DeepSeek `Peak.OffPeakDates` is still the shipped 33 dates, and (b) a **second** loader built with a *different* list resolves independently — neither the first loader's resolved window nor the shared-window hazard can pass. `go test ./...` does not enable `-race`, so a race-detector-only guard would fail never (F3.1) | D4 freshness (F3.1) |
@@ -794,7 +796,7 @@ Ordering is load-bearing: **the merge fix (D6) must land before the backfill (D7
 
 1. `perMTok` → decimal string; `rateExact`; mechanical Claude-row update — *foundation, no behaviour change*
 2. `PeakWindow` + `IsPeak` + `Rate.Peak` + peak in `Compute` + `reload()` re-take of `Peak` and the resolved-list final step **into a freshly-built window** (T17's freshness guard) + zero-write-guarded write-rate inheritance in `LoadOverrides`/API (D1, D2, R4, F2.2/F2.3/F3.1)
-3. DeepSeek shipped rows + the 2026 holiday list and `ShippedAPIModelPrefixes()` (single home in `table.go`, **fresh window per `ShippedTable()` call**, **copy** on return) + per-row citation + `NewLoader` signature + the 9 `internal/*` test call sites (D3, D4, F2.1/F3.1, F5.4)
+3. DeepSeek shipped rows + the 2026 holiday list and `ShippedAPIModelPrefixes()` (single home in `table.go`, **fresh window per `ShippedTable()` call**, **copy** on return) + per-row citation + `NewLoader` signature + the 9 `internal/*` test call sites + **`analyze` test scoping (R3)** — the third-party exception list for the minimum-prefix coverage test, **owned here deliberately** (br-GI-3-03): the DeepSeek rows land in this same bead, so the exception list must land with them or that suite is red for every bead in between (D3, D4, F2.1/F3.1, F5.4, F7.4)
 4. Config keys (nil = shipped default), `Validate` (date + prefix), `none` sentinel, the new `Validate()` calls in `ingest`/`refresh`, **`newPriceLoader`/`resolvedAPIPrefixes` helpers (homed beside `firstAccount`) with all three sites — `serve.go:101`, `addCollectors`, `runIngest` — routed through them**, `doctor` table rows (resolved rendering) (D4, F2.4, F2.5, F3.2)
 4b. **`newTailer` — pure extract (escalation (b)).** Collapse the tailer-construction block — `jsonlogs.New(root, st)`, `SetPriceTable(newPriceLoader(cfg))`, and the subscription step **moved verbatim, guard included**:
 
@@ -807,7 +809,7 @@ Ordering is load-bearing: **the merge fix (D6) must land before the backfill (D7
     — into one helper, homed beside the D4 helpers, **taking the root as an explicit parameter** — `newTailer(cfg, root, st)` — because `runIngest`'s `root` and `addCollectors`' `jsonlRoot()` are distinct expressions and only one is the settled default; a helper that resolved the root internally would silently drop ingest's. **`SetModelBilling` is out of this bead's scope — it joins in bead 5.** The bead **does** add one read-only `Account()` accessor (D5, v7): it changes no behaviour, but it means 4b's diff is no longer *only* a move — stated here rather than left to be noticed. The two callers keep their own drive logic (`resetJSONLCursors` + one `Poll` in `runIngest`; collector registration in `addCollectors`) — **only construction collapses**. **Behaviour-preserving: the moved block is a pure move, guard included** (F5.1 — the `acct.Name != ""` guard is part of the moved block, so the extraction cannot silently re-route billing). Lands **before** bead 5 so that bead's diff shows only the semantic change and stays bisectable. (F4.2 standing-watch — escalation resolved as option (b))
 5. JSONL per-row billing routing + api-account wiring (D5) — the `SetModelBilling(resolvedAPIPrefixes(cfg), …)` attach joins `newTailer` (bead 4b), so the wiring lands in one place rather than mirrored per site
 6. `mergeEvents` `BillingMode` move + merge-path invariant test (D6, T8/T9/T9b)
-7. API/CLI surface + `analyze` test scoping (R3) + backfill documentation (D7)
+7. API/CLI surface + backfill documentation (D7)
 8. `peak_pricing` warning: optional `PeakComputer` interface, both call sites (consumer + JSONL **`insert`**), kind + README row + the "Four of these" → "**Five**" prose **with the enumeration grown to five** (D8, T11/T12, F2.7/F2.8/F3.3)
 
 ---
@@ -1027,3 +1029,51 @@ it after it had converged at v6.
   T5's API half to br-GI-3-09, which specifies no such test, leaving the
   `internal/api/prices.go` change verified only by "it compiles"; it is asserted in
   br-GI-3-04 now. Remaining items were prose and line-number NITs.
+
+### v8 — round-7 review (2026-09-19)
+
+Findings F7.1, F7.2, F7.4 from `review/round-7/critique.md`, applied under binding
+conductor overrides (each refined the critique's suggested fix). All three JUSTIFIED;
+no earlier round's error is implied — round 7 verified the v7 delta and found no
+contradiction between the plan and the code it cites. Both changes are **bookkeeping
+in §4/§5/§9**, not design: the v7 design (the two accessors, reframed T14) is
+unchanged.
+
+- **F7.1** — §4's `internal/jsonlogs/jsonlogs.go` row now names the v7 read-only
+  `Account()`/`ModelBilling()` accessors, and §4 gains an `internal/cli/cli_test.go`
+  row (the guard case via `Account()`, **T18**; T14 via `ModelBilling()`), so the
+  per-file inventory the beads derive from records the file v7 adds real tests to.
+  Both halves applied — the conductor's override required the `cli_test.go` row, not
+  the accessor clause alone.
+- **F7.2** — §5 gains **T18**, its own row (not folded into T14): the
+  `acct.Name != ""` guard read through `Account()`, **owned by br-GI-3-06 (bead 4b)**.
+  T14 remains br-GI-3-07's `ModelBilling()` wiring case — different test, different
+  bead. The conductor's override fixes the ID as **T18** and requires the owning bead
+  be stated so bead 4b can cite it.
+- **F7.4** — §9 item 7 no longer claims `analyze` test scoping (R3); it moves to item
+  3, **br-GI-3-03**, recording the reason: the DeepSeek rows land in that same bead, so
+  the exception list must land with them or the minimum-prefix coverage suite is red in
+  between. §4's own `analyze_test.go` row was already correct and is unchanged.
+
+Deferred to the bead owner (`develop-story`), **not** plan defects and **not** applied:
+F7.3 (br-GI-3-05's `resolvedAPIPrefixes`/unhomed integration assertions belong in
+`internal/cli/cli_test.go`, which its Files to Touch omits) and F7.5 (br-GI-3-06:72-73
+and br-GI-3-07:127 carry contradicting ownership sentences for `Account()`/
+`ModelBilling()`). See `review/round-7/changelog.md`; no compensating text was added to
+any plan section for either.
+
+### v8 — round-7/8 review: converged (2026-09-19)
+
+Round 7 reviewed the v7 delta and returned 5 findings, **0 MAJOR** — both v7 design
+changes (the two accessors, the reframed T14) cleared as written; the five were
+bookkeeping in §4/§5/§9. Round 8 then verified the v7→v8 edits and returned
+`VERDICT: NO_FURTHER_FINDINGS` — **0 findings** (`review/round-8/critique.md`). No
+design section moved in either round, so the design is **unchanged from v8**. The header
+now carries **`Status: converged`** again: the plan is final at **v8** and ready for
+beadification.
+
+F7.3 (br-GI-3-05's `resolvedAPIPrefixes`/unhomed integration assertions) and F7.5
+(br-GI-3-06:72-73 and br-GI-3-07:127 carrying contradicting ownership sentences for
+`Account()`/`ModelBilling()`) remain **deferred bead-side** to the bead owner
+(`develop-story`) by human decision — not plan defects, and no compensating text was
+added to any plan section for either.
