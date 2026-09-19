@@ -141,6 +141,35 @@ func (t Table) Compute(model string, usage parse.Usage, speed, serviceTier strin
 	return &f, source
 }
 
+// PeakComputer is an optional refinement of PriceComputer: a pricer that can
+// also report whether a given call fell in a model's peak window. A pricer
+// that does not implement it simply yields no peak_pricing warning.
+//
+// It is a separate interface rather than a third return value on Compute
+// because widening Compute would force an update to both PriceComputer seams
+// and to every fake behind them, for a warning only some pricers can raise.
+// The two call sites type-assert against a local mirror of this method set,
+// the same way they mirror PriceComputer.
+type PeakComputer interface {
+	PeakAt(model string, at time.Time) bool
+}
+
+// The assertion is what keeps this interface honest: without it, a change to
+// either method set would leave PeakComputer describing something nothing
+// implements.
+var (
+	_ PeakComputer = Table{}
+	_ PeakComputer = (*Loader)(nil)
+)
+
+// PeakAt reports whether a call to model at this instant falls in that model's
+// peak window. False for an unknown model and for a flat-priced one, which are
+// the same answer for a caller deciding whether to warn.
+func (t Table) PeakAt(model string, at time.Time) bool {
+	r, ok := t[model]
+	return ok && r.Peak != nil && r.Peak.IsPeak(at)
+}
+
 // roundHalfUp rounds r to the nearest multiple of unit (e.g. 1/100 for
 // cents), rounding a tie up. r and unit are always non-negative here (token
 // counts and rates never go negative), so exact-integer round-half-up is
@@ -454,4 +483,10 @@ func (l *Loader) Table() Table {
 // Compute prices usage against the Loader's current table.
 func (l *Loader) Compute(model string, usage parse.Usage, speed, serviceTier string, at time.Time) (*float64, string) {
 	return l.Table().Compute(model, usage, speed, serviceTier, at)
+}
+
+// PeakAt delegates to the Loader's current table, so a call site holding a
+// Loader sees the same peak answer its Compute just used.
+func (l *Loader) PeakAt(model string, at time.Time) bool {
+	return l.Table().PeakAt(model, at)
 }

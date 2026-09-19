@@ -744,3 +744,39 @@ func TestLoadersResolveOffPeakDatesIndependently(t *testing.T) {
 		t.Errorf("loader A now excludes %d dates, want 1 (a shared window would let B overwrite A)", n)
 	}
 }
+
+// PeakComputer's contract: true at a peak instant for a model that has a
+// window, false for a flat-priced model and for an unknown one. The last two
+// are the same answer because a caller only ever asks in order to decide
+// whether to warn, and neither case warrants one.
+func TestPeakAtContract(t *testing.T) {
+	table := ShippedTable()
+	peakAt := fixtureInstant(t, 2026, time.September, 21, 2, 0, time.Monday)
+	offAt := fixtureInstant(t, 2026, time.September, 21, 0, 30, time.Monday)
+
+	for _, c := range []struct {
+		name  string
+		model string
+		at    time.Time
+		want  bool
+	}{
+		{"shipped window, peak instant", "deepseek-flash", peakAt, true},
+		{"shipped window, off peak", "deepseek-flash", offAt, false},
+		{"flat-priced model at a peak instant", "claude-sonnet-5", peakAt, false},
+		{"unknown model at a peak instant", "claude-nonesuch-9", peakAt, false},
+	} {
+		if got := table.PeakAt(c.model, c.at); got != c.want {
+			t.Errorf("Table.PeakAt(%s): %s = %v, want %v", c.model, c.name, got, c.want)
+		}
+	}
+
+	// The Loader delegates to its current table, so a call site holding one
+	// gets the same peak answer its Compute just used.
+	loader := NewLoader(filepath.Join(t.TempDir(), "prices.toml"), nil)
+	if !loader.PeakAt("deepseek-flash", peakAt) {
+		t.Error("(*Loader).PeakAt at a peak instant = false, want true")
+	}
+	if loader.PeakAt("claude-sonnet-5", peakAt) {
+		t.Error("(*Loader).PeakAt on a flat-priced model = true, want false")
+	}
+}

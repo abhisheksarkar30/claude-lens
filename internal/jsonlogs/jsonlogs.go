@@ -60,6 +60,30 @@ type PriceComputer interface {
 	Compute(model string, usage parse.Usage, speed, serviceTier string, at time.Time) (usd *float64, costSource string)
 }
 
+// peakComputer mirrors pricing.PeakComputer, the way PriceComputer mirrors the
+// same seam: an optional refinement a pricer may or may not implement, so the
+// assertion is what decides whether a peak_pricing warning is possible at all.
+type peakComputer interface {
+	PeakAt(model string, at time.Time) bool
+}
+
+// peakWarning reports whether ev was billed at a peak rate, as a warning. Two
+// conditions gate it: the pricer must implement peakComputer, and the row must
+// actually be priced -- an unpriced row was never billed at any rate, so
+// claiming it was billed at peak would be a lie (invariant 5).
+func peakWarning(pricer PriceComputer, ev *store.Event) (store.Warning, bool) {
+	pc, ok := pricer.(peakComputer)
+	if !ok || ev.CostSource == "unpriced" || !pc.PeakAt(ev.ModelResolved, ev.StartedAt) {
+		return store.Warning{}, false
+	}
+	return store.Warning{
+		Kind:      "peak_pricing",
+		Severity:  "warn",
+		Detail:    fmt.Sprintf("%s billed at peak; the same call off-peak costs less", ev.ModelResolved),
+		CreatedAt: ev.StartedAt,
+	}, true
+}
+
 // Tailer walks a Claude Code projects directory and ingests every
 // distinct request found there through the same cold-path steps a proxy
 // row goes through in internal/consumer -- session, cost, analyzer -- via
@@ -417,6 +441,11 @@ func (t *Tailer) insert(ctx context.Context, ev *store.Event, meta parse.Meta, u
 	var warnings []store.Warning
 	for _, a := range t.analyzers {
 		warnings = append(warnings, t.runAnalyzer(a, meta, usage, ev)...)
+	}
+	// Attached here rather than in buildEvent, which returns no warnings slice
+	// to append to.
+	if w, ok := peakWarning(t.pricer, ev); ok {
+		warnings = append(warnings, w)
 	}
 	if len(warnings) > 0 {
 		if err := t.st.UpsertWarnings(ctx, id, warnings); err != nil {

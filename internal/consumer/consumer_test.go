@@ -551,3 +551,58 @@ func waitForEvents(t *testing.T, st *store.Store, want int) []*store.Event {
 		}
 	}
 }
+
+// T11 (consumer path): the same three cases as the tailer's, through the
+// consumer's own pricing block. Asserted separately because the attach is a
+// second call site -- one implementation covering only the tailer would leave
+// every proxied call without the warning.
+func TestConsumerAttachesPeakPricingWarning(t *testing.T) {
+	// 2026-09-21 is a Monday; the shipped window is [01:00,04:00) UTC.
+	peakAt := time.Date(2026, time.September, 21, 2, 0, 0, 0, time.UTC)
+	offAt := time.Date(2026, time.September, 21, 0, 30, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name  string
+		model string
+		at    time.Time
+		want  bool
+	}{
+		{"priced at peak", "deepseek-flash", peakAt, true},
+		{"priced off peak", "deepseek-flash", offAt, false},
+		{"unpriced at peak", "claude-nonesuch-9", peakAt, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			sk := sink.New(sink.DefaultCapacity)
+			c := New(sk, st, nil)
+			c.SetPriceTable(pricing.ShippedTable())
+
+			ctx, cancel := context.WithCancel(context.Background())
+			go c.Run(ctx)
+			defer cancel()
+
+			call := basicCall("req-peak")
+			call.StartedAt = tc.at
+			call.ReqBody = []byte(fmt.Sprintf(`{"model":%q,"messages":[]}`, tc.model))
+			call.RespBody = nonStreamBody(tc.model, 1000, 10)
+			sk.Submit(call)
+
+			evs := waitForEvents(t, st, 1)
+			ev := evs[0]
+			warnings, err := st.EventWarnings(context.Background(), ev.ID)
+			if err != nil {
+				t.Fatalf("EventWarnings: %v", err)
+			}
+			found := false
+			for _, w := range warnings {
+				if w.Kind == "peak_pricing" {
+					found = true
+				}
+			}
+			if found != tc.want {
+				t.Errorf("peak_pricing present = %v, want %v (cost_source=%q, model=%q, at=%s)",
+					found, tc.want, ev.CostSource, ev.ModelResolved, tc.at.Format(time.RFC3339))
+			}
+		})
+	}
+}

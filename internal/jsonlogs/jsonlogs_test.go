@@ -6,7 +6,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/parse"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
@@ -395,11 +397,27 @@ func writeLines(t *testing.T, path string, lines ...string) {
 }
 
 // assistantLine is one assistant-with-usage transcript line, the only shape
-// dedup and token extraction consider.
+// dedup and token extraction consider. With no timestamp, parseTimestamp
+// falls back to now.
 func assistantLine(requestID, sessionID, model string, inputTokens int) string {
+	return assistantLineUsage(requestID, sessionID, model, inputTokens, "")
+}
+
+// assistantLineAt is assistantLine pinned to an explicit timestamp, so a test
+// can place a row inside or outside a peak window rather than depending on
+// when it happens to run.
+func assistantLineAt(requestID, sessionID, model string, at time.Time) string {
+	return assistantLineUsage(requestID, sessionID, model, 1000, at.UTC().Format(time.RFC3339))
+}
+
+func assistantLineUsage(requestID, sessionID, model string, inputTokens int, ts string) string {
+	stamp := ""
+	if ts != "" {
+		stamp = fmt.Sprintf(`"timestamp":%q,`, ts)
+	}
 	return fmt.Sprintf(
-		`{"type":"assistant","sessionId":%q,"uuid":"u-%s","requestId":%q,"message":{"model":%q,"stop_reason":"end_turn","usage":{"input_tokens":%d,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}`,
-		sessionID, requestID, requestID, model, inputTokens)
+		`{"type":"assistant",%s"sessionId":%q,"uuid":"u-%s","requestId":%q,"message":{"model":%q,"stop_reason":"end_turn","usage":{"input_tokens":%d,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0}}}}`,
+		stamp, sessionID, requestID, requestID, model, inputTokens)
 }
 
 // T7: one tailer, two models. A prefix-matched row bills to the api account
@@ -496,4 +514,97 @@ func TestModelBillingReturnsACopy(t *testing.T) {
 	if again, _, _ := tailer.ModelBilling(); again[0] != "deepseek-" {
 		t.Errorf("mutating the returned slice changed the tailer's own: next call returned %q", again[0])
 	}
+}
+
+// --- peak_pricing warning (br-GI-3-10) ---
+
+// warningKinds reads back one row's finding kinds.
+func warningKinds(t *testing.T, st *store.Store, id int64) map[string]bool {
+	t.Helper()
+	warnings, err := st.EventWarnings(context.Background(), id)
+	if err != nil {
+		t.Fatalf("EventWarnings: %v", err)
+	}
+	out := map[string]bool{}
+	for _, w := range warnings {
+		out[w.Kind] = true
+	}
+	return out
+}
+
+// T11 (insert path): peak_pricing fires on a peak-billed *priced* row, not on
+// the same row off peak, and not on an unpriced row at a peak instant -- an
+// unpriced row was never billed at any rate, so claiming it was billed at peak
+// would be a lie.
+func TestInsertAttachesPeakPricingWarning(t *testing.T) {
+	// 2026-09-21 is a Monday; the shipped window is [01:00,04:00) UTC.
+	peakAt := time.Date(2026, time.September, 21, 2, 0, 0, 0, time.UTC)
+	offAt := time.Date(2026, time.September, 21, 0, 30, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name  string
+		model string
+		at    time.Time
+		want  bool
+	}{
+		{"priced at peak", "deepseek-flash", peakAt, true},
+		{"priced off peak", "deepseek-flash", offAt, false},
+		{"unpriced at peak", "claude-nonesuch-9", peakAt, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			writeLines(t, filepath.Join(root, "log.jsonl"),
+				assistantLineAt("req_peak", "sess_peak", tc.model, tc.at))
+
+			st := newTestStore(t)
+			tailer := New(root, st)
+			tailer.SetPriceTable(pricing.ShippedTable())
+
+			if _, err := tailer.Poll(context.Background()); err != nil {
+				t.Fatalf("Poll: %v", err)
+			}
+			ev := eventsByRequestID(t, st)["req_peak"]
+			if ev == nil {
+				t.Fatal("no event for req_peak")
+			}
+			if got := warningKinds(t, st, ev.ID)["peak_pricing"]; got != tc.want {
+				t.Errorf("peak_pricing present = %v, want %v (cost_source=%q, model=%q, at=%s)",
+					got, tc.want, ev.CostSource, ev.ModelResolved, tc.at.Format(time.RFC3339))
+			}
+		})
+	}
+}
+
+// A pricer that does not implement PeakComputer yields no warning rather than
+// a panic or a spurious one. This is the property that keeps the interface
+// optional, and it is what every existing fake relies on.
+func TestPeakWarningSkippedForAPricerWithoutPeakAt(t *testing.T) {
+	root := t.TempDir()
+	writeLines(t, filepath.Join(root, "log.jsonl"),
+		assistantLineAt("req_nopeak", "sess_nopeak", "deepseek-flash",
+			time.Date(2026, time.September, 21, 2, 0, 0, 0, time.UTC)))
+
+	st := newTestStore(t)
+	tailer := New(root, st)
+	tailer.SetPriceTable(plainPricer{})
+
+	if _, err := tailer.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	ev := eventsByRequestID(t, st)["req_nopeak"]
+	if ev == nil {
+		t.Fatal("no event for req_nopeak")
+	}
+	if warningKinds(t, st, ev.ID)["peak_pricing"] {
+		t.Error("peak_pricing attached for a pricer with no PeakAt method")
+	}
+}
+
+// plainPricer implements PriceComputer and nothing more, which is the shape
+// every existing fake has.
+type plainPricer struct{}
+
+func (plainPricer) Compute(string, parse.Usage, string, string, time.Time) (*float64, string) {
+	usd := 1.0
+	return &usd, "shipped"
 }

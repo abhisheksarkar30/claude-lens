@@ -215,13 +215,14 @@ the two cannot drift apart — and `clens warnings --detail` prints it.
 | `cost_drift` | warn | reconcile |
 | `source_mismatch` | error | store (cross-source merge) |
 | `analyzer_panic` | error | consumer (panic recovery) |
+| `peak_pricing` | warn | consumer, jsonlogs |
 
-Four of these are not emitted by `analyze` at all — `quota_window_approaching`
+Five of these are not emitted by `analyze` at all — `quota_window_approaching`
 comes from `internal/quota`, `cost_drift` from `internal/reconcile`,
-`source_mismatch` from the store's cross-source merge, and `analyzer_panic`
-from the consumer's panic recovery. They are declared in `kinds.go` because it
-is the single source of truth for spellings project-wide, not only for what
-`analyze` emits today.
+`source_mismatch` from the store's cross-source merge, `analyzer_panic` from the
+consumer's panic recovery, and `peak_pricing` from the capture path's own
+pricers. They are declared in `kinds.go` because it is the single source of
+truth for spellings project-wide, not only for what `analyze` emits today.
 
 ## Security posture
 

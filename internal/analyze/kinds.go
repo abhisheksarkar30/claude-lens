@@ -46,6 +46,7 @@ const (
 	KindAPIEquivalentCost      Kind = "api_equivalent_cost"
 	KindSourceMismatch         Kind = "source_mismatch"
 	KindAnalyzerPanic          Kind = "analyzer_panic"
+	KindPeakPricing            Kind = "peak_pricing"
 )
 
 // KindInfo pairs a kind with its severity and one-sentence description --
@@ -80,6 +81,7 @@ var allKinds = []KindInfo{
 	{KindAPIEquivalentCost, SeverityInfo, "On a subscription row: what this call would have cost at API rates. Hypothetical, never added to a billed total."},
 	{KindSourceMismatch, SeverityError, "The same request_id arrived from two sources with disagreeing token counts."},
 	{KindAnalyzerPanic, SeverityError, "A rule panicked; the panic was recovered and logged as a finding instead of crashing the consumer."},
+	{KindPeakPricing, SeverityWarn, "The call was billed at the model's peak rate, which is a cost divergence from the same call off-peak."},
 }
 
 // AllKinds returns every declared T1 kind and its description. The result
@@ -102,4 +104,5 @@ var nonAnalyzeKinds = map[Kind]string{
 	KindSourceMismatch:         "store (cross-source merge)",
 	KindCostDrift:              "reconcile",
 	KindQuotaWindowApproaching: "quota",
+	KindPeakPricing:            "consumer, jsonlogs",
 }
