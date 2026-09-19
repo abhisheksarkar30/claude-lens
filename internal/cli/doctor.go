@@ -2,24 +2,24 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/config"
+	"github.com/abhisheksarkar30/claude-lens/internal/ingest"
 	"github.com/abhisheksarkar30/claude-lens/internal/secret"
+	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
 // Doctor is `clens doctor`'s os.Stdout-writing entrypoint. args are config
 // flags (--proxy-addr, --db-path, ...), forwarded straight to config.Load
 // since doctor's whole job is reporting the resolved configuration's health.
-//
-// This bead's doctor covers configuration, port collisions, and the
-// secrets file's actually observed protection level only. Per-source
-// health (the store, the collectors) is added once those exist.
 func Doctor(args []string) error {
 	return runDoctor(args, os.Stdout)
 }
@@ -73,10 +73,67 @@ func runDoctor(args []string, w io.Writer) error {
 		}
 	}
 
+	fmt.Fprintln(w, "\nsources:")
+	for _, row := range sourceHealthRows(cfg) {
+		fmt.Fprintf(w, "  %-10s %s\n", row.name, row.detail)
+	}
+
 	if failed {
 		return fmt.Errorf("doctor: one or more checks failed")
 	}
 	return nil
+}
+
+type sourceRow struct {
+	name   string
+	detail string
+}
+
+// sourceHealthRows reports the four sources' health: proxy from a direct
+// event count (it runs continuously outside any poll cycle, so it has no
+// ingest_state outcome to read), and jsonl/snapshot/admin from
+// internal/ingest's per-source health keys. Opening the store here can
+// create db_path's file on a machine that has never run `clens serve` --
+// that mirrors store.Open's own "create if missing" contract, and an
+// empty database reports every source as pending, not an error.
+func sourceHealthRows(cfg *config.Config) []sourceRow {
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		return []sourceRow{{"error", fmt.Sprintf("could not open %s: %v", cfg.DBPath, err)}}
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	rows := []sourceRow{{"proxy", proxyHealthDetail(ctx, st)}}
+
+	health, err := ingest.New(st).SourcesHealth(ctx)
+	if err != nil {
+		rows = append(rows, sourceRow{"ingest", fmt.Sprintf("could not read source health: %v", err)})
+		return rows
+	}
+	for _, h := range health {
+		rows = append(rows, sourceRow{string(h.Source), formatHealth(h)})
+	}
+	return rows
+}
+
+func proxyHealthDetail(ctx context.Context, st *store.Store) string {
+	n, err := st.CountEvents(ctx, store.EventFilter{Source: "proxy"})
+	if err != nil {
+		return fmt.Sprintf("could not count captured requests: %v", err)
+	}
+	return fmt.Sprintf("%d requests captured (runs continuously in `clens serve`, no poll cycle to report)", n)
+}
+
+func formatHealth(h ingest.Health) string {
+	switch h.Status {
+	case "unknown":
+		return "never run"
+	case "ok":
+		return fmt.Sprintf("ok, last success %s, %d rows", h.LastSuccessAt.Format(time.RFC3339), h.RowsWritten)
+	default:
+		return fmt.Sprintf("FAILING since %s: %s", h.LastErrorAt.Format(time.RFC3339), h.LastError)
+	}
 }
 
 func runChecks(cfg *config.Config) []doctorCheck {

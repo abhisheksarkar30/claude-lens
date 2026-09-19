@@ -46,8 +46,8 @@ type HTTPClient interface {
 type Collector struct {
 	usageURL, costURL, rateLimitsURL string
 	client                           HTTPClient
-	st                                Store
-	now                               func() time.Time
+	st                               Store
+	now                              func() time.Time
 	// credential defaults to secret.Get("admin") -- the one place this
 	// package (per internal/secret's own doc comment) may read the Admin
 	// key. Overridable only so a test can avoid exercising secret's real
