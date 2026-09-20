@@ -1,5 +1,7 @@
 # GI-9 — The same request is stored twice under two keys that cannot match, and the transcript inflates itself when its `requestId` is absent
 
+<!-- version=20 status=converged -->
+
 ## 1. Summary
 
 Under proxy mode, one request produces two rows that never merge, and the JSONL tailer additionally
@@ -165,10 +167,10 @@ The corpus nearly doubled and the ratio moved two points — so the load-bearing
 relation** (the large majority of proxy body ids appear verbatim in the transcripts, on **both** passes),
 not the frozen 511, which is one pass's absolute and drifts with the database (§2's preamble).
 
-One caveat on provenance: `parse.MessageID` does not exist yet, so neither pass could use the
+One caveat on provenance: `parse.ExtractUsage`'s `Usage.MessageID` does not exist yet, so neither pass could use the
 production extractor — each applied the precedence above ad-hoc, the re-measure with a **stricter**
 extractor. That is why the live-acceptance bead (§9 bead 07, br-GI-9-06) re-runs the relation **with**
-`parse.MessageID` once it lands: the ratio is re-confirmable, and the production parser is what makes it
+`parse.ExtractUsage`'s `Usage.MessageID` once it lands: the ratio is re-confirmable, and the production parser is what makes it
 reproduced rather than merely re-confirmed.
 
 **663 of the 724 proxy rows that have a body carry an id** (92%). The residue is counted rather than
@@ -1143,22 +1145,28 @@ and now asserts a **computed** hash — the invariant it was really protecting (
 two hash-keyed session rules live under D7: `ruleCacheExpiredBetweenTurns` and
 `ruleCacheConcurrentWriteRace` `continue` on a nil `PrefixHash`
 ([`rules.go:416`](../../internal/analyze/rules.go#L416), [`:444`](../../internal/analyze/rules.go#L444)),
-and the nil-ing would have made every proxy call skip them silently.
+and the nil-ing would have made the **~97%** of proxy calls that carry a header skip them silently,
+and the **~3%** with none would have kept them only via the `else` branch's hash.
 
 **Unit — `internal/analyze` (D7, F11.4).** `ruleCacheInvalidatedByTools` fires on two **consecutive
 proxy rows** in a session whose rows include JSONL rows **interleaved** between them — the adjacency the
 interleaving breaks, and the assertion that fails if the rule keeps its pre-filter walk. The JSONL rows
-carry no `ReqBody`, so without the filter every consecutive pair has an empty side and the rule fires
+carry no `ReqBody`, so without the filter every pair that has a JSONL row on one side has an empty
+side and every other pair is broken by the interleaving, so the rule fires
 **nothing**; with it the pair is adjacent and the finding lands. This is the case §5 otherwise has
 nowhere: a green §5 must not be able to pass while the rule silently stops firing.
 
 **And the second consecutive-pair rule, whose degradation is accepted rather than fixed (F13.5).**
 `ruleCachePrefixInvalidation` ([`rules.go:293-307`](../../internal/analyze/rules.go#L293-L307)) walks the
 same rows pairwise with **no** `ReqBody` guard, so a JSONL row interleaved between two proxy rows
-contributes a pair whose cache-write side is zero and the rule returns early — interleaving can only make
-it fire **less**, with no code change and no warning. §4 takes **no code change** for it (its rule is the
+contributes a pair that usually fails the threshold — a later turn reads cache rather than writing it,
+so the write side is small — and the walk returns nil at the **first** failing pair
+([`rules.go:297-302`](../../internal/analyze/rules.go#L297-L302)), so in practice interleaving makes
+it fire **less** (with a cache-writing JSONL row it can also leave the result unchanged), with no code
+change and no warning. §4 takes **no code change** for it (its rule is the
 general pairwise shape, not the `ReqBody`-skipping one), so the case asserts the degradation is **real**
-(the mixed session does not fire where the proxy-only rows would) and states it as the accepted cost of
+(the mixed session does not fire where the proxy-only rows would — the shape a cache-reading JSONL row
+produces) and states it as the accepted cost of
 D7's whole-conversation session — the "why acceptable" arm §4's row offers, delivered in §5 where §4 says
 it goes.
 
@@ -1309,7 +1317,8 @@ row carrying that same id in the **conversation session** (D7). Seed that, and a
   session's post-merge aggregate **and** that the minted `s_…` session is **reconciled to empty and then
   removed** (F15.1's clause, applied to the shape that actually happens): a one-reconcile implementation
   passes the survivor assertion while leaving the emptied `s_…` holding the absorbed row's figures, a
-  ghost in `clens sessions`. The proxy-vs-proxy fixture above is the type that cannot happen, and it
+  ghost in `clens sessions`. The proxy-vs-proxy fixture above is the type the measured corpus does not
+  produce (a shared body id reaches it only across the D1 boundary), and it
   carries the same two-session pinning for the same reason — which is why the reconcile is stated as a
   **set**;
 - **pin the token columns so the aggregate assertion can fail**: both sides `capture_complete` with
@@ -1411,7 +1420,7 @@ deletes nothing.
   over — seconds against N², so a quadratic blow-up is a number rather than "the test got slow". It does
   **not** assert a wall-clock bound: a bound is flaky, and the wiring the case is about can only make the
   run **faster** where it is *absent*, so no wall-clock bound can fail on that absence — the wiring's
-  *existence* is gated instead by §5's tailer-wiring case (`:1167-1171`), which fails today because
+  *existence* is gated instead by §5's tailer-wiring case (`:1174-1178`), which fails today because
   `t.recorder` is nil. So this case is an observability measurement, not a gate, and §6 says so.
 
 **Pass 2 gets its own case, because it is the one write path that sets `session_id` on an existing row.**
@@ -1468,7 +1477,7 @@ already cover.
 change. (1) **Premise check** — re-run the §2.3 comparison **by the method §2.3 states** (the
 `source='proxy' AND resp_body IS NOT NULL` population, the `decode.Body` + config-cap decode, D2's id
 precedence, the transcripts under `~/.claude/projects/` distinct per file and per id), now with the
-production `parse.MessageID`: the verbatim-id relation must still hold at the same **ratio** (~77–79% of
+production `parse.ExtractUsage`'s `Usage.MessageID`: the verbatim-id relation must still hold at the same **ratio** (~77–79% of
 proxy body ids; §2.3 states both passes' figures) — the relation is the invariant, the absolute is not.
 This measures ids
 the change does not touch, so it confirms the premise still holds; it does **not** validate the story. (2) **The check that validates the story** — count post-rekey rows
@@ -1536,8 +1545,9 @@ the expected handful of `source_mismatch` warnings (§6). (4) **The drawer is al
   finds the proxy row under its own `proxy:` key, merges it into **itself** and lets the caller delete
   it — the taker **still holds the message id, so nothing is orphaned**, and because no key is wrong a
   second run changes nothing: what is lost is the proxy row's **content** (its token and cost columns,
-  the `source_refs` union, its `prefix_hash` and replay linkage), permanently — and §5's `source_refs` /
-  row-count assertion is what catches **that** shape, the `request_id` assertion being **blind** to it.
+  the `source_refs` union, its `prefix_hash` and replay linkage), permanently — and §5's `source_refs`
+  **set** assertion is what catches **that** shape (**not** the row-count assertion — both shapes drop
+  exactly one row), the `request_id` assertion being **blind** to it.
   The second is reading "merge the two rows" as a content **union**: `mergeEvents` picks a **winner** for
   the measurement columns (`merge.go:166-206`) and backfills the rest per column, unioning only
   `source_refs`, so a union produces a row no live merge could produce — and unlike the first, it changes
@@ -1845,7 +1855,7 @@ below is a **warning against reintroducing** a hand-written merge, not a descrip
 > derivation ([`merge.go:272-288`](../../internal/store/merge.go#L272-L288)) — D4's sub-rules, which a
 > paraphrase drops and a stop after (1) or (2) ships as a defect.
 
-**§4 and D4/D7 supersede br-GI-9-04 where the bead disagrees** — three items, each corrected when the
+**§4 and D4/D7 supersede br-GI-9-04 where the bead disagrees** — five items, each corrected when the
 bead is rebuilt:
 
 - br-GI-9-04's note tells the implementer to add `rekey` to **both** hand-maintained `cli_test.go`
@@ -1860,6 +1870,14 @@ bead is rebuilt:
   assigns `RequestID` and the id and the session come from the same seat — and it is exactly the
   **swapped call** this section forbids. The survivor is the **taker's** row, by its `id` and
   `session_id`; the requirement is superseded by D4.
+- br-GI-9-04's **risk text** must attribute the self-loading-helper catch to **§5's `source_refs` set
+  assertion alone** (F18.5, F19.1). The "`source_refs` / row-count" pairing is inert — both silent shapes
+  drop exactly one row — and though it is corrected in §6 and §9 it must not travel into the bead as the
+  guard (a decision, not a copy).
+- Beads must **name §5's cases in words, never their line ranges** (F19.5): cite "§5's tailer-wiring
+  case" and its siblings by name, and reproduce no `(:NNNN)` address at all. Three rounds have now
+  corrected one line-number self-pointer and got it wrong twice (F16.2 → F18.6 → F19.5), so a `(:NNNN)`
+  in a bead is a pointer that will not survive the apply.
 
 Beads are written from this plan, not the reverse, so **the plan wins** and the bead's wording is
 corrected when it is rebuilt.
@@ -1897,3 +1915,4 @@ call **one** function, and that the function is `insertOrMerge`'s collision bran
 | 2026-09-21 | Round 16 revision (round-16 findings F16.1–F16.2; **plan v17**). **One MAJOR, one NIT** (0 BLOCKER / 1 MAJOR / 0 MINOR / 1 NIT), so the convergence streak resets to 0. **F16.1 (MAJOR, two limbs, applied as a narrowing)** — pass 3's `replay_of` arm is **unreachable**, and `replay_of` can only name a **body-carrying** row: the reference is written only from the replay route's `ReplayMeta.Of` (`proxy.go:133-136`, `:252` → `consumer.go:430`), and that route refuses an original with no stored body (`internal/api/replay.go:86-88`); `internal/jsonlogs` assigns no `ReqBody`/`RespBody` and a merge cannot put one on a `jsonl:`-keyed row (the taker's key must equal the incoming's and no proxy key is `jsonl:`-prefixed). So **pass 3's `request_id LIKE 'jsonl:%'` delete can never dangle a reference**, and the collision path is the run's **only** delete site that can. The claim is **narrowed, not re-designed**: §6's "the run has two delete sites" becomes "the collision path is the only delete site that can dangle a reference", with the reachability argument stated; §4's `store.go` row is narrowed the same way; D4's pass-1 step 3 (`:530-534`) stops telling the collision site to mirror pass 3 and stands as the exemplar itself; the F15.2 rationale (`:1258-1265`) stops calling pass 3's `jsonl:` id set "the natural way to write it" and names it the empty set it is; and §5's pass-3 bullet is replaced with the **negative form** — seed a replay row naming a surviving `proxy:`-keyed row and assert pass 3 leaves its `replay_of` **untouched** — keeping the `--dry-run` dangle-count assertion. Limb (b) (the asserted target's id is unknowable inside step 1's transaction) **dissolves** with the arm: the collision site's target is the survivor, which exists at commit time. **The reviewer's alternative — keeping the arm and moving the re-point after the re-ingest — is rejected** in the changelog: it would re-grow pass 3's procedure against the standing structural instruction that D4's collision path and the backfill stay requirement lists with named traps, and it arms a site with no referrers. **F16.2 (NIT, applied)** — the wall-clock bullet's cross-reference `(:1122-1126)` pointed at the `internal/analyze` interleaving fixture; corrected to the tailer-wiring case `(:1145-1149)`. **17 rows total.** |
 | 2026-09-21 | Round 17 revision (round-17 findings F17.1–F17.3; **plan v18**). **One MAJOR, two MINOR** (0 BLOCKER / 1 MAJOR / 2 MINOR), so the convergence streak stays 0 — the MAJOR is a **stated rule that is false against the code**, not a design change, so it is corrected rather than deferred. **F17.1 (MAJOR, applied as a restatement)** — the plan claimed a pass-1 collision's two rows "share one session" and that the reconcile set is "usually one". They can never share: pass 1's predicate (`request_id LIKE 'proxy:%'` **and** a body id) selects only **pre-D7** rows (a post-D7 `proxy:`-keyed row is by construction one whose body yields no id, D2's precedence), and pre-D7 `Resolve` minted **unconditionally** — the only header that reached it was `x-clens-session`, which never became the id (`session.go:58`, `:80-84`; `meta.go:38-40`); the taker holds the target key, which no pre-D1 row can, so it is a post-D1 row — most often the **JSONL** row, whose `session_id` is the transcript conversation id (`jsonlogs.go:381-386`) — and a minted `s_…` never equals a conversation id. The reconcile set is therefore **always two**: the survivor's conversation session and the deleted row's minted one. The requirement text ("the distinct sessions among the two rows") is left alone; the false **claim**, the ordering rationale, the §3 consequences, D4's pass-1 step 3 (the "where that session is not the survivor's — the **L** population" qualifier becomes unconditional), D4's "D7 deletes the premise" and §2.6's guarantee paragraph are corrected, and **§5's JSONL-taker fixture is re-seeded**: the proxy row now sits in its **own minted session** (its own `sessions` row) and the case asserts the survivor's conversation aggregate **and** that the minted `s_…` is reconciled to empty and removed (F15.1's clause on the shape that actually happens). The two shapes' session seeding was **inverted** — the reachable JSONL-taker case got one session, the unreachable proxy-vs-proxy case got the two-session pinning — and is now fixed; the proxy-vs-proxy fixture is kept as it was. **F17.2 (MINOR, applied)** — D4's premise "that session **has an aggregate row**" is not the state pass 1 meets: today the `sessions` table holds only the 184 proxy-minted ids, D7 wires rows only for later ingests, and pass 2's own text says the conversation session "may not exist yet" and must be upserted (`:752-759`). Reworded to what pass 1 actually meets — the survivor's session is the one the merged row belongs to, materialised by pass 2's upsert and pass 3's re-ingest — with no branch restored. **F17.3 (MINOR, applied)** — §9's supersession of br-GI-9-04 was scoped only to the two-tables wording, but the bead still carries the **pre-D7** design: its ordering section (`:31-47`, "step 3 branches on the taker's source", "only proxy sessions have [a materialized aggregate]") and its helper contract (`:102`, "the surviving row is the proxy row's `id` and `session_id`", unimplementable through `mergeEvents` — `merged := *existing` never assigns `RequestID` — i.e. §9's forbidden swapped call). §9's rebuild note now names both as **superseded by D4/D7**; the bead file is **not** edited (`.beads/` is outside the plan's write boundary), the correction living in §9. **18 rows total.** |
 | 2026-09-21 | Round 18 revision (round-18 findings F18.1–F18.6; **plan v19**). **MAJOR-free round** (0 BLOCKER / 0 MAJOR / 3 MINOR / 3 NIT) — the convergence streak advances to **1** — so the apply is small and surgical and does not re-grow the collision path's requirement list. **F18.1 (MINOR, a false universal corrected)** — D7 change 4 said "D7 makes `SessionHeader` non-empty for **every** proxy call", contradicted by the plan's own census (1,364 of ~1,400 headers, `:958`) and by §6's **~3%** fall-back (`:1645-1647`); narrowed to "the **~97%** of proxy calls that carry a header … while the residual **~3%** fall back to the `else` branch's hash". The fix it justifies (always compute the hash) is unchanged and still correct for every call. **F18.2 (MINOR, a stale target corrected)** — §5's live-acceptance check (2) targeted the **frozen 511** while its sibling check (1) and §2.3 declare the absolute perishable and the **ratio** the invariant (511/663 = 77% vs 947/1,203 = 79%); on the grown DB the check as written reads as a miss. It is now stated as the **same ratio** check (1) uses ("~77–79% of the post-rekey window's distinct proxy body ids, i.e. a few hundred to ~950 rows on this DB, and the run reports the number"), keeping the row-unit argument. **F18.3 (MINOR, AMBIGUITY resolved in the plan)** — pass 1 is a **second id-extraction site** and its extractor was unnamed, while D2 insists precedence lives in one function and D2 pins two cases (two `message_start` frames; a non-message-shaped body with a top-level `id`) that the measured corpus cannot exercise — so a hand-written pass-1 read can diverge from the live path and produce a **silent non-merge**. D4's pass-1 step 1 now names the extractor ("read the id by the **same rule the live path applies** — `parse.ExtractUsage`'s `Usage.MessageID`, i.e. D2's precedence … applied to the decoded body"), §4's `store.go` row names it too, and §5 gains one pass-1 bullet pinning the two D2 cases at the rekey level. **F18.4 (NIT, coverage gap closed)** — §5's pass-2 fixture pinned both-headers-present and `x-claude-code-session-id`-overlong-alone, but never the combination where D7 change 1's fill-when-absent rule and the length rule interact: an **overlong `x-clens-session` with a valid `x-claude-code-session-id`**. The plan already determines the behaviour (the overlong override does not supply the value, so the second header does); a row and its assertion are added to the fixture. **F18.5 (NIT, wording corrected)** — §9's named trap said "§5's `source_refs` / row-count assertion is what catches this one", but the row-count half is **inert** (both shapes drop exactly one row, `:1283`); only the `source_refs` **set** assertion fails, so the trap now says so. **F18.6 (NIT, a stale pointer corrected — its own prior correction was wrong in turn)** — §5's wall-clock bullet pointed at `(:1145-1149)`, which names the `internal/analyze` mixed-adjacency case, not the tailer-wiring case at `(:1167-1171)`. That pointer was itself the target of round 16's F16.2 fix, which moved it from `(:1122-1126)` to the **wrong** address; it is corrected to `(:1167-1171)`. **19 rows total.** |
+| 2026-09-21 | Round 19 revision (round-19 findings F19.1–F19.7; **plan v20, converged**). **MAJOR-free round** (0 BLOCKER / 0 MAJOR / 5 MINOR / 2 NIT) — the convergence streak reaches **2**, so the plan carries its convergence marker (`<!-- version=20 status=converged -->`) and the apply is purely wording and coverage, changing no requirement. **F19.1 (MINOR)** — F18.5 corrected §9's trap to "the `source_refs` **set** assertion" but left the **sibling copy in §6** (`:1539-1540`), the register a bead and the PR body quote, still attributing the catch to the "`source_refs` / row-count" pair; §6 now carries the same wording as §9 ("**not** the row-count assertion — both shapes drop exactly one row"), and the sweep found no third live copy (the two remaining hits are immutable Change History rows). **F19.2 (MINOR)** — §5's "the nil-ing would have made **every** proxy call skip them silently" contradicted the plan's own census (1,364 of ~1,400, ~97%, §2.6) and §6's ~3%; narrowed to the **~97%** that carry a header, with the **~3%** keeping the rules via the hash branch. **F19.3 (MINOR)** — "every consecutive pair has an empty side" is false for two adjacent proxy rows (both carry a body, `rules.go:317`); restated as "every pair that has a JSONL row on one side … and every other pair is broken by the interleaving". **F19.4 (MINOR)** — the F13.5 bullet's mechanism was over-stated: a JSONL row **does** fill the cache-write columns (`jsonlogs.go:425-426`), and the walk returns nil at the **first** failing pair (`rules.go:297-302`) so "can only make it fire **less**" is not a property of the walk; reworded to "usually fails the threshold … in practice interleaving makes it fire less (with a cache-writing JSONL row it can also leave the result unchanged)", and the §5 case's parenthetical is qualified so it rests on a true shape. The conclusion (accept the degradation, change no code) is unaffected. **F19.5 (MINOR)** — the wall-clock bullet's pointer, corrected a third time, was still wrong: `(:1167-1171)` is the `internal/session` unit; the tailer-wiring case is at `(:1174-1178)`. Corrected to that range (F16.2 → F18.6 → F19.5). **F19.6 (NIT)** — "the type that cannot happen" for the proxy-vs-proxy collision is wrong: a shared body id **is** producible across the D1 boundary, the risk §6 names; restated as "the type the measured corpus does not produce (a shared body id reaches it only across the D1 boundary)". **F19.7 (NIT)** — `parse.MessageID` names no symbol the plan creates (D2 adds the **field** `Usage.MessageID`); all three sites now read `parse.ExtractUsage`'s `Usage.MessageID`. **§9's rebuild note** gains the two reviewer beadify items — the derived `br-GI-9-04` risk text must attribute the self-loading-helper catch to the `source_refs` set assertion alone, and beads must name §5's cases in words, never line ranges — so the rebuild is auditable. **20 rows total; status: converged.** |
