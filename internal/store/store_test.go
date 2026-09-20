@@ -831,6 +831,17 @@ func hasTable(t *testing.T, db *sql.DB, table string) bool {
 	return n == 1
 }
 
+func hasIndex(t *testing.T, db *sql.DB, index string) bool {
+	t.Helper()
+	var n int
+	err := db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&n)
+	if err != nil {
+		t.Fatalf("probe for index %s: %v", index, err)
+	}
+	return n == 1
+}
+
 func userVersion(t *testing.T, db *sql.DB) int {
 	t.Helper()
 	var v int
@@ -939,12 +950,22 @@ func TestMigrateExistingDatabase(t *testing.T) {
 }
 
 // TestMigrateHealsAPartialDatabase (T9c): the schema exec is not atomic, so a
-// database can exist with events but without a later table. The exec runs on
-// every Open precisely so it repairs that, and the migration must still apply
-// exactly once alongside it.
+// database can exist with events but without a later table -- or without one
+// of the events indexes. The exec runs on every Open precisely so it repairs
+// both, and the migration must still apply exactly once alongside it.
 func TestMigrateHealsAPartialDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "partial.db")
 	buildPreChangeDB(t, path, "warnings")
+
+	// An index the schema exec re-creates (schema.sql:68), dropped here to
+	// stand in for the other half of a first exec that died mid-file: the
+	// missing index heals by the same IF NOT EXISTS mechanism as the table.
+	const idx = "idx_events_session_id"
+	db := rawDB(t, path)
+	if _, err := db.Exec("DROP INDEX " + idx); err != nil {
+		t.Fatalf("DROP INDEX %s: %v", idx, err)
+	}
+	db.Close()
 
 	st, err := Open(path)
 	if err != nil {
@@ -954,6 +975,9 @@ func TestMigrateHealsAPartialDatabase(t *testing.T) {
 
 	if !hasTable(t, st.db, "warnings") {
 		t.Error("the always-run schema exec did not heal the missing warnings table")
+	}
+	if !hasIndex(t, st.db, idx) {
+		t.Error("the always-run schema exec did not heal the missing index")
 	}
 	for _, col := range transcriptColumns {
 		if !hasColumn(t, st.db, "events", col) {

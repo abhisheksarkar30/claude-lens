@@ -96,7 +96,7 @@ func TestAssetsTheFourNewTabsHaveTheirMountPoints(t *testing.T) {
 // TestAssetsChartsAreInlineSVG: the charts are built as SVG markup strings in
 // app.js -- no charting library, no image file, no canvas. The positive half
 // (each chart really emits an <svg>) matters as much as the negative half: a
-// chart function that quietly returns ” is a blank panel with no error.
+// chart function that quietly returns '' is a blank panel with no error.
 func TestAssetsChartsAreInlineSVG(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
