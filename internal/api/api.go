@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/consumer"
+	"github.com/abhisheksarkar30/claude-lens/internal/decode"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/sink"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
@@ -121,6 +122,10 @@ type api struct {
 	// routes answer 503 instead, and the tab shows the error.
 	sourceHealth func(ctx context.Context) ([]SourceHealth, error)
 	accounts     func(ctx context.Context) (Accounts, error)
+
+	// bodyCapBytes is the read-path decode cap, injected by SetBodyCapBytes.
+	// 0 means unwired, which is a supported state -- see decodeRespBody.
+	bodyCapBytes int
 }
 
 // SetPricing wires GET/POST /api/prices to loader's table and override file.
@@ -371,10 +376,69 @@ func (a *api) listRequests(w http.ResponseWriter, r *http.Request) {
 }
 
 // eventDetail is /api/requests/{id}'s response shape: the event's own
-// fields (promoted from the embedded pointer) plus its warnings attached.
+// fields (promoted from the embedded pointer) plus its warnings attached,
+// plus the decoded response body and the two fields that keep it honest.
 type eventDetail struct {
 	*store.Event
 	Warnings []store.Warning `json:"warnings"`
+
+	// RespBodyDecoded is the response bytes the view renders: the decoded
+	// form when the cap was wired and decoding ran, and the raw RespBody
+	// otherwise. Equalling RespBody does NOT by itself mean "undecoded" --
+	// that is also true of a body with no Content-Encoding.
+	RespBodyDecoded []byte `json:"RespBodyDecoded"`
+	// RespBodyCompleteness is what decides the view's marker.
+	// NotDecoded means RespBodyDecoded is RespBody unchanged.
+	RespBodyCompleteness decode.Completeness `json:"RespBodyCompleteness"`
+	// BodyCapBytes == 0 means the read cap is unwired -- never a zero-byte
+	// cap. The view selects its "cap not configured" line off this *before*
+	// consulting RespBodyCompleteness, so a missing cap can never manufacture
+	// the "would not decompress" state.
+	BodyCapBytes int `json:"BodyCapBytes"`
+}
+
+// decodeRespBody returns the bytes the detail view should render for a stored
+// response, how complete they are, and the cap they were read under.
+//
+// Decoding is display-only and never rewrites the stored row: replay sends
+// orig.ReqBody/orig.RespHeaders straight from the row, so nothing here has a
+// route back to a replay.
+func (a *api) decodeRespBody(ev *store.Event) ([]byte, decode.Completeness, int) {
+	if a.bodyCapBytes <= 0 {
+		// The seam is unwired. Do not call decode.Body: with a non-positive
+		// limit it returns the raw body *and* an error, which the view would
+		// render as "would not decompress" for a body that decodes fine.
+		// BodyCapBytes == 0 is what says so. The bytes served are the whole
+		// stored body, so Complete is accurate and draws no marker.
+		return ev.RespBody, decode.Complete, 0
+	}
+	// A malformed header blob degrades to an empty header set, which carries
+	// no Content-Encoding and is therefore Complete: the body is shown raw,
+	// never a 500.
+	hdr := http.Header{}
+	if ev.RespHeaders != "" {
+		_ = json.Unmarshal([]byte(ev.RespHeaders), &hdr)
+	}
+	decoded, _, completeness, err := decode.Body(hdr, ev.RespBody, a.bodyCapBytes)
+	if err != nil {
+		return ev.RespBody, decode.NotDecoded, a.bodyCapBytes
+	}
+	return decoded, completeness, a.bodyCapBytes
+}
+
+// SetBodyCapBytes wires the read-path decode cap. A non-positive n is
+// ignored, so leaving the seam unwired is a supported state and a zero can
+// never reach decode.Body.
+//
+// The cap has to be injected because this package cannot read it: the
+// configured BodyCapBytes lives in internal/config, which the import guard
+// bans, and the cap's default is unexported in internal/consumer, so the
+// consumer import this package already holds still buys no reachable
+// fallback.
+func (a *api) SetBodyCapBytes(n int) {
+	if n > 0 {
+		a.bodyCapBytes = n
+	}
 }
 
 func (a *api) getRequest(w http.ResponseWriter, r *http.Request) {
@@ -400,7 +464,14 @@ func (a *api) getRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, eventDetail{Event: ev, Warnings: warnings})
+	decoded, completeness, cap := a.decodeRespBody(ev)
+	writeJSON(w, http.StatusOK, eventDetail{
+		Event:                ev,
+		Warnings:             warnings,
+		RespBodyDecoded:      decoded,
+		RespBodyCompleteness: completeness,
+		BodyCapBytes:         cap,
+	})
 }
 
 type statsResponse struct {

@@ -148,7 +148,12 @@ recurring defect. The signal lives in `decode.Body` because that is where it is 
     not `TruncatedAtCap` (the case the withdrawn `len(decoded) == cap` test would have mislabelled).
   - `TestDetailMarksCapTruncatedBody`: expands past the cap → `TruncatedAtCap`, prefix returned.
   - `TestDetailMarksCorruptTailBody`: clean prefix then a read error → `PartialCorrupt` — reachable
-    now that `decode.Body` returns the signal it used to discard.
+    now that `decode.Body` returns the signal it used to discard. **Fixture corrected during
+    implementation:** this case must use **gzip** (or zstd), not brotli. brotli's reader emits per
+    meta-block, so a stream cut mid-way decodes to *zero* bytes and lands on `NotDecoded`, never
+    here — measured at 2/16, 4/16 and 8/16 cut points across 12 KB, 200 KB and 1 MB payloads, all
+    zero-length. gzip and zstd are stream-oriented and do yield a clean prefix plus a read error.
+    Both shapes reach a stored row, since Claude Code advertises all four codings.
   - `TestDetailFallsBackToRawOnCorruptBody`: not valid brotli → raw bytes, `NotDecoded`, **200 not
     500**.
   - `TestDetailUnencodedBodyIsComplete`: a stored plain body with no `Content-Encoding` and a positive

@@ -187,6 +187,11 @@ func Serve(args []string) error {
 		return accts, nil
 	})
 
+	// The read path's decode cap, the same value the consumer decodes with
+	// above. internal/api cannot read it itself: internal/config is under the
+	// import guard, and the default lives unexported in internal/consumer.
+	dashAPI.SetBodyCapBytes(cfg.BodyCapBytes)
+
 	dashSrv := &http.Server{Addr: cfg.DashboardAddr, Handler: dashAPI}
 
 	printBanner(os.Stdout, cfg)

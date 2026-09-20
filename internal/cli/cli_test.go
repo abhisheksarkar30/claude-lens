@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -697,5 +698,63 @@ func TestLsJSONKeepsBodyFields(t *testing.T) {
 		if c.got != c.want {
 			t.Errorf("ls --json %s = %q, want %q", c.name, c.got, c.want)
 		}
+	}
+}
+
+// gzipBody encodes data as a gzip stream: a stored response body routinely is
+// one, since the proxy tees the bytes unmodified and Claude Code advertises
+// gzip among its codings.
+func gzipBody(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestShowBodyDecodesResponse (T5, br-GI-7-03): the terminal shows the same
+// decoded response the dashboard does, and names the reason when it cannot
+// show all of it. Before this, `clens show --body` printed a stored compressed
+// body as mojibake -- the observed failure this story opens with -- because
+// printBody writes the stored bytes verbatim.
+func TestShowBodyDecodesResponse(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+	plain := []byte(`{"type":"message","content":[{"type":"text","text":"hi"}]}`)
+
+	decodable := apiRow("req_br", 1.0)
+	decodable.RespHeaders = `{"Content-Encoding":["gzip"]}`
+	decodable.RespBody = gzipBody(t, plain)
+	okID := seedEvent(t, st, decodable)
+
+	var buf bytes.Buffer
+	if err := runShow([]string{itoa(okID), "--body"}, &buf); err != nil {
+		t.Fatalf("runShow: %v", err)
+	}
+	if !strings.Contains(buf.String(), string(plain)) {
+		t.Errorf("show --body did not print the decoded response:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "would not decompress") {
+		t.Error("show --body marked a decodable body as undecodable")
+	}
+
+	// A capped body prints its marker rather than presenting a prefix as the
+	// whole response.
+	big := apiRow("req_big", 1.0)
+	big.RespHeaders = `{"Content-Encoding":["gzip"]}`
+	big.RespBody = gzipBody(t, bytes.Repeat([]byte("abcdefgh"), 512))
+	bigID := seedEvent(t, st, big)
+
+	buf.Reset()
+	if err := runShow([]string{itoa(bigID), "--body", "--body-cap-bytes=1024"}, &buf); err != nil {
+		t.Fatalf("runShow: %v", err)
+	}
+	if !strings.Contains(buf.String(), "truncated at the read cap of 1024 bytes") {
+		t.Errorf("show --body did not print the truncation marker:\n%s", buf.String())
 	}
 }

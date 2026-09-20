@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -17,7 +18,10 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/andybalholm/brotli"
+
 	"github.com/abhisheksarkar30/claude-lens/internal/consumer"
+	"github.com/abhisheksarkar30/claude-lens/internal/decode"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/sink"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
@@ -470,5 +474,182 @@ func TestSessionRouteOmitsBodies(t *testing.T) {
 	}
 	if len(got.Calls) != 50 {
 		t.Errorf("calls = %d, want 50", len(got.Calls))
+	}
+}
+
+// --- the detail route's decoded response body (br-GI-7-03, T4) ------------
+
+// brotliBody encodes data as a brotli stream. That is what a stored response
+// body routinely is: Claude Code advertises "br" and the proxy tees the bytes
+// unmodified, so the detail view cannot decode them in the browser --
+// DecompressionStream has no br support and the no-build-step rule forbids
+// bundling a library.
+func brotliBody(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := brotli.NewWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		t.Fatalf("brotli write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("brotli close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// gzipBody encodes data as a gzip stream -- see TestDetailMarksCorruptTailBody
+// for why the corrupt-tail case needs this rather than brotli.
+func gzipBody(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// detailFor seeds one stored proxy row and serves its detail. wireCap is
+// applied only when non-nil, so the unwired-seam case is expressible.
+func detailFor(t *testing.T, body []byte, respHeaders string, wireCap *int) eventDetail {
+	t.Helper()
+	st := newTestStore(t)
+	ev := seedEvent(t, st, func(e *store.Event) {
+		e.RespBody = body
+		e.RespHeaders = respHeaders
+	})
+	handler, _, _, _ := newTestAPI(t, st)
+	if wireCap != nil {
+		handler.SetBodyCapBytes(*wireCap)
+	}
+	path := "/api/requests/" + strconv.FormatInt(ev.ID, 10)
+	return decodeJSON[eventDetail](t, getOK(t, handler, path).Body)
+}
+
+func intPtr(n int) *int { return &n }
+
+func TestDetailDecodesResponseBody(t *testing.T) {
+	plain := []byte(`{"type":"message","content":[{"type":"text","text":"hi"}]}`)
+	got := detailFor(t, brotliBody(t, plain), `{"Content-Encoding":["br"]}`, intPtr(1<<20))
+
+	if got.RespBodyCompleteness != decode.Complete {
+		t.Errorf("Completeness = %v, want Complete", got.RespBodyCompleteness)
+	}
+	if !bytes.Equal(got.RespBodyDecoded, plain) {
+		t.Errorf("RespBodyDecoded = %q, want the decoded body", got.RespBodyDecoded)
+	}
+	// The stored bytes are never rewritten: replay reads them straight from
+	// the row, so a decode that wrote back would change what a replay sends.
+	if !bytes.Equal(got.RespBody, brotliBody(t, plain)) {
+		t.Error("RespBody was rewritten; decoding must be display-only")
+	}
+}
+
+func TestDetailExactCapBodyIsComplete(t *testing.T) {
+	payload := bytes.Repeat([]byte("abcdefgh"), 128) // exactly 1024
+	got := detailFor(t, brotliBody(t, payload), `{"Content-Encoding":["br"]}`, intPtr(1024))
+
+	if got.RespBodyCompleteness != decode.Complete {
+		t.Errorf("Completeness = %v, want Complete (the withdrawn len==cap test would say TruncatedAtCap)",
+			got.RespBodyCompleteness)
+	}
+	if !bytes.Equal(got.RespBodyDecoded, payload) {
+		t.Errorf("len(RespBodyDecoded) = %d, want %d", len(got.RespBodyDecoded), len(payload))
+	}
+}
+
+func TestDetailMarksCapTruncatedBody(t *testing.T) {
+	payload := bytes.Repeat([]byte("abcdefgh"), 512)
+	got := detailFor(t, brotliBody(t, payload), `{"Content-Encoding":["br"]}`, intPtr(1024))
+
+	if got.RespBodyCompleteness != decode.TruncatedAtCap {
+		t.Errorf("Completeness = %v, want TruncatedAtCap", got.RespBodyCompleteness)
+	}
+	if !bytes.Equal(got.RespBodyDecoded, payload[:1024]) {
+		t.Error("RespBodyDecoded is not the decoded prefix")
+	}
+}
+
+// TestDetailMarksCorruptTailBody uses gzip, not brotli, and that is not a
+// convenience: brotli's reader emits per meta-block, so a stream cut mid-way
+// decodes to *zero* bytes and lands on NotDecoded rather than here. gzip and
+// zstd emit incrementally, so a truncated stream really does yield a clean
+// prefix followed by a read error. Claude Code advertises all four codings, so
+// both shapes reach a stored row.
+func TestDetailMarksCorruptTailBody(t *testing.T) {
+	payload := bytes.Repeat([]byte(`{"content":"a longer body "}`), 512)
+	whole := gzipBody(t, payload)
+	got := detailFor(t, whole[:len(whole)/2], `{"Content-Encoding":["gzip"]}`, intPtr(1<<20))
+
+	if got.RespBodyCompleteness != decode.PartialCorrupt {
+		t.Fatalf("Completeness = %v, want PartialCorrupt", got.RespBodyCompleteness)
+	}
+	if len(got.RespBodyDecoded) == 0 {
+		t.Error("RespBodyDecoded is empty, want the decoded prefix")
+	}
+	if !bytes.Equal(got.RespBodyDecoded, payload[:len(got.RespBodyDecoded)]) {
+		t.Error("RespBodyDecoded is not a prefix of the original")
+	}
+}
+
+func TestDetailFallsBackToRawOnCorruptBody(t *testing.T) {
+	raw := append([]byte{0xff, 0xff, 0xff, 0xff}, bytes.Repeat([]byte{0xff}, 32)...)
+	got := detailFor(t, raw, `{"Content-Encoding":["br"]}`, intPtr(1<<20))
+
+	if got.RespBodyCompleteness != decode.NotDecoded {
+		t.Errorf("Completeness = %v, want NotDecoded", got.RespBodyCompleteness)
+	}
+	if !bytes.Equal(got.RespBodyDecoded, raw) {
+		t.Error("RespBodyDecoded is not the raw body")
+	}
+	// A body we cannot read is a rendering state, not a server error.
+	if got.BodyCapBytes != 1<<20 {
+		t.Errorf("BodyCapBytes = %d, want the wired cap", got.BodyCapBytes)
+	}
+}
+
+func TestDetailUnencodedBodyIsComplete(t *testing.T) {
+	plain := []byte("data: {\"type\":\"message_start\"}\n\n")
+	got := detailFor(t, plain, `{"Content-Type":["text/event-stream"]}`, intPtr(1<<20))
+
+	if got.RespBodyCompleteness != decode.Complete {
+		t.Errorf("Completeness = %v, want Complete -- a body that needs no decompression is not NotDecoded",
+			got.RespBodyCompleteness)
+	}
+	if !bytes.Equal(got.RespBodyDecoded, plain) {
+		t.Errorf("RespBodyDecoded = %q, want %q", got.RespBodyDecoded, plain)
+	}
+}
+
+// TestDetailUnwiredCapServesRawBody is the guard against decode.Body's
+// non-positive-limit error being surfaced as a decode failure: on a body that
+// decodes fine, that would render "it would not decompress".
+func TestDetailUnwiredCapServesRawBody(t *testing.T) {
+	plain := []byte(`{"type":"message"}`)
+	encoded := brotliBody(t, plain)
+	hdr := `{"Content-Encoding":["br"]}`
+
+	for _, tc := range []struct {
+		name    string
+		wireCap *int
+	}{
+		{"never wired", nil},
+		{"wired to zero", intPtr(0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detailFor(t, encoded, hdr, tc.wireCap)
+			if got.BodyCapBytes != 0 {
+				t.Errorf("BodyCapBytes = %d, want 0", got.BodyCapBytes)
+			}
+			if got.RespBodyCompleteness == decode.NotDecoded {
+				t.Error("Completeness = NotDecoded; a missing cap must not manufacture a decode failure")
+			}
+			if !bytes.Equal(got.RespBodyDecoded, encoded) {
+				t.Error("RespBodyDecoded is not the raw stored body")
+			}
+		})
 	}
 }
