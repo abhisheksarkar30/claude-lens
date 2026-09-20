@@ -123,6 +123,28 @@ func Open(dbPath string) (*Store, error) {
 // len(migrations): migrations[n] upgrades version n to n+1.
 const schemaVersion = 1
 
+// SchemaVersion reports the schema version this binary knows, so a diagnostic
+// can print it beside a database's stored one. Exported rather than duplicated
+// at the call site: a second copy of this number is a second thing to forget
+// when a migration is added, and the whole point of the runner is that exactly
+// one place owns it.
+func SchemaVersion() int { return schemaVersion }
+
+// UserVersion reads the database's stored schema version.
+//
+// It reports what is on disk now, which after a successful Open is always
+// SchemaVersion -- Open migrates before returning. That is what makes it worth
+// printing: the interesting answer is not the number but whether a database
+// handed to this binary was brought forward, and a caller that wants the
+// pre-migration value has to ask before Open rather than after.
+func (s *Store) UserVersion(ctx context.Context) (int, error) {
+	var v int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
+		return 0, fmt.Errorf("store: read user_version: %w", err)
+	}
+	return v, nil
+}
+
 // migrations holds one entry per schema change, oldest first. Each runs in its
 // own transaction with the version bump inside it, so a failure part-way leaves
 // the version where it was and the next Open retries rather than skipping.

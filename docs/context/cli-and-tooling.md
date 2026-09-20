@@ -15,7 +15,7 @@ An unknown name prints `clens <name>: not implemented yet` and exits non-zero.
 | Command | Flags | What it does | Evidence |
 |---|---|---|---|
 | `serve` | `--replay` | **The only long-running command.** proxy + dashboard in one process; owns every goroutine. Blocks until interrupted. | [internal/cli/serve.go](../../internal/cli/serve.go) |
-| `doctor` | — | prints the effective config, the bind addresses, and a PASS/WARN/FAIL per check — including the *observed* protection level of `secrets.toml` | [internal/cli/doctor.go](../../internal/cli/doctor.go) |
+| `doctor` | — | prints the effective config, the bind addresses, and a PASS/WARN/FAIL per check — including the *observed* protection level of `secrets.toml` and the database's `db_schema` version beside the one this binary knows. `db_schema` reports Open's own outcome, since Open migrates before returning: a skew is refused there, so the check FAILs rather than reporting a mismatch | [internal/cli/doctor.go](../../internal/cli/doctor.go) |
 | `ingest` | `--rebuild` | backfill from Claude Code's JSONL transcripts; `--rebuild` restarts from zero rather than from the byte cursor, which makes it **the re-pricing path** — the re-read merges by `request_id`, so an added rate row or a changed prefix is applied to rows already captured without duplicating them | [internal/cli/ingest.go](../../internal/cli/ingest.go) |
 | `refresh` | — | run every non-proxy collector once. **The cron / Task Scheduler target.** | [internal/cli/refresh.go](../../internal/cli/refresh.go) |
 | `ls` | filters | the call log, newest first | [internal/cli/ls.go](../../internal/cli/ls.go) |

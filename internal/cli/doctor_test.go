@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/secret"
+	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
 func withHome(t *testing.T) string {
@@ -29,6 +31,45 @@ func TestDoctorRunsCleanOnEmptyInstall(t *testing.T) {
 	out := buf.String()
 	if !strings.Contains(out, "configuration:") || !strings.Contains(out, "checks:") {
 		t.Fatalf("doctor output missing expected sections:\n%s", out)
+	}
+}
+
+// TestDoctorReportsTheSchemaVersion covers the reporting half of the check,
+// which is the half doctor owns. Whether a version-0 database is actually
+// brought forward is the migration runner's behaviour, and it is pinned in
+// internal/store by T9a-T9d -- including the two orderings whose failure modes
+// are unrecoverable. Asserting it again here would mean rebuilding a
+// pre-change database inside a package that cannot reach schemaSQL, and a
+// fixture that only approximates the old shape would be a worse test of it
+// than the ones that use the real thing.
+//
+// What this test does answer is the question that had no answer before it: the
+// stored version, without reading the file's header -- which does not answer it
+// at all once the pages are dirty in a WAL.
+func TestDoctorReportsTheSchemaVersion(t *testing.T) {
+	home := withHome(t)
+	st, err := store.Open(filepath.Join(home, ".clens", "lens.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	// Closed before runDoctor opens it again, and before TempDir's cleanup runs:
+	// a live handle keeps Windows from removing the file.
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := runDoctor(nil, &buf); err != nil {
+		t.Fatalf("runDoctor: %v\noutput:\n%s", err, buf.String())
+	}
+	out := buf.String()
+
+	want := fmt.Sprintf("version %d (this binary: %d)", store.SchemaVersion(), store.SchemaVersion())
+	if !strings.Contains(out, want) {
+		t.Errorf("doctor did not report the schema version.\nwant substring: %q\noutput:\n%s", want, out)
+	}
+	if !strings.Contains(out, "[PASS] db_schema") {
+		t.Errorf("db_schema is not PASS on a database this binary can read:\n%s", out)
 	}
 }
 
