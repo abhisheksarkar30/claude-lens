@@ -9,7 +9,7 @@
 | Unit + integration | Go's stdlib `testing` only — no assertion library, no mocking framework | `*_test.go` beside the code | [go.mod](../../go.mod) has no test dependency |
 | End-to-end | none — no suite; one recorded manual run instead | [docs/acceptance.md](../acceptance.md) | the doc states which half could not be run |
 
-**51 test files, 14,563 lines** against 14,655 lines of non-test Go (re-measured at
+**51 test files, 15,051 lines** against 14,803 lines of non-test Go (re-measured at
 `GI-7-header-and-body-visibility`, which took the count 50 → 51 on one new file —
 [internal/api/mode_test.go](../../internal/api/mode_test.go); everything else it added went into
 existing test files). Real components are used
@@ -41,6 +41,10 @@ Named for the invariant, not the function — that convention is documented in
 | The migration runner's four paths | `TestMigrateFreshDatabase`, `TestMigrateExistingDatabase`, `TestMigrateHealsAPartialDatabase`, `TestMigrateDoesNotReAddColumnsOnAPartialNewSchema` — see [decisions/007](decisions/007-schema-migrations-by-user-version.md) | [internal/store/store_test.go](../../internal/store/store_test.go) |
 | The browser's completeness integers | `TestDetailPinsCompletenessWireValue` — all four spellings on the wire, not the typed constants every other test compares | [internal/api/api_test.go](../../internal/api/api_test.go) |
 | The body renderer escapes, and its markers select in order | `TestAssetsTheBodyRendererEscapes` — source-shape only; its ceiling is stated in the test | [internal/web/assets_test.go](../../internal/web/assets_test.go) |
+| **`--body-policy off` records the call and drops only the bodies** | `TestCaptureRecordsUnderPolicyOff` — the row is asserted to *exist* at the sink, with both body columns nil, `CaptureComplete` true, and the headers present and redacted. `TestNoBufferingSSE` is a table over both policies, since `off` puts a second wrapper on the response body | [internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go) |
+| A missing `Request-Id` cannot panic the capture path | `TestPolicyOffSurvivesAMissingRequestID` — no `Request-Id`, and an unreachable upstream, in one table. Both reach the same nil-`reqBody` read; the second also pins the 502, which a panic inside `submit` used to swallow | [internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go) |
+| The transcript collector obeys the body policy | `TestTranscriptContentObeysTheBodyPolicy` — `off` stores nothing, a cap bounds the content, and an *unwired* cap means no cap rather than zero bytes | [internal/jsonlogs/jsonlogs_test.go](../../internal/jsonlogs/jsonlogs_test.go) |
+| An unobserved zero is not a measurement, and not a disagreement | `TestMergeDoesNotLetABodylessRowZeroObservedUsage` (both orderings, counts *and* no warning) + `TestMergeStillWarnsOnATrueDisagreement` (the warning that must survive) | [internal/store/merge_test.go](../../internal/store/merge_test.go) |
 
 ### The one test that is a design gate
 

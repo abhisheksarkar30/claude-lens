@@ -93,8 +93,10 @@ These are `TEXT` columns, not SQL enums — the valid vocabulary lives in Go and
 | `ingest_state.status` | per-collector outcome; `error` carries the message | [internal/ingest](../../internal/ingest/) |
 
 `events.capture_complete` is a flag rather than an enum: it says whether the capture is whole, or was
-narrowed by the policy and the 256 KB cap, or ended without a `message_stop` event. **Both bodies
-count** — a request body cut at the cap clears it just as a response body does (br-GI-7-08). The row
+narrowed by the 256 KB cap, or ended without a `message_stop` event. It stays **true** under
+`--body-policy off`, where no body was captured at all — a policy the operator set uniformly is not a
+narrowing, and the flag is what `analyze`'s `stream_incomplete` rule and the merge's precedence both
+key off. **Both bodies count** — a request body cut at the cap clears it just as a response body does (br-GI-7-08). The row
 does *not* record which of the two was cut or which cause applied; a reader that needs to say so
 identifies it by comparing each stored body's length against the cap the process was configured with,
 which the dashboard does and `clens show` does not. `internal/analyze`'s `stream_incomplete` rule

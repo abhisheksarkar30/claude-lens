@@ -81,7 +81,7 @@ Every subcommand accepts the same flag set; precedence is flags > `CLENS_*` > fi
 | `--dashboard-addr` | `127.0.0.1:8798` | |
 | `--upstream-url` | `https://api.anthropic.com` | |
 | `--db-path` | `~/.clens/lens.db` | |
-| `--body-policy` | `full` | `full` \| `truncated` \| `off` |
+| `--body-policy` | `full` | `full` \| `truncated` \| `off`. **`truncated` is accepted and does nothing** — no code path distinguishes it from `full`. **`off` keeps the call row and drops only the bodies** (br-GI-7-09); see [data-privacy-and-compliance.md](data-privacy-and-compliance.md) |
 | `--body-cap-bytes` | 262144 (256 KB) | |
 | `--allow-remote` | off | the footgun flag: without it, `Validate()` rejects a non-loopback bind |
 | `--session-gap-minutes` | — | session boundary heuristic |

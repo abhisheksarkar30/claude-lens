@@ -3,7 +3,7 @@
 # Dashboard
 
 *(Not a module from the skill's standard catalogue — this repo has no npm frontend, so no
-`package.json` trigger fires. It is documented anyway because 1003 lines of hand-written JavaScript
+`package.json` trigger fires. It is documented anyway because 1030 lines of hand-written JavaScript
 with a hard no-build-step rule and a no-CDN rule is exactly what a future change would break.)*
 
 The dashboard is served by the **dashboard listener** (`127.0.0.1:8798`) from
@@ -21,7 +21,7 @@ a transpile step, or a `<script src="https://…">` is a design change, not a re
 | File | Lines | Role |
 |---|---|---|
 | [index.html](../../internal/web/index.html) | 148 | the shell: header totals, the proxy-mode badge, the tab nav, one `<section class="view">` per tab |
-| [app.js](../../internal/web/app.js) | 1003 | every fetch, every table render, the three SVG charts, the body/header renderers, and the one SSE subscription |
+| [app.js](../../internal/web/app.js) | 1030 | every fetch, every table render, the three SVG charts, the body/header renderers, and the one SSE subscription |
 | [style.css](../../internal/web/style.css) | 240 | |
 
 ## The proxy-mode badge
@@ -57,16 +57,25 @@ means one place `esc(` has to be (see the injection note in
 - **Go `[]byte` is base64 on the wire.** `encoding/json` marshals it that way, so `bodySection`
   decodes before rendering, and the byte count in the `<summary>` comes from the *decoded* length —
   not the string length, which would be wrong for any non-UTF-8 body.
-- **The markers are separate claims, and neither implies the other.** The *capture* marker
+- **The markers are separate claims, and none implies another.** The *capture* marker
   (`captureMarker`) fires off `CaptureComplete` and names which body sits at the cap when that is
   knowable; the *read-path* markers (`readPathMarker`) fire off `RespBodyCompleteness`, with the
-  unwired-cap check first. A body decoded under the cap and never compressed is `Complete` and draws
-  nothing at all — the ordinary case.
+  unwired-cap check first; and the *transcript* marker (`transcriptCapMarker`) fires off nothing at
+  all except length-against-`BodyCapBytes`, because a reconstruction is not a capture and
+  `CaptureComplete` says nothing about it. A body decoded under the cap and never compressed is
+  `Complete` and draws nothing — the ordinary case.
 
 A `jsonl`-sourced row is a third case, not a broken capture: it has no headers **at all**, so it
 renders no header tables, and its content is labelled *"reconstructed from transcript — not a wire
 capture"* so the provenance stays visible. A transcript row with no content says *"not captured —
-transcript source"* instead of drawing empty boxes.
+transcript source"* instead of drawing empty boxes — and that absence now has **three** possible
+causes (the row predates `br-GI-7-06`, the line was not an assistant message, or `--body-policy off`),
+which the row does not distinguish, so the copy names none of them.
+
+`transcriptCapMarker`'s string states the measurement and then the inference — *"capped, or exactly
+this long"* — because content exactly the cap's length may simply have been that long. That is the
+same hedge `captureMarker` carries, and for the same reason: the row does not record which cause
+applied, so a surface that asserts one is claiming evidence it does not have.
 
 ## Route table
 

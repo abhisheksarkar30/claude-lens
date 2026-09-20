@@ -37,7 +37,7 @@ Three non-stdlib modules and no more: `modernc.org/sqlite` (pure Go, no cgo),
 | [testing-and-quality.md](testing-and-quality.md) | before writing a test, or wondering what CI gates on | conditional — trigger: 51 test files |
 | [infra-and-deploy.md](infra-and-deploy.md) | before touching a workflow, a hook, or branch policy | conditional — trigger: `.github/workflows/` |
 | [integrations-and-external-services.md](integrations-and-external-services.md) | before changing a collector or adding a dependency | conditional — trigger: four external endpoints, three Go modules |
-| [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 1003 lines of hand-written JS under a hard no-build-step rule |
+| [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 1030 lines of hand-written JS under a hard no-build-step rule |
 | [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — seven genuine forks, each with a rejected alternative a change could reintroduce |
 
 ## Grounding rules for agents
@@ -45,8 +45,8 @@ Three non-stdlib modules and no more: `modernc.org/sqlite` (pure Go, no cgo),
 These docs are a map, not the territory — and **the code wins on conflict**.
 
 1. **Discover, don't assume.** Every claim here cites a file (and often a symbol or line). Follow the
-   link before planning against it. Six statements are marked as not established by cited code —
-   two `⚠️ ASSUMPTION` (about intent) and four `❓ UNVERIFIED` (facts needing evidence), each in
+   link before planning against it. Five statements are marked as not established by cited code —
+   two `⚠️ ASSUMPTION` (about intent) and three `❓ UNVERIFIED` (facts needing evidence), each in
    the module that owns it and each naming what would confirm it. Grep for the markers to find them.
 2. **Verify the slice you are about to touch.** Treat a claim about the exact file, endpoint, schema
    shape, or permission you are about to change as a hypothesis until you have opened the source.
@@ -108,7 +108,7 @@ same token, because `show` bumps the generation itself. The plan's D10 already r
 the doc did not, and an overclaim in a doc whose whole job is telling an agent which guard is
 load-bearing is exactly the failure this tree exists to prevent. Corrected in place.
 
-**2026-09-20 — REFRESH, scoped to `GI-7-header-and-body-visibility`** (beads `br-GI-7-01` … `-08`;
+**2026-09-20 — REFRESH, scoped to `GI-7-header-and-body-visibility`** (beads `br-GI-7-01` … `-09`;
 plan `docs/planning/GI-7-header-and-body-visibility.md` v8). **No module was added or retired.**
 `decisions/` gained its **first ADR since the initial generation** — [007](decisions/007-schema-migrations-by-user-version.md),
 `PRAGMA user_version` migrations — which is why the decision count above moved six → seven and the
@@ -129,19 +129,36 @@ rendering* section), `cli-and-tooling.md` (`show`'s capture and read-path marker
 and `decisions/003` (both carried the "no migrations" claim), `testing-and-quality.md` (five
 invariant rows and the size figures, re-measured — this story took the test-file count 50 → 51),
 `decisions/000-index.md`, and the new `decisions/007-…md`. **Everything else came
-back *no changes needed*** — `conventions.md`, `build-and-run.md`, `cost-and-quota.md`,
-`infra-and-deploy.md`, `integrations-and-external-services.md`, and `decisions/001`, `-002`, `-004`,
-`-005`, `-006`.
+back *no changes needed*** — `conventions.md`, `build-and-run.md`, `infra-and-deploy.md`,
+`integrations-and-external-services.md`, and `decisions/001`, `-002`, `-004`, `-005`, `-006`.
+`cost-and-quota.md` came back unchanged at this refresh and changed in the follow-up below.
 
-**This refresh found a control that silently does not reach a path it appears to cover, and it is
-flagged rather than fixed.** `--body-policy` and `--body-cap-bytes` govern what the *proxy* keeps —
-`BodyPolicy` is read at exactly one call site — while `internal/jsonlogs` never consults it. So the
-story's own new feature, transcript content in `transcript_content`/`transcript_role`, is stored
-whole and uncapped even under `--body-policy off`. Neither the plan nor `br-GI-7-06` mentions the
-policy, which makes it look like an oversight rather than a decision; the behaviour is certain from
-the code, the intent is not, so it is recorded as `❓ UNVERIFIED` in
-[data-privacy-and-compliance.md](data-privacy-and-compliance.md) rather than asserted either way.
-The same class of gap turned up twice in this one story: `CaptureComplete` was derived from the
-response buffer alone, so a request body cut at the read cap was stored as a prefix on a row still
-reporting a whole capture. That one the story's manual run caught and it was fixed in `br-GI-7-08`;
-this one no test or run would have caught, because nothing in the story's scope asked the question.
+**This refresh found a control that silently does not reach a path it appears to cover** —
+`--body-policy`/`--body-cap-bytes` governed what the *proxy* kept (`BodyPolicy` had exactly one call
+site) while `internal/jsonlogs` never consulted them, so the story's own new
+`transcript_content`/`transcript_role` columns were stored whole and uncapped even under
+`--body-policy off`. Neither the plan nor `br-GI-7-06` mentioned the policy, so the intent was not
+recoverable and the finding was recorded as `❓ UNVERIFIED` rather than asserted either way.
+
+**That finding was then escalated and fixed, and the fix found a bigger defect underneath it**
+(`br-GI-7-09`, committed after this refresh ran — the paragraph above describes the tree as this
+refresh left it). Eleven of the module files were updated again for the fix, and **two joined the
+list that had come back clean**: `cost-and-quota.md` (`source_mismatch` now needs two *measurements*,
+which is what its own contract always said) and `build-and-run.md` (the flag table, where
+`truncated`'s inertness and `off`'s real behaviour both belong). `api-surface.md`,
+`decisions/000-index.md` and `decisions/007` were unaffected by the fix. Answering *"does the
+policy reach source B?"* required answering *"what does the policy mean?"*, and `off` turned out to
+mean **no rows at all**: the proxy returned the bare `ReverseProxy` before the closure that installs
+capture state existed, so an operator choosing the most private setting silently lost the records —
+while `clens serve`'s banner promised "calls are recorded without their bodies", and `printBanner`'s
+own doc comment disagreed with the string beneath it. The code now matches the words, in both
+sources. The bead also fixed a knock-on it created: a bodyless row is `CaptureComplete` true with
+every token column zero, which made the merge both *prefer* it over a row with real counts and raise
+`source_mismatch` at `SeverityError` claiming a disagreement that never happened.
+
+The class is the same one `CaptureComplete` belonged to, and it appeared three times in one story: a
+control that looks like it covers a path and does not. `CaptureComplete` was derived from one buffer
+of two (fixed in `br-GI-7-08`, found by the manual run); the body policy reached one source of two
+(fixed in `br-GI-7-09`, found by this refresh); and neither was visible to any test — the first
+because every fixture truncated a response, the second because the one test that read the banner
+checked its text and not its claim.

@@ -30,13 +30,27 @@ are in [decisions/003](decisions/003-full-bodies-stored.md).
 
 ## The capture policy
 
-Three settings on `--body-policy`, with `full` as the default:
+Three accepted settings on `--body-policy`, with `full` as the default. **Only two of them do
+anything** — see the `truncated` row:
 
 | Policy | Behaviour |
 |---|---|
 | `full` (default) | the body is captured whole, up to the 256 KB cap |
-| `truncated` | the body is narrowed before storage |
-| `off` | no body is captured |
+| `truncated` | **accepted and inert.** No code path distinguishes it from `full`; both are bounded by the cap and nothing else. See the note below. |
+| `off` | no body is captured, but the **call is still recorded**: method, path, status, redacted headers, TTFB and duration, with both body columns NULL (br-GI-7-09) |
+
+`off` narrows what is *kept*, not what is *recorded*. That distinction is load-bearing and was not
+true before br-GI-7-09: the proxy used to return the bare `ReverseProxy` under `off`, installing no
+capture state at all, so **no row was written** — while `clens serve`'s banner promised "calls are
+recorded without their bodies". An operator choosing the most private setting silently lost the
+records too. The banner was right and the code was wrong; the code now matches it. The same policy
+governs `transcript_content` (below).
+
+The consequence is a thin row. A body that was never kept cannot be parsed, so no model, no tokens and
+no cost are derivable from it — `capture_complete` stays **true**, because nothing was *narrowed*, and
+the absence is a policy the operator set uniformly. Which warnings survive on such a row is tabulated
+in `br-GI-7-09`; the short version is that the ones keyed on status and credential shape still fire
+and everything keyed on the body does not.
 
 `--body-cap-bytes` (default `262144`, i.e. 256 KB) bounds the capture independently of the policy,
 **per body**. `events.capture_complete` records whether what was stored is the whole thing or was
@@ -45,7 +59,16 @@ difference between an absent field and a truncated one. It covers **both** bodie
 at the cap clears it exactly as a response body does (br-GI-7-08). What the row does *not* record is
 which of the two was cut, so a surface that needs to say so infers it from the body's length against
 the cap in force — an inference that is only as good as the cap not having changed since, which is
-why the flag is the authoritative half and the length comparison only names the body.
+why the flag is the authoritative half and the length comparison only names the body. The dashboard's
+transcript section carries the same length comparison for the third content column (br-GI-7-09).
+
+**A known gap, recorded rather than marked unverified** — because the *behaviour* is certain and only
+the intent is not: `truncated` being inert is a fact about the code. `config.Validate` accepts it and
+`internal/proxy`'s only policy branch is `== "off"`, so `full` and `truncated` execute byte-identical
+code. Whether the value was meant to do something is not recorded; `README.md`'s claim that it
+"narrow[s]" the capture is an overclaim until that is answered. Recorded as a known gap in
+`br-GI-7-09`, deliberately not fixed there — making the two differ means deciding whether `full`
+should mean *uncapped*, which is a design question about the default's blast radius.
 
 A second kind of content is stored, from a source that is not the wire: **`transcript_content` /
 `transcript_role`**, one assistant message's `content` from a Claude Code transcript
@@ -55,17 +78,22 @@ lives in its own columns and is labelled as such in the UI rather than being wri
 It is the same class of data (a prompt and the files the agent read), so it is covered by the same
 protections: the same file, the same file permissions, the same retention and `clens purge`.
 
-The two capture controls above **do not reach it**, and whether that is intended is not recorded
-anywhere: `BodyPolicy` is read in exactly one place —
-[internal/proxy/proxy.go:59](../../internal/proxy/proxy.go#L59) — and `internal/jsonlogs` never
-consults it, so an install running `--body-policy off` still stores a transcript line's `content`
-whole and uncapped. Neither GI#7's plan nor `br-GI-7-06` mentions the policy, so this reads as an
-oversight rather than a choice: the bead set out to store transcript content and never asked what
-the existing content controls should do about it.
+**Both capture controls reach it, and that is new.** Until br-GI-7-09 they did not: `BodyPolicy` was
+read at exactly one call site (`internal/proxy`) and this collector never consulted it, so an install
+running `--body-policy off` stored a transcript line's `content` whole and uncapped. Neither GI#7's
+plan nor `br-GI-7-06` mentions the policy, which is what made it read as an oversight — the bead set
+out to store transcript content and never asked what the existing content controls should do about it.
+The user resolved the ambiguity in favour of the controls applying, so the tailer now takes the policy
+and the cap through a `SetBodyPolicy` seam wired in `internal/cli`'s `newTailer`.
 
-> ❓ UNVERIFIED: whether the omission is deliberate. The behaviour is not in doubt — the code is
-> explicit — only the intent. Evidence that would settle it: a decision in the plan, a bead that
-> says so, or a test asserting the policy reaches source B.
+Two consequences are worth knowing, because both are deliberate and neither is obvious:
+
+- **A capped reconstruction does not clear `capture_complete`.** That flag is about the two *teed*
+  bodies — br-GI-7-08 widened it to "both sides of the capture" and this is not a third. A
+  reconstruction cut at a cap has narrowed nothing that was ever captured, and `transcript_content`
+  lives in its own columns precisely because it is not a capture.
+- **An unwired cap means no cap**, not a zero-byte one, so a caller that forgets the seam captures
+  rather than silently truncating every transcript to nothing.
 
 Before assuming the cap bounds what is in the database, check both sources.
 

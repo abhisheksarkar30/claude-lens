@@ -105,9 +105,16 @@ Two rules, both load-bearing:
 2. **A broken collector never prevents the others from writing.** Each collector's error is
    recorded against its own source row.
 
-Evidence: `TestFailOpenOnUpstreamFailure` and the pass-through tests in
-[internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go); per-source outcome handling in
-[internal/ingest](../../internal/ingest/).
+Evidence: `TestFailOpenOnUpstreamFailure`, `TestPolicyOffSurvivesAMissingRequestID` and the
+pass-through tests in [internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go); per-source
+outcome handling in [internal/ingest](../../internal/ingest/).
+
+Rule 1 is the one a new code path is most likely to break, and it has broken once: under
+`--body-policy off` the capture path hashed a nil request body, and on the transport-failure branch
+the panic landed before the `502` was written — so a failed upstream answered with an aborted
+connection. `net/http` recovers handler panics and logs them, so the test suite stayed green while
+it happened. A new branch on the hot path owes a test that drives *its* failure mode, not just its
+happy one; see [security-and-permissions.md](security-and-permissions.md).
 
 ### Error handling
 

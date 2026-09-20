@@ -18,13 +18,26 @@ an explicit policy to narrow it:
 | `--body-policy` | Behaviour |
 |---|---|
 | `full` (**default**) | body captured whole, up to `--body-cap-bytes` |
-| `truncated` | narrowed before storage |
-| `off` | no body captured |
+| `truncated` | **accepted and inert** — no code path distinguishes it from `full` (see below) |
+| `off` | no body captured; the **call is still recorded** (br-GI-7-09) |
 
 `events.capture_complete` records whether what was stored is the whole thing or was narrowed, so a
 reader can tell "this is everything" from "this is what we kept". It covers **both** bodies since
 `br-GI-7-08`; before that it was derived from the response buffer alone, so a request body cut at the
-cap was stored as a prefix with the row still reporting a whole capture.
+cap was stored as a prefix with the row still reporting a whole capture. It is a *capture* flag:
+`off`, where nothing was captured, leaves it true, and so does a `transcript_content` narrowed at the
+cap, because a reconstruction is not a capture.
+
+Two corrections since this record was written, both of which change what the policy above actually
+buys you and neither of which invalidates the decision itself:
+
+- **`off` did not mean "no bodies".** Until `br-GI-7-09` the proxy returned the bare `ReverseProxy`
+  under `off`, so *no call row was written at all* — a strictly larger withholding than the flag, the
+  banner, this file and the README all described. The code now matches the words.
+- **`truncated` is inert.** `config.Validate` accepts it and `internal/proxy`'s only policy branch is
+  `== "off"`, so it executes byte-identical code to `full`. Whether it was meant to mean *uncapped* is
+  not recorded anywhere; until that is answered, the `full` row above is the honest description of
+  both.
 
 Credentials are kept out by a separate mechanism — redaction before the tee
 ([../security-and-permissions.md](../security-and-permissions.md)) — not by refusing to store
