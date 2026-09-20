@@ -806,6 +806,30 @@ async function loadTotals() {
   }
 }
 
+// The proxy-mode badge: whether Claude Code is actually pointed at this
+// process, and whether this process is actually receiving. Neither half alone
+// is the answer -- "configured" reads fine while the proxy is dead, and
+// "receiving" reads fine while the client is pointed somewhere else.
+//
+// The label is rendered server-side and printed verbatim. The state -> label
+// grid is a pure Go function in internal/api/mode.go, which is what makes it
+// testable at all: there is no JS runtime in this toolchain, so a mapping here
+// could only be asserted by a source-shape check.
+async function loadProxyMode() {
+  const el = $('proxy-mode');
+  try {
+    const { body } = await api('/api/mode');
+    el.textContent = body.Badge;
+    el.dataset.state = body.Configured + '/' + (body.Observed ? 'on' : 'off');
+  } catch (err) {
+    // Fail open, like loadTotals -- but clear it rather than leaving the last
+    // label up: a stale "proxy: active" is worse than no badge, because it is
+    // the exact false reassurance this exists to prevent.
+    el.textContent = '';
+    delete el.dataset.state;
+  }
+}
+
 // Live updates: every event the consumer commits is pushed over SSE. Re-running
 // the current view's loader on each event is the lazy correct thing here -- the
 // alternative is patching rows in place, which would have to re-derive the
@@ -821,7 +845,7 @@ function subscribe() {
     if (refreshing) return;
     refreshing = true;
     try {
-      await Promise.all([loadTotals(), loaders[current]()]);
+      await Promise.all([loadTotals(), loadProxyMode(), loaders[current]()]);
     } catch (err) {
       setStatus(err.message, true);
     } finally {
@@ -834,5 +858,6 @@ function subscribe() {
 }
 
 loadTotals();
+loadProxyMode();
 show('overview');
 subscribe();

@@ -735,3 +735,48 @@ func TestSummaryScanMatchesSummaryColumns(t *testing.T) {
 		t.Errorf("scanEvent takes %d destinations for %d columns", got, want)
 	}
 }
+
+// TestLatestProxyStartedAt: the observed half of the proxy-mode badge. Its
+// contract has two edges worth pinning at the store: an empty store is the
+// zero time rather than an error, and a transcript-only store is *not*
+// evidence the proxy is running -- which is why the consumer's LastWriteAt,
+// which counts every source, is not the source for this.
+func TestLatestProxyStartedAt(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	at, err := st.LatestProxyStartedAt(ctx)
+	if err != nil {
+		t.Fatalf("LatestProxyStartedAt on an empty store: %v", err)
+	}
+	if !at.IsZero() {
+		t.Errorf("an empty store returned %v, want the zero time", at)
+	}
+
+	sub := fullEvent("req_jsonl")
+	sub.Source = "jsonl"
+	sub.FirstSource = "jsonl"
+	if _, _, err := st.InsertEvent(ctx, sub); err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+	if at, err = st.LatestProxyStartedAt(ctx); err != nil || !at.IsZero() {
+		t.Errorf("a transcript-only store returned (%v, %v), want the zero time and no error", at, err)
+	}
+
+	newest := time.Now().Truncate(time.Second)
+	older := newest.Add(-time.Hour)
+	for _, when := range []time.Time{older, newest} {
+		ev := fullEvent("req_" + when.Format("150405"))
+		ev.StartedAt = when
+		if _, _, err := st.InsertEvent(ctx, ev); err != nil {
+			t.Fatalf("InsertEvent: %v", err)
+		}
+	}
+	at, err = st.LatestProxyStartedAt(ctx)
+	if err != nil {
+		t.Fatalf("LatestProxyStartedAt: %v", err)
+	}
+	if !at.Equal(newest) {
+		t.Errorf("LatestProxyStartedAt = %v, want the newest row's %v", at, newest)
+	}
+}

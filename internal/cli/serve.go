@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/analyze"
@@ -192,6 +195,21 @@ func Serve(args []string) error {
 	// import guard, and the default lives unexported in internal/consumer.
 	dashAPI.SetBodyCapBytes(cfg.BodyCapBytes)
 
+	// The mode badge's two facts. Injected rather than read in internal/api
+	// because the settings read lives here, in internal/cli, which already
+	// imports internal/api -- the reverse edge would be a build cycle.
+	dashAPI.SetProxyMode(func(ctx context.Context) (api.ProxyMode, error) {
+		at, err := st.LatestProxyStartedAt(ctx)
+		if err != nil {
+			return api.ProxyMode{}, err
+		}
+		base, ok := readSettingsBaseURL(filepath.Join(claudeConfigDir(), "settings.json"))
+		return api.ProxyMode{
+			Configured: configuredAgainst(base, ok, cfg.ProxyAddr),
+			Observed:   !at.IsZero() && time.Since(at) <= proxyRecentWindow,
+		}, nil
+	})
+
 	dashSrv := &http.Server{Addr: cfg.DashboardAddr, Handler: dashAPI}
 
 	printBanner(os.Stdout, cfg)
@@ -251,6 +269,57 @@ func Serve(args []string) error {
 	<-consumerDone
 
 	return nil
+}
+
+// proxyRecentWindow bounds "observed": a proxy row newer than this means the
+// proxy is receiving. Without a stated window the state has no boundary and no
+// test can pin it.
+const proxyRecentWindow = 5 * time.Minute
+
+// configuredAgainst answers the badge's "configured" half: does the client's
+// ANTHROPIC_BASE_URL point at this process's ProxyAddr?
+//
+// readSettingsBaseURL reports ("", false) for a missing or unparseable
+// settings.json *or* a missing ANTHROPIC_BASE_URL, and that is Unknown rather
+// than a mismatch -- the printed-banner onboarding path tells the user to
+// export the variable in their shell, where settings.json cannot see it.
+func configuredAgainst(settings string, ok bool, proxyAddr string) api.ProxyConfigured {
+	if !ok {
+		return api.ProxyConfiguredUnknown
+	}
+	if normalizeAddr(settings) == normalizeAddr(proxyAddr) {
+		return api.ProxyConfiguredMatch
+	}
+	return api.ProxyConfiguredMismatch
+}
+
+// normalizeAddr reduces an address to host:port so the two sides can be
+// compared at all.
+//
+// Without this the check fails on the tool's own output: printBanner writes
+// "http://127.0.0.1:8797" while cfg.ProxyAddr is the bare "127.0.0.1:8797",
+// and readSettingsBaseURL returns the settings string verbatim. A string
+// equality test would report the bad state for a correctly-pointed client --
+// the one thing this indicator exists to get right.
+//
+// A bare host with no port normalizes to itself, so it never matches a
+// host:port. That is deliberate: the port is the signal.
+func normalizeAddr(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return strings.ToLower(s)
+	}
+	if strings.EqualFold(host, "localhost") {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(strings.ToLower(host), port)
 }
 
 // checkRedaction runs the startup leak self-test over stored request headers

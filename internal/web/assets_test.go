@@ -366,3 +366,33 @@ func funcBody(js, name string) (string, bool) {
 	}
 	return rest[:end], true
 }
+
+// TestAssetsTheBadgeIsInTheHeader (br-GI-7-05) is the positional half of the
+// badge guard. The mechanical half -- app.js looks up an id that index.html
+// defines -- is TestAssetsEveryLookupHasAMount's job; this one asserts *where*
+// the badge lives.
+//
+// It belongs in the header because the incident it exists for was a dashboard
+// that looked healthy while Claude Code was pointed at another product's port.
+// Putting the answer on the Sources tab would make it depend on the user
+// already suspecting something -- which is exactly what they could not do.
+func TestAssetsTheBadgeIsInTheHeader(t *testing.T) {
+	html := readAsset(t, "index.html")
+
+	start := strings.Index(html, `<header class="app-header">`)
+	if start < 0 {
+		t.Fatal("index.html has no app-header block")
+	}
+	end := strings.Index(html[start:], "</header>")
+	if end < 0 {
+		t.Fatal("the app-header block is never closed")
+	}
+	header := html[start : start+end]
+
+	if !strings.Contains(header, `id="proxy-mode"`) {
+		t.Error("the proxy-mode badge is not inside the app header, so it is not on every tab")
+	}
+	if !strings.Contains(readAsset(t, "app.js"), "$('proxy-mode')") {
+		t.Error("app.js never looks up the proxy-mode badge")
+	}
+}

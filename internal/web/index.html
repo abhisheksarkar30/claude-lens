@@ -17,6 +17,12 @@
     <span>api <strong id="total-cost-api">$0.00</strong></span>
     <span>sub <strong id="total-cost-sub">$0.00</strong></span>
   </div>
+  <!-- In the header, on every tab -- deliberately not on the Sources tab. The
+       incident this exists for was a dashboard that looked fine while Claude
+       Code was pointed at another product's port, and its own transcript rows
+       were the only thing arriving. A user had to run `clens doctor` and read
+       a PASS line to find out. -->
+  <span class="proxy-badge" id="proxy-mode" aria-live="polite"></span>
   <nav class="tabs" id="tabs">
     <button class="tab active" data-view="overview" type="button">Overview</button>
     <button class="tab" data-view="calls" type="button">Calls</button>

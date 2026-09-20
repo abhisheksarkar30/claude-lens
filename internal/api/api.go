@@ -126,6 +126,12 @@ type api struct {
 	// bodyCapBytes is the read-path decode cap, injected by SetBodyCapBytes.
 	// 0 means unwired, which is a supported state -- see decodeRespBody.
 	bodyCapBytes int
+
+	// proxyMode backs GET /api/mode. It is a seam for the same reason
+	// sourceHealth is one: the settings read lives in internal/cli, and
+	// internal/cli already imports this package, so the reverse edge is a
+	// build cycle rather than a guard violation.
+	proxyMode func(ctx context.Context) (ProxyMode, error)
 }
 
 // SetPricing wires GET/POST /api/prices to loader's table and override file.
@@ -199,6 +205,7 @@ func New(st Store, sk *sink.Sink, cons *consumer.Consumer, broker *Broker, asset
 	mux.HandleFunc("/api/accounts", methodGet(a.listAccounts))
 	mux.HandleFunc("/api/models", methodGet(a.models))
 	mux.HandleFunc("/api/reconcile", methodGet(a.reconcile))
+	mux.HandleFunc("/api/mode", methodGet(a.mode))
 	mux.HandleFunc("POST /api/accounts", a.saveAccounts)
 	mux.HandleFunc("POST /api/secrets", a.setSecret)
 	mux.HandleFunc("POST /api/ingest", a.triggerIngest)

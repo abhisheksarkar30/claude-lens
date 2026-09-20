@@ -307,6 +307,27 @@ func (s *Store) ListEventsFull(ctx context.Context, filter EventFilter) ([]*Even
 	return out, rows.Err()
 }
 
+// LatestProxyStartedAt returns the newest source='proxy' row's started_at, or
+// the zero time when no proxy row has ever been written.
+//
+// It backs the "observed" half of the dashboard's proxy-mode badge. A store
+// read rather than an ingest health source, because the proxy is deliberately
+// not one of RunOnce's collectors -- internal/ingest defines only jsonl,
+// snapshot and admin. The consumer's LastWriteAt on /api/health would not do:
+// it counts every source, so a transcript-only install would read as
+// "receiving".
+func (s *Store) LatestProxyStartedAt(ctx context.Context) (time.Time, error) {
+	var at sql.NullInt64
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT MAX(started_at) FROM events WHERE source = 'proxy'").Scan(&at); err != nil {
+		return time.Time{}, fmt.Errorf("store: LatestProxyStartedAt: %w", err)
+	}
+	if !at.Valid {
+		return time.Time{}, nil
+	}
+	return timeFromNano(at.Int64), nil
+}
+
 // CountEvents counts events matching filter, ignoring pagination.
 func (s *Store) CountEvents(ctx context.Context, filter EventFilter) (int, error) {
 	where, args := filter.whereClause()

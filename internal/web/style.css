@@ -190,3 +190,18 @@ svg.chart .chart-label { fill: var(--muted); font-size: 10px; text-anchor: middl
    in a reason/snapshot cell opt that cell back to the left. */
 #sources-table td:nth-child(7),
 #quota-body td:nth-child(7) { text-align: left; }
+
+/* The proxy-mode badge. It sits in the header on every tab, because the
+   failure it reports is invisible from the tab a user happens to be on. */
+.proxy-badge {
+  margin-left: auto;
+  padding: 2px 8px;
+  border: 1px solid var(--border, #444);
+  border-radius: 999px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+/* Keyed on data-state ("<configured>/<on|off>"), written by loadProxyMode from
+   the server's own two facts rather than parsed back out of the label text. */
+.proxy-badge[data-state$="/on"] { border-color: var(--ok, #2e7d32); }
+.proxy-badge[data-state^="1/"] { border-color: var(--warn, #b26a00); }
