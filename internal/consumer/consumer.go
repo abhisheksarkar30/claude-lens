@@ -296,7 +296,10 @@ func (c *Consumer) processCall(call *sink.CapturedCall) *pendingEvent {
 	if respHeaders == nil {
 		respHeaders = http.Header{}
 	}
-	if decoded, decodedHeaders, err := decode.Body(respHeaders, respBody, c.bodyCapBytes); err == nil {
+	// Completeness is discarded deliberately: the consumer keys off err alone,
+	// because a degraded parse still beats none. A partial prefix is enough to
+	// extract usage from, and branching here would change what gets stored.
+	if decoded, decodedHeaders, _, err := decode.Body(respHeaders, respBody, c.bodyCapBytes); err == nil {
 		respBody, respHeaders = decoded, decodedHeaders
 	}
 	usage := parse.ExtractUsage(respBody, respHeaders.Get("Content-Type"))

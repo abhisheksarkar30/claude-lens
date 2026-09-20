@@ -37,6 +37,47 @@ import (
 // string-matching the error message.
 var ErrUnsupported = errors.New("decode: unsupported Content-Encoding")
 
+// Completeness says how much of the decoded body the caller got.
+//
+// Body has always been able to tell these apart -- it reads one byte past its
+// cap, and it already distinguishes "a prefix decoded, then the stream broke"
+// from "nothing decoded at all" -- and used to discard the distinction. It
+// cannot be reconstructed from err, which means only "nothing decoded".
+type Completeness int
+
+const (
+	// Complete means the whole body is available: it carried no
+	// Content-Encoding, or the stream reached EOF within the cap.
+	Complete Completeness = iota
+	// TruncatedAtCap means more than limit bytes decoded, and the prefix is
+	// what came back. A body decoding to exactly limit is Complete, not this
+	// -- which is why the read below asks for limit+1 bytes.
+	TruncatedAtCap
+	// PartialCorrupt means a non-empty prefix decoded and then a read error
+	// ended the stream. The prefix is returned and err is nil.
+	PartialCorrupt
+	// NotDecoded means nothing was decoded: an encoding this package cannot
+	// read, or a compressed body that produced no bytes. body comes back
+	// unchanged and err is non-nil.
+	NotDecoded
+)
+
+// String names the value, so a marker rendered from it and a test failure
+// both say which state it is rather than printing an int.
+func (c Completeness) String() string {
+	switch c {
+	case Complete:
+		return "Complete"
+	case TruncatedAtCap:
+		return "TruncatedAtCap"
+	case PartialCorrupt:
+		return "PartialCorrupt"
+	case NotDecoded:
+		return "NotDecoded"
+	}
+	return fmt.Sprintf("Completeness(%d)", int(c))
+}
+
 // Body returns body with h's Content-Encoding undone, and a copy of h with
 // the headers that described the encoded form (Content-Encoding,
 // Content-Length) removed — so the returned pair describes the returned
@@ -58,13 +99,21 @@ var ErrUnsupported = errors.New("decode: unsupported Content-Encoding")
 // An encoding this package does not implement returns body and h
 // unchanged, along with an error naming it, so the caller stores what was
 // captured and can say why.
-func Body(h http.Header, body []byte, limit int) ([]byte, http.Header, error) {
+//
+// The Completeness result says how much of the decoded body the caller
+// actually got. It is not derivable from err: err means "nothing decoded",
+// never "the cap cut this short" or "a clean prefix then a corrupt tail".
+// A caller that renders the bytes to a user needs the difference.
+func Body(h http.Header, body []byte, limit int) ([]byte, http.Header, Completeness, error) {
 	encs := encodings(h.Get("Content-Encoding"))
 	if len(encs) == 0 {
-		return body, h, nil
+		// Already plaintext -- the tool's central case (a plain or
+		// SSE-streamed response), and the one most easily misread as
+		// NotDecoded because it decodes nothing. The bytes are whole.
+		return body, h, Complete, nil
 	}
 	if limit <= 0 {
-		return body, h, fmt.Errorf("decode: limit must be positive, got %d", limit)
+		return body, h, NotDecoded, fmt.Errorf("decode: limit must be positive, got %d", limit)
 	}
 
 	// Content-Encoding lists codings in the order they were applied
@@ -75,12 +124,12 @@ func Body(h http.Header, body []byte, limit int) ([]byte, http.Header, error) {
 		wrap, ok := wrapperFor(encs[i])
 		if !ok {
 			closeAll(closers)
-			return body, h, fmt.Errorf("%w: %q", ErrUnsupported, encs[i])
+			return body, h, NotDecoded, fmt.Errorf("%w: %q", ErrUnsupported, encs[i])
 		}
 		next, c, err := wrap(r)
 		if err != nil {
 			closeAll(closers)
-			return body, h, fmt.Errorf("decode: %s: %w", strings.Join(encs, ", "), err)
+			return body, h, NotDecoded, fmt.Errorf("decode: %s: %w", strings.Join(encs, ", "), err)
 		}
 		r = next
 		if c != nil {
@@ -92,17 +141,30 @@ func Body(h http.Header, body []byte, limit int) ([]byte, http.Header, error) {
 	// mistaken for a truncated one.
 	out, err := io.ReadAll(io.LimitReader(r, int64(limit)+1))
 	closeAll(closers)
+
+	// The cap is tested against the pre-truncation length: that is the whole
+	// reason for reading limit+1 bytes, and it is what makes a body decoding
+	// to exactly limit Complete rather than TruncatedAtCap.
+	completeness := Complete
 	if len(out) > limit {
-		out = out[:limit]
+		completeness, out = TruncatedAtCap, out[:limit]
 	}
-	if err != nil && len(out) == 0 {
-		return body, h, fmt.Errorf("decode: %s: %w", strings.Join(encs, ", "), err)
+	if err != nil {
+		if len(out) == 0 {
+			return body, h, NotDecoded, fmt.Errorf("decode: %s: %w", strings.Join(encs, ", "), err)
+		}
+		// A clean prefix, then the stream broke. Truncation at the cap is
+		// the binding constraint when both happened: the cap is a
+		// deliberate cut, the error incidental.
+		if completeness == Complete {
+			completeness = PartialCorrupt
+		}
 	}
 
 	stripped := h.Clone()
 	stripped.Del("Content-Encoding")
 	stripped.Del("Content-Length")
-	return out, stripped, nil
+	return out, stripped, completeness, nil
 }
 
 // encodings splits a Content-Encoding field value into the codings that
