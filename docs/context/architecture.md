@@ -114,7 +114,10 @@ Rule 1 is the one a new code path is most likely to break, and it has broken onc
 the panic landed before the `502` was written — so a failed upstream answered with an aborted
 connection. `net/http` recovers handler panics and logs them, so the test suite stayed green while
 it happened. A new branch on the hot path owes a test that drives *its* failure mode, not just its
-happy one; see [security-and-permissions.md](security-and-permissions.md).
+happy one; see [security-and-permissions.md](security-and-permissions.md). The green-suite half is
+now closed structurally rather than by remembering: `proxyServer(t, h)` in
+[internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go) is the only way a proxy test
+builds a server, and it fails the test if a panic reached the recovered-error log.
 
 ### Error handling
 
