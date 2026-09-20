@@ -38,9 +38,15 @@ type CapturedCall struct {
 	ReqBody     []byte      // body policy already applied by the caller
 	RespBody    []byte      // nil while streaming; filled by a separate accumulator
 
-	// CaptureComplete is false when the body was truncated by the cap or
+	// CaptureComplete is false when either body was truncated by the cap, or
 	// the stream ended without message_stop — the merge-precedence flag
 	// downstream storage reads.
+	//
+	// Both bodies: a request body over the cap is stored as a prefix exactly
+	// as a response body is, and a flag derived from one of them reports a
+	// row as whole while it holds a fragment of the other. The request side
+	// is the one that has to be said out loud -- it is the half a
+	// response-side test fixture never truncates.
 	CaptureComplete bool
 
 	// ReplayOf and ReplayEdits carry a replay's linkage (see

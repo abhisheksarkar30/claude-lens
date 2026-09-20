@@ -71,11 +71,138 @@ func Open(dbPath string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 
+	// Order matters, and this is the part that is easy to get wrong. The probe
+	// decides only whether to stamp; the stamp goes down *before* the exec.
+	//
+	// A fresh file gets the current version first, then the schema. The exec is
+	// not atomic -- it is a sequence of statements -- so it can die part-way
+	// through. Stamped first, the version is already current when the process
+	// dies, so the next boot's runner applies nothing and the always-run exec
+	// repairs the missing tables. Seeded *after* a successful exec instead, the
+	// version would still be 0 at a mid-file crash; the next boot would see
+	// `events` present (so not fresh, so no stamp), heal the missing tables,
+	// then read 0 and apply migration 1 -- ALTER TABLE ADD COLUMN against a
+	// table schema.sql had just created with that column. That is a
+	// "duplicate column name" error out of Open on every boot thereafter, with
+	// no recovery but deleting the database.
+	//
+	// Stamping early is safe the other way too: if the stamp landed but the
+	// first CREATE TABLE did not, the next boot's probe still reads `events`
+	// absent, so it re-seeds and re-runs the exec.
+	fresh, err := eventsTableAbsent(db)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if fresh {
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("store: stamp a fresh schema: %w", err)
+		}
+	}
+
+	// Unconditional, every open. Against an existing database it is a no-op --
+	// every statement is IF NOT EXISTS -- and against a partial one it is the
+	// repair. Skipping it when `events` exists would strand every other missing
+	// table behind "no such table" on every boot.
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: create schema: %w", err)
 	}
+
+	// Before Open returns, so no caller can observe a database that has the
+	// schema but not its migrations.
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+// schemaVersion is the current PRAGMA user_version. It must equal
+// len(migrations): migrations[n] upgrades version n to n+1.
+const schemaVersion = 1
+
+// SchemaVersion reports the schema version this binary knows, so a diagnostic
+// can print it beside a database's stored one. Exported rather than duplicated
+// at the call site: a second copy of this number is a second thing to forget
+// when a migration is added, and the whole point of the runner is that exactly
+// one place owns it.
+func SchemaVersion() int { return schemaVersion }
+
+// UserVersion reads the database's stored schema version.
+//
+// It reports what is on disk now, which after a successful Open is always
+// SchemaVersion -- Open migrates before returning. That is what makes it worth
+// printing: the interesting answer is not the number but whether a database
+// handed to this binary was brought forward, and a caller that wants the
+// pre-migration value has to ask before Open rather than after.
+func (s *Store) UserVersion(ctx context.Context) (int, error) {
+	var v int
+	if err := s.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&v); err != nil {
+		return 0, fmt.Errorf("store: read user_version: %w", err)
+	}
+	return v, nil
+}
+
+// migrations holds one entry per schema change, oldest first. Each runs in its
+// own transaction with the version bump inside it, so a failure part-way leaves
+// the version where it was and the next Open retries rather than skipping.
+//
+// This is the repo's first migration mechanism. It exists because schema.sql is
+// CREATE TABLE IF NOT EXISTS throughout and can never add a column to a
+// database that already exists -- GI-1 recorded "Migrations: none in v1" as a
+// decision, not an omission, and this is the first change to need one.
+var migrations = []string{
+	// 0 -> 1: transcript content gets its own columns rather than sharing the
+	// wire-capture ones. Nullable and additive, so there is no table rewrite.
+	`ALTER TABLE events ADD COLUMN transcript_content BLOB;
+	 ALTER TABLE events ADD COLUMN transcript_role TEXT;`,
+}
+
+// eventsTableAbsent reports whether this database has no events table yet,
+// which is what distinguishes a fresh file from an existing one.
+func eventsTableAbsent(db *sql.DB) (bool, error) {
+	var n int
+	err := db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='events'`).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("store: probe for the events table: %w", err)
+	}
+	return n == 0, nil
+}
+
+// migrate brings db up to schemaVersion.
+func migrate(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return fmt.Errorf("store: read user_version: %w", err)
+	}
+	if version > schemaVersion {
+		return fmt.Errorf("store: database is at schema version %d but this binary knows %d: "+
+			"it was written by a newer clens", version, schemaVersion)
+	}
+	for v := version; v < schemaVersion; v++ {
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("store: migrate %d->%d: %w", v, v+1, err)
+		}
+		if _, err := tx.Exec(migrations[v]); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("store: migrate %d->%d: %w", v, v+1, err)
+		}
+		// Inside the transaction: a version that moved without its migration
+		// landing would strand the change forever, and a migration that landed
+		// without the version moving would fail on the next boot.
+		if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", v+1)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("store: stamp %d->%d: %w", v, v+1, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("store: migrate %d->%d: %w", v, v+1, err)
+		}
+	}
+	return nil
 }
 
 // Close closes the underlying connection.
@@ -219,9 +346,69 @@ func (s *Store) SessionEvents(ctx context.Context, sessionID string) ([]*Event, 
 	return out, rows.Err()
 }
 
+// SessionEventsSummary is SessionEvents at the list projection: the same
+// rows, same order, without the four header/body blobs. The session route
+// renders a call list, so it wants this; the session-scoped analyzer pass
+// compares consecutive request bodies and wants SessionEvents.
+func (s *Store) SessionEventsSummary(ctx context.Context, sessionID string) ([]*EventSummary, error) {
+	rows, err := s.db.QueryContext(ctx, summarySelectColumns+" FROM events WHERE session_id = ? ORDER BY started_at ASC", sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("store: SessionEventsSummary: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*EventSummary
+	for rows.Next() {
+		ev, err := scanEventSummary(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: SessionEventsSummary: %w", err)
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
 // ListEvents returns events matching filter, newest first, paginated by
 // filter.Limit/Offset.
-func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]*Event, error) {
+//
+// It reads the scalar projection only. The header/body blobs are not
+// selected, so a list never pays to read a body it will not render — on a
+// populated store that is the difference between a ~12 MB response and a
+// small one. A caller that genuinely needs a body uses ListEventsFull and
+// says so by name; it cannot reach one through this type by accident.
+func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]*EventSummary, error) {
+	where, args := filter.whereClause()
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = DefaultLimit
+	}
+	query := summarySelectColumns + " FROM events" + where + " ORDER BY started_at DESC LIMIT ? OFFSET ?"
+	args = append(args, limit, filter.Offset)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: ListEvents: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*EventSummary
+	for rows.Next() {
+		ev, err := scanEventSummary(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: ListEvents: %w", err)
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// ListEventsFull is ListEvents at full row width. Exactly four callers need
+// it, and each names it explicitly rather than relying on a default: the
+// boot-time redaction self-test (which reads headers to prove they were
+// redacted), clens export (documented as the complete dump), clens ls
+// --json (encodes whole rows), and the replay poll (hands the row to
+// replay.OutcomeOf).
+func (s *Store) ListEventsFull(ctx context.Context, filter EventFilter) ([]*Event, error) {
 	where, args := filter.whereClause()
 	limit := filter.Limit
 	if limit <= 0 {
@@ -232,7 +419,7 @@ func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]*Event, e
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("store: ListEvents: %w", err)
+		return nil, fmt.Errorf("store: ListEventsFull: %w", err)
 	}
 	defer rows.Close()
 
@@ -240,11 +427,32 @@ func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]*Event, e
 	for rows.Next() {
 		ev, err := scanEvent(rows)
 		if err != nil {
-			return nil, fmt.Errorf("store: ListEvents: %w", err)
+			return nil, fmt.Errorf("store: ListEventsFull: %w", err)
 		}
 		out = append(out, ev)
 	}
 	return out, rows.Err()
+}
+
+// LatestProxyStartedAt returns the newest source='proxy' row's started_at, or
+// the zero time when no proxy row has ever been written.
+//
+// It backs the "observed" half of the dashboard's proxy-mode badge. A store
+// read rather than an ingest health source, because the proxy is deliberately
+// not one of RunOnce's collectors -- internal/ingest defines only jsonl,
+// snapshot and admin. The consumer's LastWriteAt on /api/health would not do:
+// it counts every source, so a transcript-only install would read as
+// "receiving".
+func (s *Store) LatestProxyStartedAt(ctx context.Context) (time.Time, error) {
+	var at sql.NullInt64
+	if err := s.db.QueryRowContext(ctx,
+		"SELECT MAX(started_at) FROM events WHERE source = 'proxy'").Scan(&at); err != nil {
+		return time.Time{}, fmt.Errorf("store: LatestProxyStartedAt: %w", err)
+	}
+	if !at.Valid {
+		return time.Time{}, nil
+	}
+	return timeFromNano(at.Int64), nil
 }
 
 // CountEvents counts events matching filter, ignoring pagination.
@@ -980,76 +1188,149 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-const eventSelectColumns = `SELECT
-	id, request_id, source, source_refs, first_source,
-	started_at, ended_at,
-	auth_kind, account, billing_mode,
-	model_requested, model_resolved,
-	input_tokens, output_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_read_tokens, thinking_tokens, total_prompt_tokens,
-	service_tier, speed, effort, inference_geo,
-	stop_reason, stop_category,
-	is_sidechain, session_id, project, git_branch, client_version, cli_entrypoint,
-	cost_usd, api_equivalent_cost_usd, cost_source,
-	prefix_hash, replay_of, replay_edits, capture_complete,
-	method, path, status, req_headers, resp_headers, req_body, resp_body`
+// eventColumnNames is the positional column list every event SELECT uses, in
+// scan order. Both scans below take their order from it, and the summary
+// projection is *derived* from it rather than hand-kept, so the list SELECT
+// cannot drift from the detail SELECT.
+var eventColumnNames = []string{
+	"id", "request_id", "source", "source_refs", "first_source",
+	"started_at", "ended_at",
+	"auth_kind", "account", "billing_mode",
+	"model_requested", "model_resolved",
+	"input_tokens", "output_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens", "cache_read_tokens", "thinking_tokens", "total_prompt_tokens",
+	"service_tier", "speed", "effort", "inference_geo",
+	"stop_reason", "stop_category",
+	"is_sidechain", "session_id", "project", "git_branch", "client_version", "cli_entrypoint",
+	"cost_usd", "api_equivalent_cost_usd", "cost_source",
+	"prefix_hash", "replay_of", "replay_edits", "capture_complete",
+	"method", "path", "status", "req_headers", "resp_headers", "req_body", "resp_body",
+	"transcript_content", "transcript_role",
+}
+
+// summaryOmittedColumns are the header/body blobs the list path never reads.
+// This is the one place the projection names them: adding a column to the
+// blob set is a one-line change here, and the list keeps excluding it.
+var summaryOmittedColumns = []string{
+	"req_headers", "resp_headers", "req_body", "resp_body",
+	"transcript_content", "transcript_role",
+}
+
+var (
+	eventSelectColumns   = selectFrom(eventColumnNames)
+	summaryColumnNames   = columnsMinus(eventColumnNames, summaryOmittedColumns)
+	summarySelectColumns = selectFrom(summaryColumnNames)
+)
+
+func selectFrom(cols []string) string { return "SELECT " + strings.Join(cols, ", ") }
+
+func columnsMinus(all, omit []string) []string {
+	drop := make(map[string]bool, len(omit))
+	for _, c := range omit {
+		drop[c] = true
+	}
+	out := make([]string, 0, len(all))
+	for _, c := range all {
+		if !drop[c] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// eventScanVals holds the intermediate scan targets shared by both event
+// scans, so the two projections cannot decode a column differently.
+type eventScanVals struct {
+	sourceRefs      string
+	startedAt       int64
+	endedAt         sql.NullInt64
+	isSidechain     int64
+	captureComplete int64
+	costUSD         sql.NullFloat64
+	apiEquivCost    sql.NullFloat64
+	prefixHash      sql.NullString
+	method, path    sql.NullString
+	status          sql.NullInt64
+}
+
+// dest returns the Scan destinations for summaryColumnNames, in order,
+// followed by any extras the caller's wider projection appends. Writing the
+// destination list once is what keeps it in step with the column list; the
+// two would otherwise have to be edited together by hand.
+func (v *eventScanVals) dest(es *EventSummary, extra ...any) []any {
+	d := []any{
+		&es.ID, &es.RequestID, &es.Source, &v.sourceRefs, &es.FirstSource,
+		&v.startedAt, &v.endedAt,
+		&es.AuthKind, &es.Account, &es.BillingMode,
+		&es.ModelRequested, &es.ModelResolved,
+		&es.InputTokens, &es.OutputTokens, &es.CacheWrite5mTokens, &es.CacheWrite1hTokens, &es.CacheReadTokens, &es.ThinkingTokens, &es.TotalPromptTokens,
+		&es.ServiceTier, &es.Speed, &es.Effort, &es.InferenceGeo,
+		&es.StopReason, &es.StopCategory,
+		&v.isSidechain, &es.SessionID, &es.Project, &es.GitBranch, &es.ClientVersion, &es.CliEntrypoint,
+		&v.costUSD, &v.apiEquivCost, &es.CostSource,
+		&v.prefixHash, &es.ReplayOf, &es.ReplayEdits, &v.captureComplete,
+		&v.method, &v.path, &v.status,
+	}
+	return append(d, extra...)
+}
+
+// apply writes the shared intermediates onto es.
+func (v *eventScanVals) apply(es *EventSummary) {
+	es.SourceRefs = splitList(v.sourceRefs)
+	es.StartedAt = timeFromNano(v.startedAt)
+	if v.endedAt.Valid {
+		t := timeFromNano(v.endedAt.Int64)
+		es.EndedAt = &t
+	}
+	es.IsSidechain = v.isSidechain != 0
+	es.CaptureComplete = v.captureComplete != 0
+	if v.costUSD.Valid {
+		c := v.costUSD.Float64
+		es.CostUSD = &c
+	}
+	if v.apiEquivCost.Valid {
+		c := v.apiEquivCost.Float64
+		es.ApiEquivalentCostUSD = &c
+	}
+	if v.prefixHash.Valid {
+		h := v.prefixHash.String
+		es.PrefixHash = &h
+	}
+	es.Method = v.method.String
+	es.Path = v.path.String
+	es.Status = int(v.status.Int64)
+}
+
+func scanEventSummary(row rowScanner) (*EventSummary, error) {
+	var es EventSummary
+	var v eventScanVals
+	if err := row.Scan(v.dest(&es)...); err != nil {
+		return nil, err
+	}
+	v.apply(&es)
+	return &es, nil
+}
 
 func scanEvent(row rowScanner) (*Event, error) {
 	var ev Event
-	var sourceRefs string
-	var startedAt int64
-	var endedAt sql.NullInt64
-	var isSidechain, captureComplete int64
-	var costUSD, apiEquivCostUSD sql.NullFloat64
-	var prefixHash sql.NullString
-	var method, path, reqHeaders, respHeaders sql.NullString
-	var status sql.NullInt64
-	var reqBody, respBody []byte
+	var v eventScanVals
+	var reqHeaders, respHeaders sql.NullString
+	var reqBody, respBody, transcriptContent []byte
+	var transcriptRole sql.NullString
 
-	err := row.Scan(
-		&ev.ID, &ev.RequestID, &ev.Source, &sourceRefs, &ev.FirstSource,
-		&startedAt, &endedAt,
-		&ev.AuthKind, &ev.Account, &ev.BillingMode,
-		&ev.ModelRequested, &ev.ModelResolved,
-		&ev.InputTokens, &ev.OutputTokens, &ev.CacheWrite5mTokens, &ev.CacheWrite1hTokens, &ev.CacheReadTokens, &ev.ThinkingTokens, &ev.TotalPromptTokens,
-		&ev.ServiceTier, &ev.Speed, &ev.Effort, &ev.InferenceGeo,
-		&ev.StopReason, &ev.StopCategory,
-		&isSidechain, &ev.SessionID, &ev.Project, &ev.GitBranch, &ev.ClientVersion, &ev.CliEntrypoint,
-		&costUSD, &apiEquivCostUSD, &ev.CostSource,
-		&prefixHash, &ev.ReplayOf, &ev.ReplayEdits, &captureComplete,
-		&method, &path, &status, &reqHeaders, &respHeaders, &reqBody, &respBody,
-	)
-	if err != nil {
+	// The extras follow eventColumnNames' tail order: the four blobs, then the
+	// two transcript columns.
+	if err := row.Scan(v.dest(&ev.EventSummary,
+		&reqHeaders, &respHeaders, &reqBody, &respBody,
+		&transcriptContent, &transcriptRole)...); err != nil {
 		return nil, err
 	}
-
-	ev.SourceRefs = splitList(sourceRefs)
-	ev.StartedAt = timeFromNano(startedAt)
-	if endedAt.Valid {
-		t := timeFromNano(endedAt.Int64)
-		ev.EndedAt = &t
-	}
-	ev.IsSidechain = isSidechain != 0
-	ev.CaptureComplete = captureComplete != 0
-	if costUSD.Valid {
-		v := costUSD.Float64
-		ev.CostUSD = &v
-	}
-	if apiEquivCostUSD.Valid {
-		v := apiEquivCostUSD.Float64
-		ev.ApiEquivalentCostUSD = &v
-	}
-	if prefixHash.Valid {
-		v := prefixHash.String
-		ev.PrefixHash = &v
-	}
-	ev.Method = method.String
-	ev.Path = path.String
-	ev.Status = int(status.Int64)
+	v.apply(&ev.EventSummary)
 	ev.ReqHeaders = reqHeaders.String
 	ev.RespHeaders = respHeaders.String
 	ev.ReqBody = reqBody
 	ev.RespBody = respBody
-
+	ev.TranscriptContent = transcriptContent
+	ev.TranscriptRole = transcriptRole.String
 	return &ev, nil
 }
 

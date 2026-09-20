@@ -31,26 +31,48 @@ handler runs.
 
 | Method | Path | Summary | Parameters | Evidence |
 |---|---|---|---|---|
-| `GET` | `/api/requests` | the call log, newest first | `limit`, `offset`, filters (see below) | [internal/api/api.go:167](../../internal/api/api.go#L167) |
-| `GET` | `/api/requests/{id}` | one call in full | — | [internal/api/api.go:168](../../internal/api/api.go#L168) |
-| `GET` | `/api/stats` | totals by period, model, or cost source | window + `granularity` | [internal/api/api.go:170](../../internal/api/api.go#L170) |
-| `GET` | `/api/warnings` | findings, one row per occurrence | `limit`, `offset` | [internal/api/api.go:175](../../internal/api/api.go#L175) |
-| `GET` | `/api/warnings/summary` | findings grouped by kind | — | [internal/api/api.go:174](../../internal/api/api.go#L174) |
-| `GET` | `/api/sessions` | one row per agentic run | `limit`, `offset` | [internal/api/api.go:176](../../internal/api/api.go#L176) |
-| `GET` | `/api/sessions/{id}` | one session and its events | — | [internal/api/api.go:177](../../internal/api/api.go#L177) |
-| `GET` | `/api/sources` | collector health: last success, last error, rows written | — | [internal/api/api.go:185](../../internal/api/api.go#L185) |
-| `GET` | `/api/quota` | burn per account/window, snapshots, calibration candidates | — | [internal/api/api.go:186](../../internal/api/api.go#L186) |
-| `GET` | `/api/accounts` | configured accounts and their plan/billing state | — | [internal/api/api.go:187](../../internal/api/api.go#L187) |
-| `GET` | `/api/models` | the catalogue, plus every model traffic used | — | [internal/api/api.go:188](../../internal/api/api.go#L188) |
-| `GET` | `/api/reconcile` | computed (A/B) vs billed (D), per day and model | — | [internal/api/api.go:189](../../internal/api/api.go#L189) |
-| `GET` | `/api/prices` | the effective rate table | — | [internal/api/api.go:180](../../internal/api/api.go#L180) |
-| `GET` | `/api/health` | health, plus the counters that would otherwise be invisible | — | [internal/api/api.go:179](../../internal/api/api.go#L179) |
-| `GET` | `/api/stream` | **SSE.** Live push of new events and warnings. | — | [internal/api/api.go:178](../../internal/api/api.go#L178) |
-| `GET` | `/` and below | the embedded dashboard assets | — | [internal/api/api.go:194](../../internal/api/api.go#L194) |
+| `GET` | `/api/requests` | the call log, newest first. **Projected**: `store.EventSummary`, which carries none of the four header/body columns nor the two transcript ones | `limit`, `offset`, filters (see below) | [internal/api/api.go:167](../../internal/api/api.go#L185) |
+| `GET` | `/api/requests/{id}` | one call in full, plus three decoded-body fields (below) | — | [internal/api/api.go:168](../../internal/api/api.go#L186) |
+| `GET` | `/api/mode` | the proxy-mode signal the header badge renders: `Configured`, `Observed`, `Badge` | — | [internal/api/mode.go](../../internal/api/mode.go) |
+| `GET` | `/api/stats` | totals by period, model, or cost source | window + `granularity` | [internal/api/api.go:170](../../internal/api/api.go#L188) |
+| `GET` | `/api/warnings` | findings, one row per occurrence | `limit`, `offset` | [internal/api/api.go:175](../../internal/api/api.go#L193) |
+| `GET` | `/api/warnings/summary` | findings grouped by kind | — | [internal/api/api.go:174](../../internal/api/api.go#L192) |
+| `GET` | `/api/sessions` | one row per agentic run | `limit`, `offset` | [internal/api/api.go:176](../../internal/api/api.go#L194) |
+| `GET` | `/api/sessions/{id}` | one session and its events. **Projected** the same way as `/api/requests` | — | [internal/api/api.go:177](../../internal/api/api.go#L195) |
+| `GET` | `/api/sources` | collector health: last success, last error, rows written | — | [internal/api/api.go:185](../../internal/api/api.go#L203) |
+| `GET` | `/api/quota` | burn per account/window, snapshots, calibration candidates | — | [internal/api/api.go:186](../../internal/api/api.go#L204) |
+| `GET` | `/api/accounts` | configured accounts and their plan/billing state | — | [internal/api/api.go:187](../../internal/api/api.go#L205) |
+| `GET` | `/api/models` | the catalogue, plus every model traffic used | — | [internal/api/api.go:188](../../internal/api/api.go#L206) |
+| `GET` | `/api/reconcile` | computed (A/B) vs billed (D), per day and model | — | [internal/api/api.go:189](../../internal/api/api.go#L207) |
+| `GET` | `/api/prices` | the effective rate table | — | [internal/api/api.go:180](../../internal/api/api.go#L198) |
+| `GET` | `/api/health` | health, plus the counters that would otherwise be invisible | — | [internal/api/api.go:179](../../internal/api/api.go#L197) |
+| `GET` | `/api/stream` | **SSE.** Live push of new events and warnings. | — | [internal/api/api.go:178](../../internal/api/api.go#L196) |
+| `GET` | `/` and below | the embedded dashboard assets | — | [internal/api/api.go:194](../../internal/api/api.go#L213) |
 
 **Pagination** rides on response headers, not in the body, so a list response stays the bare JSON
 array. `limit`/`offset` default to `0`, which every store list method treats as *its own capped
 default* — never unbounded. A malformed or negative value is rejected with an error, not clamped.
+
+### The list projection, and why it is a type
+
+`/api/requests` and `/api/sessions/{id}` return `store.EventSummary` — the scalar block — rather
+than `store.Event`. The distinction is a **compile error, not a filter flag**: a caller that needs a
+body cannot reach one, because the field is not there to name, whereas a forgotten flag would return
+`nil` where bytes were expected, and a body-less `jsonl` row is byte-identical on the wire to an
+unselected one. Fifty captured calls carry ~15 MB of stored bodies (measured), so the projection is
+what keeps the dashboard's hottest fetch at ~48 KB. `ListEventsFull` / `SessionEvents` are the
+full-row reads, and the two SELECTs are derived from one column list so they cannot drift.
+
+`/api/requests/{id}` adds the decoded response body and the two fields that keep it honest:
+
+| Field | Meaning |
+|---|---|
+| `RespBodyDecoded` | the bytes the view renders — the decoded form when the cap was wired and decoding ran, the raw `RespBody` otherwise. **Equalling `RespBody` does not mean "undecoded"**: that is also true of a body with no `Content-Encoding`. |
+| `RespBodyCompleteness` | `decode.Completeness` as its **integer** value (`0` Complete, `1` TruncatedAtCap, `2` PartialCorrupt, `3` NotDecoded). `app.js` compares those integers; `TestDetailPinsCompletenessWireValue` pins all four spellings. |
+| `BodyCapBytes` | the read cap in force, or **`0` for unwired** — never a zero-byte cap. The view checks this *before* the completeness, so a missing cap cannot manufacture "would not decompress". |
+
+Decoding is display-only: nothing here writes back, and replay sends the stored `ReqBody` and
+`RespHeaders` straight from the row.
 
 ### Writes
 

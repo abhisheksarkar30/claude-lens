@@ -32,7 +32,7 @@ type Config struct {
 	DashboardAddr     string
 	UpstreamURL       string
 	DBPath            string
-	BodyPolicy        string // "full" | "truncated" | "off"
+	BodyPolicy        string // "full" | "off"
 	BodyCapBytes      int
 	AllowRemote       bool
 	SessionGapMinutes int
@@ -218,7 +218,7 @@ func applyFlags(cfg *Config, args []string) error {
 	fs.StringVar(&cfg.DashboardAddr, "dashboard-addr", cfg.DashboardAddr, "dashboard listen address")
 	fs.StringVar(&cfg.UpstreamURL, "upstream-url", cfg.UpstreamURL, "upstream Anthropic API URL")
 	fs.StringVar(&cfg.DBPath, "db-path", cfg.DBPath, "SQLite database path")
-	fs.StringVar(&cfg.BodyPolicy, "body-policy", cfg.BodyPolicy, "body capture policy: full|truncated|off")
+	fs.StringVar(&cfg.BodyPolicy, "body-policy", cfg.BodyPolicy, "body capture policy: full|off")
 	fs.IntVar(&cfg.BodyCapBytes, "body-cap-bytes", cfg.BodyCapBytes, "max bytes captured per body")
 	fs.BoolVar(&cfg.AllowRemote, "allow-remote", cfg.AllowRemote, "allow non-loopback bind addresses")
 	fs.IntVar(&cfg.SessionGapMinutes, "session-gap-minutes", cfg.SessionGapMinutes, "minutes of inactivity before a new session")
@@ -313,9 +313,17 @@ func (c *Config) Validate() error {
 		return err
 	}
 	switch c.BodyPolicy {
-	case "full", "truncated", "off":
+	case "full", "off":
 	default:
-		return fmt.Errorf("config: validate: BodyPolicy: invalid value %q (want full, truncated, or off)", c.BodyPolicy)
+		// "truncated" was accepted here and read nowhere: full and truncated
+		// executed byte-identical code, both bounded by BodyCapBytes, because a
+		// single cap leaves a second value nothing to control. It is rejected
+		// outright rather than aliased to "full", because on a flag whose whole
+		// job is deciding what content reaches the database, a value that reads
+		// as "narrow it" and stores the body whole is the one outcome worth
+		// failing loudly over. The vocabulary is inherited from deepseek-lens,
+		// where the policy is likewise applied only for "off".
+		return fmt.Errorf("config: validate: BodyPolicy: invalid value %q (want full or off)", c.BodyPolicy)
 	}
 	if c.BodyCapBytes <= 0 {
 		return fmt.Errorf("config: validate: BodyCapBytes: must be positive, got %d", c.BodyCapBytes)

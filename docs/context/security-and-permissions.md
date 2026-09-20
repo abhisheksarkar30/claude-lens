@@ -59,6 +59,20 @@ regression is caught before traffic flows. It never quotes the value it found �
 protected than the database the check exists to keep the value out of, so quoting it would move the
 credential rather than catch it. The header name and length are reported instead.
 
+**Redaction is not conditional on the body policy.** `--body-policy off` narrows what is kept, not
+what is protected: the header clone is redacted before the policy branch is reached, so an `off` row
+still stores `[redacted]` in the header blobs it *does* keep. That is the case that matters most —
+`off` is the setting an operator picks *because* they care what lands in the database — and it is
+pinned by a test rather than left to the ordering of two statements.
+
+**Fail-open, and one place it used to break.** A capture failure is logged, never propagated: the
+client's session must not depend on this tool. The `off` path violated that between GI#7's bead 06
+and its bead 09 — `requestID` hashed a nil request body, and on the transport-failure path the panic
+landed *before* the 502 was written, so a failed upstream returned an aborted connection instead. It
+was invisible because `net/http` recovers handler panics and logs them, and because the only test
+that drove the path set the very header that avoids the nil read. `TestPolicyOffSurvivesAMissingRequestID`
+now covers both halves.
+
 ### 2. The credential file lives outside the database
 
 `~/.clens/secrets.toml` holds the claude.ai `sessionKey` cookie and the Admin API key.
@@ -142,6 +156,26 @@ These are mechanical properties enforced by tests, not review habits:
 A route that must write a credential reaches it through an **injected function-value seam**
 (`SetCredentialWriter` → `secret.Save`), so there is no import edge a future handler could reach one
 back through. An unwired seam answers `503`, never an empty result.
+
+## Untrusted rendering (the dashboard)
+
+The dashboard builds HTML by string concatenation and assigns `innerHTML`, so escaping is a manual,
+load-bearing control rather than a framework's. Two inputs are attacker-influenced in the ordinary
+course of the tool's job, and both arrive from a **remote** endpoint rather than from the user:
+
+| Input | Where it is rendered | Control |
+|---|---|---|
+| response and request **bodies** | the call detail's `<details>` sections | `esc()` inside one top-level `bodySection` — a body is arbitrary bytes, so this is the surface that matters most |
+| stored **header** blobs | the same detail's `kv` tables | `esc()` per key and value in `headerRows` |
+
+The design rule is **one renderer per untrusted class**, so the escaping has one place to review
+rather than one per call site. A second call site is not a style question here: this page also holds
+a replay button that spends money, so an injected `<script>` is not merely a defaced dashboard.
+
+`internal/web/assets_test.go` guards it — `TestAssetsTheBodyRendererEscapes` fails if `esc(` leaves
+the renderer, and its doc states the ceiling plainly: with no JS runtime in this toolchain the test
+proves the escaping **call is present in the source**, not that the rendered pixels are safe. A
+change to body rendering should be re-checked by hand in a browser; the test cannot do it for you.
 
 ## Network posture
 

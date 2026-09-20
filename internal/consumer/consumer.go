@@ -296,7 +296,10 @@ func (c *Consumer) processCall(call *sink.CapturedCall) *pendingEvent {
 	if respHeaders == nil {
 		respHeaders = http.Header{}
 	}
-	if decoded, decodedHeaders, err := decode.Body(respHeaders, respBody, c.bodyCapBytes); err == nil {
+	// Completeness is discarded deliberately: the consumer keys off err alone,
+	// because a degraded parse still beats none. A partial prefix is enough to
+	// extract usage from, and branching here would change what gets stored.
+	if decoded, decodedHeaders, _, err := decode.Body(respHeaders, respBody, c.bodyCapBytes); err == nil {
 		respBody, respHeaders = decoded, decodedHeaders
 	}
 	usage := parse.ExtractUsage(respBody, respHeaders.Get("Content-Type"))
@@ -396,40 +399,42 @@ func (c *Consumer) runOneAnalyzer(a Analyzer, meta parse.Meta, usage parse.Usage
 func buildEvent(call *sink.CapturedCall, meta parse.Meta, usage parse.Usage) *store.Event {
 	endedAt := call.StartedAt.Add(call.Duration)
 	ev := &store.Event{
-		RequestID:          call.RequestID,
-		Source:             "proxy",
-		FirstSource:        "proxy",
-		StartedAt:          call.StartedAt,
-		EndedAt:            &endedAt,
-		AuthKind:           call.AuthKind,
-		ModelRequested:     meta.ModelRequested,
-		ModelResolved:      usage.Model,
-		InputTokens:        usage.InputTokens,
-		OutputTokens:       usage.OutputTokens,
-		CacheWrite5mTokens: usage.CacheWrite5mTokens,
-		CacheWrite1hTokens: usage.CacheWrite1hTokens,
-		CacheReadTokens:    usage.CacheReadTokens,
-		ThinkingTokens:     usage.ThinkingTokens,
-		ServiceTier:        usage.ServiceTier,
-		Speed:              usage.Speed,
-		Effort:             meta.Effort,
-		InferenceGeo:       meta.InferenceGeo,
-		StopReason:         usage.StopReason,
-		StopCategory:       usage.StopCategory,
-		IsSidechain:        meta.IsSidechain,
-		Project:            meta.Project,
-		GitBranch:          meta.GitBranch,
-		ClientVersion:      meta.ClientVersion,
-		CliEntrypoint:      meta.CliEntrypoint,
-		PrefixHash:         meta.PrefixHash,
-		CaptureComplete:    call.CaptureComplete,
-		ReplayOf:           call.ReplayOf,
-		ReplayEdits:        call.ReplayEdits,
-		Method:             call.Method,
-		Path:               call.Path,
-		Status:             call.Status,
-		ReqBody:            call.ReqBody,
-		RespBody:           call.RespBody,
+		EventSummary: store.EventSummary{
+			RequestID:          call.RequestID,
+			Source:             "proxy",
+			FirstSource:        "proxy",
+			StartedAt:          call.StartedAt,
+			EndedAt:            &endedAt,
+			AuthKind:           call.AuthKind,
+			ModelRequested:     meta.ModelRequested,
+			ModelResolved:      usage.Model,
+			InputTokens:        usage.InputTokens,
+			OutputTokens:       usage.OutputTokens,
+			CacheWrite5mTokens: usage.CacheWrite5mTokens,
+			CacheWrite1hTokens: usage.CacheWrite1hTokens,
+			CacheReadTokens:    usage.CacheReadTokens,
+			ThinkingTokens:     usage.ThinkingTokens,
+			ServiceTier:        usage.ServiceTier,
+			Speed:              usage.Speed,
+			Effort:             meta.Effort,
+			InferenceGeo:       meta.InferenceGeo,
+			StopReason:         usage.StopReason,
+			StopCategory:       usage.StopCategory,
+			IsSidechain:        meta.IsSidechain,
+			Project:            meta.Project,
+			GitBranch:          meta.GitBranch,
+			ClientVersion:      meta.ClientVersion,
+			CliEntrypoint:      meta.CliEntrypoint,
+			PrefixHash:         meta.PrefixHash,
+			CaptureComplete:    call.CaptureComplete,
+			ReplayOf:           call.ReplayOf,
+			ReplayEdits:        call.ReplayEdits,
+			Method:             call.Method,
+			Path:               call.Path,
+			Status:             call.Status,
+		},
+		ReqBody:  call.ReqBody,
+		RespBody: call.RespBody,
 	}
 	if usage.Model == "" {
 		ev.ModelResolved = meta.ModelRequested

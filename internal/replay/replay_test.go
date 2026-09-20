@@ -23,10 +23,9 @@ func TestOutcomeOfModelFallback(t *testing.T) {
 		{"both empty stays empty", "", "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := OutcomeOf(&store.Event{
+			got := OutcomeOf(&store.Event{EventSummary: store.EventSummary{
 				ModelRequested: tc.requested,
-				ModelResolved:  tc.resolved,
-			}, nil)
+				ModelResolved:  tc.resolved}}, nil)
 			if got.Model != tc.want {
 				t.Errorf("OutcomeOf().Model = %q, want %q", got.Model, tc.want)
 			}
@@ -61,12 +60,12 @@ func TestOutcomeOfCarriesWarnings(t *testing.T) {
 func TestOutcomeOfDurationFromInstants(t *testing.T) {
 	start := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
 	ended := start.Add(1500 * time.Millisecond)
-	got := OutcomeOf(&store.Event{StartedAt: start, EndedAt: &ended}, nil)
+	got := OutcomeOf(&store.Event{EventSummary: store.EventSummary{StartedAt: start, EndedAt: &ended}}, nil)
 	if got.DurationMs != 1500 {
 		t.Errorf("DurationMs = %v, want 1500", got.DurationMs)
 	}
 
-	if got := OutcomeOf(&store.Event{StartedAt: start}, nil); got.DurationMs != 0 {
+	if got := OutcomeOf(&store.Event{EventSummary: store.EventSummary{StartedAt: start}}, nil); got.DurationMs != 0 {
 		t.Errorf("DurationMs = %v, want 0 when EndedAt is nil", got.DurationMs)
 	}
 }
@@ -76,10 +75,9 @@ func TestOutcomeOfDurationFromInstants(t *testing.T) {
 // defaults.
 func TestOutcomeOfCarriesCostAndStatus(t *testing.T) {
 	cost := 0.0042
-	got := OutcomeOf(&store.Event{
+	got := OutcomeOf(&store.Event{EventSummary: store.EventSummary{
 		ID: 7, Status: 200, InputTokens: 11, OutputTokens: 22,
-		CostUSD: &cost, CostSource: "shipped",
-	}, nil)
+		CostUSD: &cost, CostSource: "shipped"}}, nil)
 	if got.ID != 7 || got.Status != 200 || got.InputTokens != 11 || got.OutputTokens != 22 {
 		t.Errorf("Outcome = %+v, want the row's id/status/tokens", got)
 	}

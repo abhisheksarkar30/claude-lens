@@ -77,7 +77,7 @@ func runStats(args []string, w io.Writer) error {
 
 	fmt.Fprintf(w, "window:   %s\n", windowLabel(sinceAt, untilAt))
 	fmt.Fprintf(w, "requests: %d\n", summary.RequestCount)
-	fmt.Fprintf(w, "tokens:   %s\n", tokenLine(&store.Event{
+	fmt.Fprintf(w, "tokens:   %s\n", tokenLine(&store.EventSummary{
 		InputTokens:        summary.InputTokens,
 		OutputTokens:       summary.OutputTokens,
 		CacheWrite5mTokens: summary.CacheWrite5mTokens,

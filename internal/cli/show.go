@@ -3,13 +3,16 @@ package cli
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/decode"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
@@ -34,7 +37,7 @@ func runShow(args []string, w io.Writer) error {
 	}
 	args = args[1:]
 
-	_, st, err := openStore(args)
+	cfg, st, err := openStore(args)
 	if err != nil {
 		return fmt.Errorf("show: %w", err)
 	}
@@ -58,14 +61,14 @@ func runShow(args []string, w io.Writer) error {
 		{"session", displayOrDash(ev.SessionID)},
 		{"project", displayOrDash(ev.Project)},
 		{"branch", displayOrDash(ev.GitBranch)},
-		{"model", displayModel(ev)},
-		{"status", statusCell(ev)},
+		{"model", displayModel(&ev.EventSummary)},
+		{"status", statusCell(&ev.EventSummary)},
 		{"stop", displayOrDash(ev.StopCategory)},
 		{"billing", ev.BillingMode},
 		{"account", displayOrDash(ev.Account)},
 		{"service", displayOrDash(ev.ServiceTier)},
 		{"speed", displayOrDash(ev.Speed)},
-		{"tokens", tokenLine(ev)},
+		{"tokens", tokenLine(&ev.EventSummary)},
 		{"cost", costCell(ev.CostUSD, ev.ApiEquivalentCostUSD) + costNote(ev.CostSource)},
 	}
 	if ev.ReplayOf != "" {
@@ -103,8 +106,15 @@ func runShow(args []string, w io.Writer) error {
 	}
 
 	if withBody {
+		// The request half stays raw: no compressed request body has been
+		// observed, and inventing behaviour for an unobserved case is scope
+		// this story does not need.
 		printBody(w, "request body", ev.ReqBody)
-		printBody(w, "response body", ev.RespBody)
+		respBody, marker := responseBody(ev, cfg.BodyCapBytes)
+		printBody(w, "response body", respBody)
+		if marker != "" {
+			fmt.Fprintln(w, marker)
+		}
 	} else if len(ev.ReqBody) > 0 || len(ev.RespBody) > 0 {
 		fmt.Fprintln(w, "\nbodies stored; pass --body to print them")
 	}
@@ -113,7 +123,7 @@ func runShow(args []string, w io.Writer) error {
 
 // tokenLine spells out every token class, because the classes are priced
 // separately (invariant 4): a reader who only sees in/out cannot check a cost.
-func tokenLine(ev *store.Event) string {
+func tokenLine(ev *store.EventSummary) string {
 	return fmt.Sprintf(
 		"prompt=%s (in=%s cache-w5m=%s cache-w1h=%s cache-r=%s) out=%s thinking=%s",
 		humanTokens(ev.TotalPromptTokens), humanTokens(ev.InputTokens),
@@ -121,6 +131,41 @@ func tokenLine(ev *store.Event) string {
 		humanTokens(ev.CacheReadTokens), humanTokens(ev.OutputTokens),
 		humanTokens(ev.ThinkingTokens),
 	)
+}
+
+// responseBody returns the response half as the terminal should print it,
+// plus a marker line naming why it is not the whole body (empty when it is).
+//
+// The rule matches the dashboard's, deliberately: decode only when the cap is
+// positive, and never rewrite the stored bytes. A stored response is routinely
+// brotli -- Claude Code advertises "br" and the proxy tees bytes unmodified --
+// so printing the raw form is the observed failure this replaces. Those bytes
+// render as mojibake rather than as an error, which is why the marker has to
+// name the reason rather than leaving a blank.
+func responseBody(ev *store.Event, capBytes int) ([]byte, string) {
+	if capBytes <= 0 {
+		// Same guard as the read path: decode.Body with a non-positive limit
+		// returns the raw body *and* an error, which would print "would not
+		// decompress" for a body that decodes fine.
+		return ev.RespBody, ""
+	}
+	hdr := http.Header{}
+	if ev.RespHeaders != "" {
+		// A malformed blob degrades to an empty header set: no
+		// Content-Encoding, so the body prints raw rather than erroring.
+		_ = json.Unmarshal([]byte(ev.RespHeaders), &hdr)
+	}
+	decoded, _, completeness, err := decode.Body(hdr, ev.RespBody, capBytes)
+	if err != nil {
+		return ev.RespBody, "  (shown raw: it would not decompress)"
+	}
+	switch completeness {
+	case decode.TruncatedAtCap:
+		return decoded, fmt.Sprintf("  (truncated at the read cap of %d bytes)", capBytes)
+	case decode.PartialCorrupt:
+		return decoded, "  (decoded only partially: its tail was corrupt)"
+	}
+	return decoded, ""
 }
 
 // printBody writes one stored body, saying so when it was not stored at all

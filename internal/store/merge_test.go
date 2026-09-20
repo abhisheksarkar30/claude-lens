@@ -704,3 +704,307 @@ func TestMergeKeepsExistingAccountAndAuthKind(t *testing.T) {
 		t.Errorf("AuthKind = %q, want oauth (preferNonEmpty, even though the incoming side won the costs)", got.AuthKind)
 	}
 }
+
+// TestMergeFillsTranscriptColumnsBothWays (T8) covers the ordering the design
+// as first written dropped: the proxy captures live and the transcript
+// reconstruction lands minutes later, so proxy-first is the common case and a
+// new column with no merge rule is discarded exactly when it finally shows up.
+// Both orderings must leave the row carrying the reconstruction, because the
+// proxy side structurally cannot supply it -- a capture has no `message.content`
+// to reconstruct from.
+func TestMergeFillsTranscriptColumnsBothWays(t *testing.T) {
+	const content = `[{"type":"text","text":"the transcript's own content"}]`
+
+	// proxyFirst writes the capture, then the reconstruction.
+	proxyFirst := func(t *testing.T) {
+		st := newTestStore(t)
+		ctx := context.Background()
+
+		proxy := fullEvent("req-t8-proxy-first")
+		proxy.Source, proxy.FirstSource = "proxy", "proxy"
+		if _, _, err := st.InsertEvent(ctx, proxy); err != nil {
+			t.Fatalf("InsertEvent proxy: %v", err)
+		}
+
+		jsonl := fullEvent("req-t8-proxy-first")
+		jsonl.Source, jsonl.FirstSource = "jsonl", "jsonl"
+		jsonl.TranscriptContent = []byte(content)
+		jsonl.TranscriptRole = "assistant"
+		id, _, err := st.InsertEvent(ctx, jsonl)
+		if err != nil {
+			t.Fatalf("InsertEvent jsonl (merge): %v", err)
+		}
+
+		got, err := st.GetEvent(ctx, id)
+		if err != nil {
+			t.Fatalf("GetEvent: %v", err)
+		}
+		if string(got.TranscriptContent) != content {
+			t.Errorf("TranscriptContent = %q, want the reconstruction to survive a proxy-first merge", got.TranscriptContent)
+		}
+		if got.TranscriptRole != "assistant" {
+			t.Errorf("TranscriptRole = %q, want assistant", got.TranscriptRole)
+		}
+		// The capture's own columns are untouched by the merge: the
+		// reconstruction goes in its own columns by design.
+		if string(got.ReqBody) != string(proxy.ReqBody) {
+			t.Errorf("ReqBody = %q, want the capture's own %q", got.ReqBody, proxy.ReqBody)
+		}
+	}
+
+	// jsonlFirst writes the reconstruction, then the capture arrives.
+	jsonlFirst := func(t *testing.T) {
+		st := newTestStore(t)
+		ctx := context.Background()
+
+		jsonl := fullEvent("req-t8-jsonl-first")
+		jsonl.Source, jsonl.FirstSource = "jsonl", "jsonl"
+		jsonl.TranscriptContent = []byte(content)
+		jsonl.TranscriptRole = "assistant"
+		if _, _, err := st.InsertEvent(ctx, jsonl); err != nil {
+			t.Fatalf("InsertEvent jsonl: %v", err)
+		}
+
+		proxy := fullEvent("req-t8-jsonl-first")
+		proxy.Source, proxy.FirstSource = "proxy", "proxy"
+		id, _, err := st.InsertEvent(ctx, proxy)
+		if err != nil {
+			t.Fatalf("InsertEvent proxy (merge): %v", err)
+		}
+
+		got, err := st.GetEvent(ctx, id)
+		if err != nil {
+			t.Fatalf("GetEvent: %v", err)
+		}
+		if string(got.TranscriptContent) != content {
+			t.Errorf("TranscriptContent = %q, want the reconstruction to survive a jsonl-first merge", got.TranscriptContent)
+		}
+		if got.TranscriptRole != "assistant" {
+			t.Errorf("TranscriptRole = %q, want assistant", got.TranscriptRole)
+		}
+		if string(got.ReqBody) != string(proxy.ReqBody) {
+			t.Errorf("ReqBody = %q, want the capture's own %q", got.ReqBody, proxy.ReqBody)
+		}
+	}
+
+	t.Run("proxy first", proxyFirst)
+	t.Run("jsonl first", jsonlFirst)
+
+	// The both-sides-populated case: a second jsonl row for the same request
+	// (a re-read after a truncated cursor, say) must not overwrite the content
+	// already stored -- first-written wins, the merge's general rule.
+	t.Run("existing reconstruction is not overwritten", func(t *testing.T) {
+		st := newTestStore(t)
+		ctx := context.Background()
+
+		first := fullEvent("req-t8-keep")
+		first.Source, first.FirstSource = "jsonl", "jsonl"
+		first.TranscriptContent = []byte(content)
+		first.TranscriptRole = "assistant"
+		if _, _, err := st.InsertEvent(ctx, first); err != nil {
+			t.Fatalf("InsertEvent first: %v", err)
+		}
+
+		second := fullEvent("req-t8-keep")
+		second.Source, second.FirstSource = "jsonl", "jsonl"
+		second.TranscriptContent = []byte(`[{"type":"text","text":"a later, different read"}]`)
+		second.TranscriptRole = "assistant"
+		id, _, err := st.InsertEvent(ctx, second)
+		if err != nil {
+			t.Fatalf("InsertEvent second: %v", err)
+		}
+
+		got, err := st.GetEvent(ctx, id)
+		if err != nil {
+			t.Fatalf("GetEvent: %v", err)
+		}
+		if string(got.TranscriptContent) != content {
+			t.Errorf("TranscriptContent = %q, want the first-written %q", got.TranscriptContent, content)
+		}
+	})
+}
+
+// TestMergePrefersTheWhollyCapturedRowOverATruncatedRequest (br-GI-7-08) pins
+// the merge consequence of widening CaptureComplete to cover both bodies.
+//
+// Before that bead the flag was false only for a truncated *response*, so a
+// proxy row with a cut request body counted as complete and -- being the row
+// written second -- took the token pick on the `winner = incoming` branch. It
+// now counts as incomplete, and the wholly-captured jsonl row already on the
+// row takes the pick instead. That is deliberate (with one body known to be a
+// prefix, the record that is whole is the safer one to quote) but it is a
+// behaviour change, so it is asserted here rather than left to be discovered.
+//
+// The write order is load-bearing and is why the proxy row is second: with the
+// jsonl row second both orderings pick it, and the test would pass whether the
+// flag changed or not.
+func TestMergePrefersTheWhollyCapturedRowOverATruncatedRequest(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	// The transcript's own record of the request: whole.
+	jsonl := fullEvent("req-gi7-merge-trunc")
+	jsonl.Source, jsonl.FirstSource = "jsonl", "jsonl"
+	jsonl.CaptureComplete = true
+	jsonl.InputTokens, jsonl.OutputTokens = 111, 55
+	if _, _, err := st.InsertEvent(ctx, jsonl); err != nil {
+		t.Fatalf("InsertEvent jsonl: %v", err)
+	}
+
+	// The proxy capture, arriving after: request body cut at the read cap, so
+	// br-GI-7-08 marks the capture incomplete.
+	proxy := fullEvent("req-gi7-merge-trunc")
+	proxy.Source, proxy.FirstSource = "proxy", "proxy"
+	proxy.CaptureComplete = false
+	proxy.InputTokens, proxy.OutputTokens = 100, 50
+	id, _, err := st.InsertEvent(ctx, proxy)
+	if err != nil {
+		t.Fatalf("InsertEvent proxy (merge): %v", err)
+	}
+
+	got, err := st.GetEvent(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	if got.InputTokens != 111 || got.OutputTokens != 55 {
+		t.Errorf("tokens = %d/%d, want the wholly-captured row's 111/55: a request-truncated "+
+			"capture must not win the pick", got.InputTokens, got.OutputTokens)
+	}
+	if !got.CaptureComplete {
+		t.Error("merged CaptureComplete = false, want true: one side captured the request whole")
+	}
+}
+
+// TestMergeDoesNotLetABodylessRowZeroObservedUsage is the hazard br-GI-7-09
+// introduced and its review caught, pinned in both orderings.
+//
+// Under --body-policy off the proxy writes a row with no bodies, and every
+// token column is zero because usage is parsed out of the response body it
+// never kept. That row also reports CaptureComplete *true* -- nothing was
+// narrowed -- so the flag-based pick hands it the win whenever it arrives
+// second, and the zero it carries is not a measurement. The merged row would
+// lose the transcript's real counts and gain a spurious source_mismatch.
+//
+// Both orderings are here because the thin row is the `incoming` argument in one
+// and the `existing` argument in the other -- the *same* `case existing.
+// CaptureComplete && incoming.CaptureComplete` both times, since both rows are
+// complete, so only the argument order differs and a fix that handled one
+// ordering would pass half the time. (`!existing && incoming` cannot fire here:
+// it needs an incomplete `existing`, and neither row is ever incomplete.)
+//
+// A first draft of this comment claimed the two orderings reached different
+// branches. They do not, and the claim survived into a bead before review caught
+// it -- removal of the guard below failing the test in *both* orderings is the
+// reading that shows it.
+func TestMergeDoesNotLetABodylessRowZeroObservedUsage(t *testing.T) {
+	for _, first := range []string{"jsonl", "proxy"} {
+		t.Run(first+" first", func(t *testing.T) {
+			st := newTestStore(t)
+			ctx := context.Background()
+
+			jsonl := fullEvent("req-gi7-off-merge")
+			jsonl.Source, jsonl.FirstSource = "jsonl", "jsonl"
+			jsonl.CaptureComplete = true
+			jsonl.InputTokens, jsonl.OutputTokens = 111, 55
+
+			// The off-policy row: complete, and empty because nothing was kept.
+			// All six token columns, not just the two the assertion reads --
+			// fullEvent populates the cache columns, and leaving them set made
+			// this fixture a row that *had* been measured, which is the
+			// opposite of the shape under test.
+			empty := fullEvent("req-gi7-off-merge")
+			empty.Source, empty.FirstSource = "proxy", "proxy"
+			empty.CaptureComplete = true
+			empty.InputTokens, empty.OutputTokens = 0, 0
+			empty.CacheWrite5mTokens, empty.CacheWrite1hTokens = 0, 0
+			empty.CacheReadTokens, empty.ThinkingTokens = 0, 0
+			empty.ReqBody, empty.RespBody = nil, nil
+
+			rows := []*Event{jsonl, empty}
+			if first == "proxy" {
+				rows[0], rows[1] = rows[1], rows[0]
+			}
+			if _, _, err := st.InsertEvent(ctx, rows[0]); err != nil {
+				t.Fatalf("InsertEvent first: %v", err)
+			}
+			id, _, err := st.InsertEvent(ctx, rows[1])
+			if err != nil {
+				t.Fatalf("InsertEvent second (merge): %v", err)
+			}
+
+			got, err := st.GetEvent(ctx, id)
+			if err != nil {
+				t.Fatalf("GetEvent: %v", err)
+			}
+			if got.InputTokens != 111 || got.OutputTokens != 55 {
+				t.Errorf("tokens = %d/%d, want the observed 111/55: a row with no bodies has no "+
+					"measurement to contribute, and its zeros are 'never looked', not 'none'",
+					got.InputTokens, got.OutputTokens)
+			}
+
+			// The other half of the same defect, and the half that fired in the
+			// *ordinary* proxy-first ordering rather than a race. mergeEvents's
+			// own contract says "a 0-vs-N difference is not a disagreement", but
+			// the completeness case set mismatch from tokensDiffer alone, so an
+			// absent side counted as a conflicting one and every off-policy
+			// merge grew a source_mismatch at SeverityError -- an error warning
+			// about a disagreement that never happened, on the row shape `off`
+			// produces for every call it records.
+			warnings, err := st.ListWarnings(ctx, WarningFilter{})
+			if err != nil {
+				t.Fatalf("ListWarnings: %v", err)
+			}
+			for _, w := range warnings {
+				if w.Kind == "source_mismatch" {
+					t.Errorf("a bodyless row raised %s (%s): no measurement was contradicted -- "+
+						"one side never looked", w.Kind, w.Detail)
+				}
+			}
+		})
+	}
+}
+
+// TestMergeStillWarnsOnATrueDisagreement is the negative half of the gate above,
+// which is the half a "stop warning" fix gets wrong: if the mismatch condition
+// is narrowed too far, a real disagreement goes unreported and nothing fails.
+//
+// Both rows are complete *and* both were measured, differing on the numbers --
+// the case source_mismatch exists for.
+func TestMergeStillWarnsOnATrueDisagreement(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	first := fullEvent("req-gi7-real-mismatch")
+	first.Source, first.FirstSource = "proxy", "proxy"
+	first.CaptureComplete = true
+	first.InputTokens, first.OutputTokens = 100, 50
+
+	second := fullEvent("req-gi7-real-mismatch")
+	second.Source, second.FirstSource = "jsonl", "jsonl"
+	second.CaptureComplete = true
+	second.InputTokens, second.OutputTokens = 111, 55
+
+	if _, _, err := st.InsertEvent(ctx, first); err != nil {
+		t.Fatalf("InsertEvent first: %v", err)
+	}
+	if _, _, err := st.InsertEvent(ctx, second); err != nil {
+		t.Fatalf("InsertEvent second (merge): %v", err)
+	}
+
+	// No EventID filter exists on WarningFilter, and none is needed: this store
+	// holds one merged event, so every warning it returns belongs to it.
+	warnings, err := st.ListWarnings(ctx, WarningFilter{})
+	if err != nil {
+		t.Fatalf("ListWarnings: %v", err)
+	}
+	found := false
+	for _, w := range warnings {
+		if w.Kind == "source_mismatch" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no source_mismatch for two complete captures that disagree on tokens; "+
+			"got %d warnings", len(warnings))
+	}
+}

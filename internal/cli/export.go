@@ -87,7 +87,7 @@ func exportJSON(ctx context.Context, w io.Writer, st *store.Store, filter store.
 		if page.Limit == 0 {
 			return nil
 		}
-		events, err := st.ListEvents(ctx, page)
+		events, err := st.ListEventsFull(ctx, page)
 		if err != nil {
 			return fmt.Errorf("export: %w", err)
 		}
@@ -128,6 +128,9 @@ func exportCSV(ctx context.Context, w io.Writer, st *store.Store, filter store.E
 		if page.Limit == 0 {
 			break
 		}
+		// The summary projection, not ListEventsFull: rowValues emits the
+		// scalar columns only (see this file's doc comment), so reading the
+		// blobs here would be 256 KB per row to write none of it.
 		events, err := st.ListEvents(ctx, page)
 		if err != nil {
 			return fmt.Errorf("export: %w", err)
@@ -161,7 +164,7 @@ func pageSize(limit, written int) int {
 	return exportPage
 }
 
-func rowValues(ev *store.Event) []string {
+func rowValues(ev *store.EventSummary) []string {
 	ended := ""
 	if ev.EndedAt != nil {
 		ended = ev.EndedAt.Format(time.RFC3339)

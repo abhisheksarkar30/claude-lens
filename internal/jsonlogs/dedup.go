@@ -26,6 +26,22 @@ type message struct {
 	Model      string      `json:"model"`
 	StopReason string      `json:"stop_reason"`
 	Usage      *usageShape `json:"usage"`
+
+	// Content is the message's own content array, kept as raw JSON: a real
+	// transcript carries text, thinking, tool_use and tool_result blocks in
+	// it, and decoding into a fixed shape here would discard whichever block
+	// type this struct did not anticipate. It is the one thing a transcript
+	// holds that the tool otherwise never sees -- the proxy cannot observe a
+	// transcript line and the transcript cannot observe a request.
+	Content json.RawMessage `json:"content"`
+
+	// Role comes from the transcript's own shape
+	// ({"message":{"role":"assistant","content":[...]}}). Only "assistant"
+	// lines carry Message at all (see the line doc above), so this is
+	// "assistant" in practice; it is read from the payload rather than
+	// hardcoded because the column is named transcript_role and should say
+	// what the transcript said.
+	Role string `json:"role"`
 }
 
 // usageShape mirrors the wire shape of Anthropic's usage object -- the

@@ -221,7 +221,7 @@ func (s *statusRecorder) status() int {
 // newestReplay returns the id of the newest recorded replay of origID, or 0
 // when that capture has never been replayed.
 func (a *api) newestReplay(ctx context.Context, origID int64) (int64, error) {
-	rows, err := a.store.ListEvents(ctx, store.EventFilter{ReplayOf: &origID, Limit: 1})
+	rows, err := a.store.ListEventsFull(ctx, store.EventFilter{ReplayOf: &origID, Limit: 1})
 	if err != nil {
 		return 0, err
 	}
@@ -246,7 +246,7 @@ func (a *api) newestReplay(ctx context.Context, origID int64) (int64, error) {
 func (a *api) awaitReplayRow(ctx context.Context, origID, afterID int64) (*store.Event, error) {
 	deadline := time.Now().Add(replayWait)
 	for {
-		rows, err := a.store.ListEvents(ctx, store.EventFilter{ReplayOf: &origID, Limit: 1})
+		rows, err := a.store.ListEventsFull(ctx, store.EventFilter{ReplayOf: &origID, Limit: 1})
 		if err != nil {
 			return nil, err
 		}

@@ -2,17 +2,78 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/sink"
 )
+
+// proxyServer starts the handler under test with its panic log captured, and
+// fails the test if anything panicked while it served.
+//
+// This exists because net/http RECOVERS a handler panic: it logs the stack to
+// the server's ErrorLog and closes the connection. The process survives, the
+// test binary survives, and unless a test happens to assert on the response
+// body or reach the sink, the suite stays green while the capture path panics
+// on every call and writes no row.
+//
+// That is not hypothetical. br-GI-7-09 shipped a nil-pointer in requestID that
+// did exactly this, and the only reason it was caught is that a reviewer
+// instrumented the switch by hand. Both of its failure modes are invisible to
+// an ordinary assertion: on the success path the row is simply missing, and on
+// the upstream-failure path the panic lands before WriteHeader(502), so the
+// client sees an aborted connection rather than a status to check. A recovered
+// panic is never an acceptable outcome here -- CLAUDE.md's fail-open invariant
+// says a broken observer must not affect the client, which a dropped connection
+// plainly does.
+//
+// Every proxy test goes through this, not just the ones about panics: the guard
+// is only worth having if it covers the paths nobody suspected.
+func proxyServer(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+
+	srv := httptest.NewUnstartedServer(h)
+	var mu sync.Mutex
+	var logged bytes.Buffer
+	srv.Config.ErrorLog = log.New(&lockedWriter{mu: &mu, w: &logged}, "", 0)
+	srv.Start()
+
+	t.Cleanup(func() {
+		srv.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		// The check runs at cleanup, after the body has been read and the
+		// handler has finished, so a panic from any request in the test is in
+		// the buffer by now.
+		if s := logged.String(); strings.Contains(s, "panic") {
+			t.Errorf("the proxy handler panicked while serving; net/http recovered it, so nothing "+
+				"else in this test would have failed:\n%s", s)
+		}
+	})
+	return srv
+}
+
+// lockedWriter serialises the server's log writes: net/http logs from the
+// connection's goroutine, and the test reads the buffer from its own.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
+}
 
 func testConfig(upstreamURL string) *config.Config {
 	cfg := config.Default()
@@ -37,7 +98,18 @@ func captureOne(t *testing.T, sk *sink.Sink) *sink.CapturedCall {
 // last SSE event until released, the client must see the first event
 // before the last one is written — proof the proxy never buffers the
 // stream to inspect it.
+//
+// Both policies, because they are two different wrappers on the response body
+// now: the tee under "full", and a bare pass-through closer under "off". The
+// off path is the one br-GI-7-09 added to the hot path, so the gate has to
+// cover it or the new wrapper is the only one on the stream without proof.
 func TestNoBufferingSSE(t *testing.T) {
+	for _, policy := range []string{"full", "off"} {
+		t.Run(policy, func(t *testing.T) { testNoBufferingSSE(t, policy) })
+	}
+}
+
+func testNoBufferingSSE(t *testing.T, policy string) {
 	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -51,12 +123,14 @@ func TestNoBufferingSSE(t *testing.T) {
 	}))
 	defer upstream.Close()
 
+	cfg := testConfig(upstream.URL)
+	cfg.BodyPolicy = policy
 	sk := sink.New(16)
-	h, err := New(testConfig(upstream.URL), sk)
+	h, err := New(cfg, sk)
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxySrv := httptest.NewServer(h)
+	proxySrv := proxyServer(t, h)
 	defer proxySrv.Close()
 
 	resp, err := http.Get(proxySrv.URL + "/v1/messages")
@@ -111,7 +185,7 @@ func TestByteIdentityNonStreaming(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxySrv := httptest.NewServer(h)
+	proxySrv := proxyServer(t, h)
 	defer proxySrv.Close()
 
 	resp, err := http.Post(proxySrv.URL+"/v1/messages", "application/json", strings.NewReader(reqBody))
@@ -143,7 +217,7 @@ func TestFailOpenOnUpstreamFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxySrv := httptest.NewServer(h)
+	proxySrv := proxyServer(t, h)
 	defer proxySrv.Close()
 
 	resp, err := http.Get(proxySrv.URL + "/v1/messages")
@@ -177,7 +251,7 @@ func TestBodyCapTruncation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxySrv := httptest.NewServer(h)
+	proxySrv := proxyServer(t, h)
 	defer proxySrv.Close()
 
 	resp, err := http.Get(proxySrv.URL + "/v1/messages")
@@ -199,6 +273,281 @@ func TestBodyCapTruncation(t *testing.T) {
 	}
 }
 
+// TestCaptureCompleteCoversBothBodies (br-GI-7-08) is the guard for the
+// defect the GI#7 manual run found: the flag was submitted as
+// !respBuf.truncated, the response buffer's alone, so a request body over the
+// cap produced a row reporting a complete capture while holding a prefix of
+// the request. Every other fixture in that story truncates a response, which
+// is why none of them could reach it.
+//
+// TestCaptureRecordsUnderPolicyOff is the assertion that fails at the *sink*
+// under the defect it was written for, not inside a handler: `New` used to
+// return the bare ReverseProxy when BodyPolicy was "off", before the closure
+// that injects captureState existed, so no row reached the sink at all and
+// nothing downstream could notice -- the row was simply absent.
+//
+// The banner at cli/serve.go promises "calls are recorded without their
+// bodies". This is that promise, in the only place it can be checked: a row
+// must arrive, must carry the metadata, and must carry no bodies.
+func TestCaptureRecordsUnderPolicyOff(t *testing.T) {
+	const reqBody = `{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}]}`
+	const respBody = `{"id":"msg_1","usage":{"input_tokens":5,"output_tokens":2}}`
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Request-Id", "req_off_policy")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(respBody))
+	}))
+	defer upstream.Close()
+
+	cfg := testConfig(upstream.URL)
+	cfg.BodyPolicy = "off"
+	sk := sink.New(16)
+	h, err := New(cfg, sk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxySrv := proxyServer(t, h)
+	defer proxySrv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/messages",
+		strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-ant-secret-value")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The pass-through wrapper must not alter what the client sees: it exists
+	// only so onClose can fire, and this is the assertion that fails if it is
+	// ever given a buffer.
+	got, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != respBody {
+		t.Fatalf("client received %q under policy off, want %q", got, respBody)
+	}
+
+	// captureOne fails the test on the 2s timeout, which is exactly the
+	// off-policy failure mode: no row, ever.
+	call := captureOne(t, sk)
+
+	if call.ReqBody != nil || call.RespBody != nil {
+		t.Errorf("bodies captured under policy off: ReqBody=%q RespBody=%q, want both nil",
+			call.ReqBody, call.RespBody)
+	}
+	if call.Status != http.StatusOK {
+		t.Errorf("Status = %d, want 200", call.Status)
+	}
+	// True because nothing was *narrowed*: an absent body is the policy's
+	// doing, not a cap's or a stream's. False here would fire
+	// stream_incomplete on every 200 and cost every off-policy row the merge
+	// token pick, neither of which has anything to do with a body.
+	if !call.CaptureComplete {
+		t.Error("CaptureComplete = false under policy off, want true (nothing was truncated)")
+	}
+	// The metadata half is the whole point of keeping the row: method, path,
+	// status and headers must all survive the narrowed capture.
+	//
+	// TTFB is deliberately not asserted positive. `time.Since` on a loopback
+	// round trip under Windows' coarse timer can legitimately measure 0, and a
+	// Duration has no presence bit, so "0" is not evidence the field was lost —
+	// asserting it made this test fail roughly one run in three at -count=10.
+	// What is checkable is that the row was submitted at all, which captureOne
+	// already enforces by failing on the sink timeout.
+	if call.Method != http.MethodPost || call.Path != "/v1/messages" {
+		t.Errorf("metadata lost: method=%q path=%q", call.Method, call.Path)
+	}
+	if call.ReqHeaders.Get("Content-Type") != "application/json" {
+		t.Errorf("req headers lost under policy off: %v", call.ReqHeaders)
+	}
+	if call.RespHeaders.Get("Request-Id") != "req_off_policy" {
+		t.Errorf("resp headers lost under policy off: %v", call.RespHeaders)
+	}
+	// Redaction is unconditional, and the off path is the one an operator
+	// chose *because* they care about what is stored: a route around it here
+	// would leak the credential the policy was set to protect.
+	if got := call.ReqHeaders.Get("Authorization"); strings.Contains(got, "sk-ant-secret-value") {
+		t.Errorf("Authorization not redacted under policy off: %q", got)
+	}
+}
+
+// TestPolicyOffSurvivesAMissingRequestID is the regression the first version of
+// br-GI-7-09 shipped. captureState.requestID hashes st.reqBody to build its
+// fallback key, and under "off" that field is nil -- so any call whose response
+// carried no Request-Id panicked on a nil *boundedBuffer. net/http recovers a
+// handler panic and logs it, so the suite stayed green while the row was
+// silently never submitted.
+//
+// Both paths are here because they reach the same line and only one of them
+// looks like an error: a 200 with no Request-Id, and an unreachable upstream,
+// where respHeaders is nil so the early return above cannot help and the panic
+// lands *before* ErrorHandler's WriteHeader(502) -- turning a failed upstream
+// into an aborted request and breaking fail-open for the client.
+func TestPolicyOffSurvivesAMissingRequestID(t *testing.T) {
+	tests := []struct {
+		name       string
+		upstream   func(t *testing.T) string
+		wantStatus int
+		wantRow    bool
+	}{
+		{
+			name: "no Request-Id header on a healthy response",
+			upstream: func(t *testing.T) string {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					// Deliberately no Request-Id: requestID must fall back.
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte(`{}`))
+				}))
+				t.Cleanup(srv.Close)
+				return srv.URL
+			},
+			wantStatus: http.StatusOK,
+			wantRow:    true,
+		},
+		{
+			name: "unreachable upstream, so respHeaders is nil",
+			upstream: func(t *testing.T) string {
+				// Nothing listens here -- every dial fails.
+				return "http://127.0.0.1:1"
+			},
+			wantStatus: http.StatusBadGateway,
+			wantRow:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig(tt.upstream(t))
+			cfg.BodyPolicy = "off"
+			sk := sink.New(16)
+			h, err := New(cfg, sk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			front := proxyServer(t, h)
+			defer front.Close()
+
+			resp, err := http.Get(front.URL + "/v1/messages")
+			if err != nil {
+				// The fail-open half: a panic inside submit aborts the
+				// connection before the error response is written, so the
+				// client sees this instead of a 502.
+				t.Fatalf("client got an aborted request instead of a response: %v", err)
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			call := captureOne(t, sk)
+			if call.Method != http.MethodGet {
+				t.Errorf("Method = %q, want GET", call.Method)
+			}
+			// The synthetic key is the whole reason requestID ran at all, and
+			// an empty one would collapse every off-policy row onto a single
+			// UNIQUE request_id.
+			if !strings.HasPrefix(call.RequestID, "proxy:") {
+				t.Errorf("RequestID = %q, want a proxy: synthetic key", call.RequestID)
+			}
+		})
+	}
+}
+
+// All the cases are one table on purpose. The regression this guards is as
+// much "the response half stopped being checked" as "the request half is not",
+// and a request-only test would let the first through.
+func TestCaptureCompleteCoversBothBodies(t *testing.T) {
+	const bodyCap = 64
+
+	var respLen int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Drain the request first: the tee only sees what upstream reads, so a
+		// handler that ignored the body would leave the buffer short and pass
+		// the over-cap case for the wrong reason.
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("draining the request body: %v", err)
+		}
+		w.Write([]byte(strings.Repeat("y", respLen)))
+	}))
+	defer upstream.Close()
+
+	cases := []struct {
+		name       string
+		reqLen     int
+		respLen    int
+		wantWhole  bool
+		wantReqCut bool
+		wantRespCt bool
+	}{
+		{"request over the cap", 200, 8, false, true, false},
+		{"request exactly at the cap", bodyCap, 8, true, false, false},
+		{"request under the cap", 10, 8, true, false, false},
+		{"response over the cap", 10, 200, false, false, true},
+		{"both over the cap", 200, 200, false, true, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			respLen = tc.respLen
+			cfg := testConfig(upstream.URL)
+			cfg.BodyCapBytes = bodyCap
+			sk := sink.New(16)
+			h, err := New(cfg, sk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxySrv := proxyServer(t, h)
+			defer proxySrv.Close()
+
+			reqBody := strings.Repeat("x", tc.reqLen)
+			resp, err := http.Post(proxySrv.URL+"/v1/messages", "application/json",
+				strings.NewReader(reqBody))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The client's view is unaffected either way: the cap bounds what
+			// clens stores, never what it forwards.
+			got, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if len(got) != tc.respLen {
+				t.Fatalf("client received %d bytes, want the full %d", len(got), tc.respLen)
+			}
+
+			call := captureOne(t, sk)
+			if call.CaptureComplete != tc.wantWhole {
+				t.Errorf("CaptureComplete = %v, want %v", call.CaptureComplete, tc.wantWhole)
+			}
+			wantReq := tc.reqLen
+			if wantReq > bodyCap {
+				wantReq = bodyCap
+			}
+			if len(call.ReqBody) != wantReq {
+				t.Errorf("ReqBody = %d bytes, want %d", len(call.ReqBody), wantReq)
+			}
+			if tc.wantReqCut && len(call.ReqBody) != bodyCap {
+				t.Errorf("a request reported as cut is not at the cap: %d", len(call.ReqBody))
+			}
+			wantResp := tc.respLen
+			if wantResp > bodyCap {
+				wantResp = bodyCap
+			}
+			if len(call.RespBody) != wantResp {
+				t.Errorf("RespBody = %d bytes, want %d", len(call.RespBody), wantResp)
+			}
+			if tc.wantRespCt && len(call.RespBody) != bodyCap {
+				t.Errorf("a response reported as cut is not at the cap: %d", len(call.RespBody))
+			}
+		})
+	}
+}
+
 func TestResponseDerivedRequestIDWins(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Request-Id", "req_abc123")
@@ -211,7 +560,7 @@ func TestResponseDerivedRequestIDWins(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxySrv := httptest.NewServer(h)
+	proxySrv := proxyServer(t, h)
 	defer proxySrv.Close()
 
 	resp, err := http.Post(proxySrv.URL+"/v1/messages", "application/json", strings.NewReader("{}"))
@@ -237,7 +586,7 @@ func TestHashFallbackTwoAttemptsProduceDistinctIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	proxySrv := httptest.NewServer(h)
+	proxySrv := proxyServer(t, h)
 	defer proxySrv.Close()
 
 	const body = `{"model":"claude-sonnet-5"}`

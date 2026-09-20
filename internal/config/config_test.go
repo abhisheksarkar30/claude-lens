@@ -82,11 +82,38 @@ func TestValidateRejectsNonLoopbackWithoutAllowRemote(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsBadBodyPolicy(t *testing.T) {
-	cfg := Default()
-	cfg.BodyPolicy = "sometimes"
-	if err := cfg.Validate(); err == nil {
-		t.Fatal("Validate: want error for invalid BodyPolicy")
+// TestBodyPolicyAcceptsExactlyTheValuesThatDoSomething pins the accepted set in
+// both directions. The positive half is the one that matters: "truncated" was
+// accepted for the project's whole life and read nowhere, so an assertion that
+// only checked the negative would have been green throughout the defect.
+//
+// It is rejected rather than aliased to "full" deliberately. On a flag that
+// decides what content reaches the database, a value reading as "narrow it"
+// while storing the body whole is worse than no value at all, and this flag's
+// default is the permissive one.
+func TestBodyPolicyAcceptsExactlyTheValuesThatDoSomething(t *testing.T) {
+	for _, policy := range []string{"full", "off"} {
+		cfg := Default()
+		cfg.BodyPolicy = policy
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate rejected %q, which the proxy branches on: %v", policy, err)
+		}
+	}
+
+	for _, policy := range []string{"truncated", "sometimes", "", "FULL"} {
+		cfg := Default()
+		cfg.BodyPolicy = policy
+		err := cfg.Validate()
+		if err == nil {
+			t.Errorf("Validate accepted %q, which no code path reads", policy)
+			continue
+		}
+		// The message has to name the real choice, not just reject: someone
+		// who set "truncated" needs to be told what to set instead, and the
+		// old message advertised the value being removed.
+		if policy == "truncated" && !strings.Contains(err.Error(), "full or off") {
+			t.Errorf("the error for %q does not name the accepted values: %v", policy, err)
+		}
 	}
 }
 

@@ -157,7 +157,12 @@ Admin cost report, per `(day, model)`. Divergence past an absolute-dollar thresh
 `cost_drift` — the signal that the price table is stale.
 
 `source_mismatch` is the other half: the same `request_id` arriving from two sources with
-disagreeing token counts. It is raised by the store's merge, not by an analyze rule, and is one of
+disagreeing token counts. **Two measurements are required for a disagreement** — a side with no
+observed usage at all is absent, not contradicting, which is the contract `mergeEvents` already
+documented and the merge now enforces. A row captured under `--body-policy off` carries zeros in every
+token column because usage is parsed from a body it never kept; ungated, that made every off-policy
+merge raise this kind at `SeverityError`. It is raised by the store's merge, not by an analyze rule,
+and is one of
 the five kinds in `nonAnalyzeKinds` ([internal/analyze/kinds.go](../../internal/analyze/kinds.go)) —
 the list a README check uses to expect a kind with no rule in that package. See the README's
 warning-kind table, which `internal/analyze/readme_test.go` pins against `AllKinds()`.

@@ -22,7 +22,8 @@ const eventWriteColumns = `
 	is_sidechain, session_id, project, git_branch, client_version, cli_entrypoint,
 	cost_usd, api_equivalent_cost_usd, cost_source,
 	prefix_hash, replay_of, replay_edits, capture_complete,
-	method, path, status, req_headers, resp_headers, req_body, resp_body`
+	method, path, status, req_headers, resp_headers, req_body, resp_body,
+	transcript_content, transcript_role`
 
 func eventWriteArgs(ev *Event) []any {
 	return []any{
@@ -37,6 +38,7 @@ func eventWriteArgs(ev *Event) []any {
 		nullableFloat(ev.CostUSD), nullableFloat(ev.ApiEquivalentCostUSD), ev.CostSource,
 		nullableString(ev.PrefixHash), ev.ReplayOf, ev.ReplayEdits, boolToInt(ev.CaptureComplete),
 		nullEmptyString(ev.Method), nullEmptyString(ev.Path), nullZeroInt(ev.Status), nullEmptyString(ev.ReqHeaders), nullEmptyString(ev.RespHeaders), ev.ReqBody, ev.RespBody,
+		ev.TranscriptContent, nullEmptyString(ev.TranscriptRole),
 	}
 }
 
@@ -152,13 +154,55 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 		existing.CacheReadTokens != incoming.CacheReadTokens ||
 		existing.ThinkingTokens != incoming.ThinkingTokens
 
+	// The rule is "prefer the more complete record". Both halves of a capture
+	// count: since br-GI-7-08 CaptureComplete is also false when only the
+	// *request* body was cut at the read cap, a proxy row in that state no
+	// longer wins this pick against a wholly-captured jsonl row for the same
+	// request. That is deliberate and conservative -- with one body known to
+	// be a prefix, the record that is whole is the safer one to quote -- and
+	// it costs nothing in visibility, because a differing pair is still
+	// reported through `mismatch` above. Pinned by a test so a later change
+	// to it is a decision rather than a side effect.
 	winner := existing
 	switch {
 	case existing.CaptureComplete && incoming.CaptureComplete:
 		winner = incoming
-		mismatch = tokensDiffer
+		// A disagreement needs two measurements. This function's own contract
+		// says "a 0-vs-N difference is not a disagreement", and under
+		// --body-policy off that is exactly the pair a merge produces: the
+		// proxy row looked at nothing, so all six of its columns are zero, and
+		// ungated this fired a source_mismatch at SeverityError on every
+		// off-policy call that merged -- in the *ordinary* proxy-first
+		// ordering, not a race. Reproduced before it was fixed.
+		mismatch = tokensDiffer && usageObserved(existing) && usageObserved(incoming)
 	case !existing.CaptureComplete && incoming.CaptureComplete:
 		winner = incoming
+	}
+
+	// ...with one correction, which the completeness flag alone cannot make.
+	// A row captured under --body-policy off reports CaptureComplete true --
+	// nothing was narrowed, the body was simply never kept -- and carries no
+	// usage at all, because usage is parsed out of the response body. Under the
+	// rule above that row *wins* whenever it arrives second, zeroing the
+	// populated tokens of the jsonl row it merged with, and the zero is not a
+	// measurement: it means "never observed", the same distinction
+	// cost-and-quota draws between an unpriced row and a $0.00 one. So a row
+	// with no observed usage never takes the pick from a row that has some.
+	//
+	// Both-zero and both-nonzero keep the flag's decision untouched: the first
+	// has nothing to lose, and the second is the ordinary two-captures case
+	// this rule was written for. winner is only ever one of the two arguments,
+	// so the identity test below is exact.
+	if !usageObserved(winner) {
+		loser := incoming
+		if winner == incoming {
+			loser = existing
+		}
+		if usageObserved(loser) {
+			// No mismatch here either: the swap happens precisely *because*
+			// one side never looked, which is an absence, not a conflict.
+			winner = loser
+		}
 	}
 
 	merged.InputTokens = winner.InputTokens
@@ -264,8 +308,36 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	if len(existing.RespBody) == 0 {
 		merged.RespBody = incoming.RespBody
 	}
+	// The transcript columns are written by one side only -- internal/jsonlogs.
+	// A new column with no rule here would be silently dropped from the
+	// incoming side, and the common ordering is proxy-first: the capture is
+	// written live and the reconstruction arrives minutes later, so "no rule"
+	// means the content is discarded exactly when it finally shows up.
+	//
+	// These two are structurally transcript-only, so "a capture and a
+	// reconstruction disagree" is not reachable for them: a proxy row's value
+	// is always empty and only an empty existing cell is backfilled. The rule
+	// is the merge's general one -- the first-written side keeps its value --
+	// stated here so a future column written by both sides is a decision rather
+	// than an accident of the copy.
+	if len(existing.TranscriptContent) == 0 {
+		merged.TranscriptContent = incoming.TranscriptContent
+	}
+	merged.TranscriptRole = preferNonEmpty(existing.TranscriptRole, incoming.TranscriptRole)
 
 	return &merged, mismatch
+}
+
+// usageObserved reports whether a row carries any measured token count at all.
+// It is the "was this ever observed" test, not a "was this expensive" one: a row
+// captured under --body-policy off has no usage because usage is parsed out of
+// the response body, and every one of its token columns is the zero value of
+// never having looked. Reading that zero as a measurement is the same error as
+// reading an unpriced API row's absent cost as $0.00.
+func usageObserved(ev *Event) bool {
+	return ev.InputTokens != 0 || ev.OutputTokens != 0 ||
+		ev.CacheWrite5mTokens != 0 || ev.CacheWrite1hTokens != 0 ||
+		ev.CacheReadTokens != 0 || ev.ThinkingTokens != 0
 }
 
 func preferNonEmpty(existing, incoming string) string {

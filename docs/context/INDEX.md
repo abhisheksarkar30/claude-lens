@@ -34,11 +34,11 @@ Three non-stdlib modules and no more: `modernc.org/sqlite` (pure Go, no cgo),
 | [workflows.md](workflows.md) | to understand a flow end to end before changing it | conditional — trigger: flows spanning more than one package |
 | [security-and-permissions.md](security-and-permissions.md) | **before touching credentials, redaction, listeners, or an import edge** | conditional — trigger: `internal/secret`, the redactor, the Origin guard |
 | [data-privacy-and-compliance.md](data-privacy-and-compliance.md) | before changing what is captured, or how long it is kept | conditional — trigger: the body policy, the cap, retention, `clens purge` |
-| [testing-and-quality.md](testing-and-quality.md) | before writing a test, or wondering what CI gates on | conditional — trigger: 50 test files |
+| [testing-and-quality.md](testing-and-quality.md) | before writing a test, or wondering what CI gates on | conditional — trigger: 51 test files |
 | [infra-and-deploy.md](infra-and-deploy.md) | before touching a workflow, a hook, or branch policy | conditional — trigger: `.github/workflows/` |
 | [integrations-and-external-services.md](integrations-and-external-services.md) | before changing a collector or adding a dependency | conditional — trigger: four external endpoints, three Go modules |
-| [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 838 lines of hand-written JS under a hard no-build-step rule |
-| [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — six genuine forks, each with a rejected alternative a change could reintroduce |
+| [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 1030 lines of hand-written JS under a hard no-build-step rule |
+| [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — seven genuine forks, each with a rejected alternative a change could reintroduce |
 
 ## Grounding rules for agents
 
@@ -107,3 +107,66 @@ GI#5 — said the token is compared "after every `await`". It is not. In the `[d
 same token, because `show` bumps the generation itself. The plan's D10 already records that ceiling;
 the doc did not, and an overclaim in a doc whose whole job is telling an agent which guard is
 load-bearing is exactly the failure this tree exists to prevent. Corrected in place.
+
+**2026-09-20 — REFRESH, scoped to `GI-7-header-and-body-visibility`** (beads `br-GI-7-01` … `-09`;
+plan `docs/planning/GI-7-header-and-body-visibility.md` v8). **No module was added or retired.**
+`decisions/` gained its **first ADR since the initial generation** — [007](decisions/007-schema-migrations-by-user-version.md),
+`PRAGMA user_version` migrations — which is why the decision count above moved six → seven and the
+`decisions/` hint changed. 007 is also the first record here whose status is *supersedes a GI-1
+decision* rather than a standalone fork, so [000](decisions/000-index.md) now says which kind it is.
+
+**Twelve module files changed and one was created — this index makes fourteen:**
+`storage-schema.md` (a new *How the schema gets applied* section; the `events` row now names the
+transcript columns and 47 total), `api-surface.md` (the `/api/mode` route; the list projection and
+why it is a *type*; the three detail fields and `Completeness`'s integer spellings; and every
+`api.go` line reference re-pointed — the route block moved down 18 lines, which no diff of *this*
+file would ever show), `dashboard.md`
+(the badge, the body/header renderers, the re-measured line counts, and a warning about `funcBody`'s
+CRLF assumption), `glossary.md` (`EventSummary`/`Event`, `Completeness`, the transcript columns, the
+cap, the badge), `workflows.md` §1 and §2 (`CaptureComplete` covers both teed buffers; the merge's
+new preference), `data-privacy-and-compliance.md`, `security-and-permissions.md` (a new *Untrusted
+rendering* section), `cli-and-tooling.md` (`show`'s capture and read-path markers), `architecture.md`
+and `decisions/003` (both carried the "no migrations" claim), `testing-and-quality.md` (five
+invariant rows and the size figures, re-measured — this story took the test-file count 50 → 51),
+`decisions/000-index.md`, and the new `decisions/007-…md`. **Everything else came
+back *no changes needed*** — `conventions.md`, `build-and-run.md`, `infra-and-deploy.md`,
+`integrations-and-external-services.md`, and `decisions/001`, `-002`, `-004`, `-005`, `-006`.
+`cost-and-quota.md` came back unchanged at this refresh and changed in the follow-up below.
+
+**This refresh found a control that silently does not reach a path it appears to cover** —
+`--body-policy`/`--body-cap-bytes` governed what the *proxy* kept (`BodyPolicy` had exactly one call
+site) while `internal/jsonlogs` never consulted them, so the story's own new
+`transcript_content`/`transcript_role` columns were stored whole and uncapped even under
+`--body-policy off`. Neither the plan nor `br-GI-7-06` mentioned the policy, so the intent was not
+recoverable and the finding was recorded as `❓ UNVERIFIED` rather than asserted either way.
+
+**That finding was then escalated and fixed, and the fix found a bigger defect underneath it**
+(`br-GI-7-09`, committed after this refresh ran — the paragraph above describes the tree as this
+refresh left it). Eleven of the module files were updated again for the fix, and **two joined the
+list that had come back clean**: `cost-and-quota.md` (`source_mismatch` now needs two *measurements*,
+which is what its own contract always said) and `build-and-run.md` (the flag table, where the body
+policy's real behaviour belongs). `api-surface.md`,
+`decisions/000-index.md` and `decisions/007` were unaffected by the fix. Answering *"does the
+policy reach source B?"* required answering *"what does the policy mean?"*, and `off` turned out to
+mean **no rows at all**: the proxy returned the bare `ReverseProxy` before the closure that installs
+capture state existed, so an operator choosing the most private setting silently lost the records —
+while `clens serve`'s banner promised "calls are recorded without their bodies", and `printBanner`'s
+own doc comment disagreed with the string beneath it. The code now matches the words, in both
+sources. The bead also fixed a knock-on it created: a bodyless row is `CaptureComplete` true with
+every token column zero, which made the merge both *prefer* it over a row with real counts and raise
+`source_mismatch` at `SeverityError` claiming a disagreement that never happened.
+
+**One more value went the same way, after the fix above.** `--body-policy` had a third spelling,
+`truncated`, accepted by `Validate` and read by no code path — so `full` and `truncated` ran
+byte-identical code, and the value that reads as *narrow it* stored the body whole. It is now
+rejected at startup with a message naming `full` and `off`, rather than aliased to `full`.
+`data-privacy-and-compliance.md`, `build-and-run.md` and `decisions/003` moved with it; `README.md`
+is outside the generated tree. See `br-GI-7-09`'s decision log for why rejection beat aliasing.
+
+The class is the same one `CaptureComplete` belonged to, and it appeared four times in one story: a
+control that looks like it covers a path and does not. `CaptureComplete` was derived from one buffer
+of two (fixed in `br-GI-7-08`, found by the manual run); the body policy reached one source of two
+(fixed in `br-GI-7-09`, found by this refresh); its third value reached nothing at all (fixed in the
+same bead); and none was visible to any test — the first because every fixture truncated a response,
+the second because the one test that read the banner checked its text and not its claim, the third
+because no test asserted the *accepted* set, only a rejected one.

@@ -71,7 +71,7 @@ var allKinds = []KindInfo{
 	{KindThinkingDisplayOmitted, SeverityInfo, "Thinking was on and billed, but thinking.display defaulted to omitted -- reasoning paid for but not received."},
 	{KindMaxTokensTruncation, SeverityWarn, "stop_reason was max_tokens: the turn was cut off mid-thought and will be retried at more cost."},
 	{KindRefusal, SeverityWarn, "stop_reason was refusal."},
-	{KindStreamIncomplete, SeverityError, "The SSE stream ended without a message_stop event."},
+	{KindStreamIncomplete, SeverityError, "The capture is incomplete: a body was truncated at the read cap, or the SSE stream ended before message_stop. The row does not record which."},
 	{KindRateLimited, SeverityWarn, "HTTP 429 was returned."},
 	{KindOverloaded, SeverityError, "HTTP 529 was returned."},
 	{KindUpstreamError, SeverityError, "An error object arrived inside a 200 body, or the upstream request failed outright."},

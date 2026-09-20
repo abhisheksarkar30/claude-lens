@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/analyze"
@@ -187,6 +190,26 @@ func Serve(args []string) error {
 		return accts, nil
 	})
 
+	// The read path's decode cap, the same value the consumer decodes with
+	// above. internal/api cannot read it itself: internal/config is under the
+	// import guard, and the default lives unexported in internal/consumer.
+	dashAPI.SetBodyCapBytes(cfg.BodyCapBytes)
+
+	// The mode badge's two facts. Injected rather than read in internal/api
+	// because the settings read lives here, in internal/cli, which already
+	// imports internal/api -- the reverse edge would be a build cycle.
+	dashAPI.SetProxyMode(func(ctx context.Context) (api.ProxyMode, error) {
+		at, err := st.LatestProxyStartedAt(ctx)
+		if err != nil {
+			return api.ProxyMode{}, err
+		}
+		base, ok := readSettingsBaseURL(filepath.Join(claudeConfigDir(), "settings.json"))
+		return api.ProxyMode{
+			Configured: configuredAgainst(base, ok, cfg.ProxyAddr),
+			Observed:   !at.IsZero() && time.Since(at) <= proxyRecentWindow,
+		}, nil
+	})
+
 	dashSrv := &http.Server{Addr: cfg.DashboardAddr, Handler: dashAPI}
 
 	printBanner(os.Stdout, cfg)
@@ -248,6 +271,57 @@ func Serve(args []string) error {
 	return nil
 }
 
+// proxyRecentWindow bounds "observed": a proxy row newer than this means the
+// proxy is receiving. Without a stated window the state has no boundary and no
+// test can pin it.
+const proxyRecentWindow = 5 * time.Minute
+
+// configuredAgainst answers the badge's "configured" half: does the client's
+// ANTHROPIC_BASE_URL point at this process's ProxyAddr?
+//
+// readSettingsBaseURL reports ("", false) for a missing or unparseable
+// settings.json *or* a missing ANTHROPIC_BASE_URL, and that is Unknown rather
+// than a mismatch -- the printed-banner onboarding path tells the user to
+// export the variable in their shell, where settings.json cannot see it.
+func configuredAgainst(settings string, ok bool, proxyAddr string) api.ProxyConfigured {
+	if !ok {
+		return api.ProxyConfiguredUnknown
+	}
+	if normalizeAddr(settings) == normalizeAddr(proxyAddr) {
+		return api.ProxyConfiguredMatch
+	}
+	return api.ProxyConfiguredMismatch
+}
+
+// normalizeAddr reduces an address to host:port so the two sides can be
+// compared at all.
+//
+// Without this the check fails on the tool's own output: printBanner writes
+// "http://127.0.0.1:8797" while cfg.ProxyAddr is the bare "127.0.0.1:8797",
+// and readSettingsBaseURL returns the settings string verbatim. A string
+// equality test would report the bad state for a correctly-pointed client --
+// the one thing this indicator exists to get right.
+//
+// A bare host with no port normalizes to itself, so it never matches a
+// host:port. That is deliberate: the port is the signal.
+func normalizeAddr(s string) string {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+	}
+	if i := strings.IndexByte(s, '/'); i >= 0 {
+		s = s[:i]
+	}
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		return strings.ToLower(s)
+	}
+	if strings.EqualFold(host, "localhost") {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(strings.ToLower(host), port)
+}
+
 // checkRedaction runs the startup leak self-test over stored request headers
 // and reports the first failure through logf. It logs and continues rather
 // than refusing to start: a reachable credential is worth knowing about, but
@@ -258,7 +332,11 @@ func Serve(args []string) error {
 // one calls. proxy.RedactCheck takes one call's header JSON, so the scan is
 // this loop rather than a store method.
 func checkRedaction(ctx context.Context, st *store.Store, logf func(string, ...any)) {
-	events, err := st.ListEvents(ctx, store.EventFilter{Limit: redactScanLimit})
+	// ListEventsFull, not ListEvents: this check reads ReqHeaders to prove the
+	// redactor ran. On the summary projection ReqHeaders is not there to read,
+	// and a version that skipped every row would report zero findings — a
+	// security control silently disabled, with no error and no log.
+	events, err := st.ListEventsFull(ctx, store.EventFilter{Limit: redactScanLimit})
 	if err != nil {
 		logf("serve: redaction self-test: %v", err)
 		return
@@ -328,8 +406,14 @@ func credentialState(name string) api.Credential {
 }
 
 // printBanner prints the copy-pasteable ANTHROPIC_BASE_URL line, the dashboard
-// URL, and -- when body capture is off -- the standing "nothing is being
-// recorded" warning.
+// URL, and -- when body capture is off -- the standing warning that calls are
+// recorded without their bodies. It says "without their bodies" and not
+// "nothing is being recorded" because that is what the code does: since
+// br-GI-7-09 the proxy still writes a row under "off", carrying method, path,
+// status, timing and redacted headers, with both body columns NULL. Before
+// that fix this comment and the string below disagreed, and the code matched
+// the comment -- an operator setting the most private policy lost the records
+// too.
 func printBanner(w io.Writer, cfg *config.Config) {
 	fmt.Fprintln(w, "claude-lens is running.")
 	fmt.Fprintf(w, "  export ANTHROPIC_BASE_URL=http://%s\n", cfg.ProxyAddr)

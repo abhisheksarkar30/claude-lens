@@ -2,10 +2,17 @@ package store
 
 import "time"
 
-// Event is one row in events: one observed turn, from source "proxy" or
-// "jsonl". TotalPromptTokens is recomputed by the store on every write
-// (invariant 4) — a caller-supplied value is ignored, never trusted.
-type Event struct {
+// EventSummary is an event row's scalar block: everything Event carries
+// except the four header/body blobs. It is the type ListEvents returns, so
+// the list path never reads a body out of SQLite — and a caller that needs
+// one cannot reach it, because the field is not there to name. That
+// compile error is the point: with a flag on the query instead, a caller
+// that forgot it would silently receive nil where it needed bytes, and a
+// body-less jsonl row is byte-identical on the wire to an unselected one.
+//
+// TotalPromptTokens is recomputed by the store on every write (invariant 4)
+// — a caller-supplied value is ignored, never trusted.
+type EventSummary struct {
 	ID          int64
 	RequestID   string
 	Source      string
@@ -61,18 +68,48 @@ type Event struct {
 	ReplayOf    string
 	ReplayEdits string
 
-	// CaptureComplete is false when the body was truncated or the stream
-	// ended without message_stop — the merge-precedence flag.
+	// CaptureComplete is false when either body was truncated or the stream
+	// ended without message_stop — the merge-precedence flag. Which of the
+	// two bodies was cut is not recorded on the row; the detail view names
+	// it by comparing each stored body's length against the read cap it was
+	// configured with.
 	CaptureComplete bool
 
 	// Proxy-only, empty for a source="jsonl" row.
-	Method      string
-	Path        string
-	Status      int
+	Method string
+	Path   string
+	Status int
+}
+
+// Event is one row in events: one observed turn, from source "proxy" or
+// "jsonl".
+//
+// The scalar block is embedded rather than duplicated because Event's wire
+// keys are its Go field names: a second, hand-kept copy could drift from
+// EventSummary field-by-field and silently split the list wire from the
+// detail wire. encoding/json flattens an embedded struct, so the detail
+// route's JSON is unchanged by the split.
+//
+// The four blobs stay direct fields, which is what keeps them off the list
+// path — see EventSummary.
+type Event struct {
+	EventSummary
+
+	// Proxy-only, empty for a source="jsonl" row.
 	ReqHeaders  string // redacted header JSON
 	RespHeaders string // redacted header JSON
 	ReqBody     []byte
 	RespBody    []byte
+
+	// Transcript-only, empty for a source="proxy" row. A transcript excerpt is
+	// a reconstruction of intent, not a wire capture: one assistant message,
+	// not the request that produced it, and it excludes the system prompt, the
+	// tool schemas, and everything the proxy sees. The columns are named for
+	// that so a reader cannot mistake one for a capture.
+	//
+	// A transcript carries no headers at all -- not redacted, absent.
+	TranscriptContent []byte
+	TranscriptRole    string
 }
 
 // Warning is one analyzer finding attached to an event. (event_id, kind) is

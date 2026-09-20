@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -16,7 +18,10 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/andybalholm/brotli"
+
 	"github.com/abhisheksarkar30/claude-lens/internal/consumer"
+	"github.com/abhisheksarkar30/claude-lens/internal/decode"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/sink"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
@@ -41,7 +46,7 @@ var seedCounter atomic.Int64
 func seedEvent(t *testing.T, st *store.Store, opts func(*store.Event)) *store.Event {
 	t.Helper()
 	cost := 0.01
-	ev := &store.Event{
+	ev := &store.Event{EventSummary: store.EventSummary{
 		RequestID:      "req_" + strconv.FormatInt(seedCounter.Add(1), 10),
 		Source:         "proxy",
 		FirstSource:    "proxy",
@@ -55,8 +60,7 @@ func seedEvent(t *testing.T, st *store.Store, opts func(*store.Event)) *store.Ev
 		CostSource:     "shipped",
 		Method:         "POST",
 		Path:           "/v1/messages",
-		Status:         200,
-	}
+		Status:         200}}
 	if opts != nil {
 		opts(ev)
 	}
@@ -390,5 +394,351 @@ func TestEmbeddedAssetsServedWithoutExternalFetch(t *testing.T) {
 	// The page the user opens is really the index page, not an empty shell.
 	if !strings.Contains(getOK(t, handler, "/").Body.String(), "<title>") {
 		t.Error("GET / did not serve the dashboard's index page")
+	}
+}
+
+// --- the list projections (br-GI-7-01) ------------------------------------
+
+// assertNoBodyColumns checks both halves of the projection guarantee at once:
+// the response is small, and it names none of the blob columns. The size
+// bound is what makes it non-vacuous -- the fixtures below are sized so a
+// single leaked body would blow far past it. The key list is the four
+// header/body columns plus br-GI-7-06's two transcript columns, because
+// EventSummary names none of the six and the list path must not read any of
+// them (plan D1/F3.3).
+func assertNoBodyColumns(t *testing.T, body []byte, what string) {
+	t.Helper()
+	if len(body) > 64*1024 {
+		t.Errorf("%s response = %d bytes, want under 64 KB", what, len(body))
+	}
+	for _, key := range []string{
+		"ReqBody", "RespBody", "ReqHeaders", "RespHeaders",
+		"TranscriptContent", "TranscriptRole",
+	} {
+		if bytes.Contains(body, []byte(`"`+key+`"`)) {
+			t.Errorf("%s response carries a %q key", what, key)
+		}
+	}
+}
+
+// seedFiftyWithBodies stores 50 rows each carrying a 1 MB request/response
+// body and a 1 MB transcript reconstruction, which is the fixture both
+// projection tests need: 50 MB stored on the wire columns and 50 MB on the
+// transcript columns, so the 64 KB bound is a real assertion rather than a
+// formality for either class.
+func seedFiftyWithBodies(t *testing.T, st *store.Store, opts func(*store.Event)) {
+	t.Helper()
+	big := bytes.Repeat([]byte("x"), 1<<20)
+	for i := 0; i < 50; i++ {
+		seedEvent(t, st, func(ev *store.Event) {
+			ev.ReqBody, ev.RespBody = big, big
+			ev.ReqHeaders = `{"authorization":["[redacted]"]}`
+			ev.RespHeaders = `{"content-type":["application/json"]}`
+			ev.TranscriptContent, ev.TranscriptRole = big, "assistant"
+			if opts != nil {
+				opts(ev)
+			}
+		})
+	}
+}
+
+// TestListRouteOmitsBodies (T1): the Calls list is the dashboard's hottest
+// fetch and renders none of the body columns -- the wire bodies or the
+// transcript reconstruction.
+func TestListRouteOmitsBodies(t *testing.T) {
+	st := newTestStore(t)
+	seedFiftyWithBodies(t, st, nil)
+	handler, _, _, _ := newTestAPI(t, st)
+
+	assertNoBodyColumns(t, getOK(t, handler, "/api/requests?limit=50").Body.Bytes(), "list")
+}
+
+// TestSessionRouteOmitsBodies (T2) asserts both halves for the session route.
+// The length half is load-bearing: with Calls typed as EventSummary the
+// "no body key" half is already guaranteed by the type checker and catches
+// nothing new, so a non-empty calls[] is what stops an empty array satisfying
+// the size bound vacuously.
+func TestSessionRouteOmitsBodies(t *testing.T) {
+	st := newTestStore(t)
+	const sid = "sess_big"
+	ctx := context.Background()
+	seedFiftyWithBodies(t, st, func(ev *store.Event) { ev.SessionID = sid })
+	// A session's own row is written separately from its events, so the route
+	// 404s until both exist.
+	if err := st.UpsertSession(ctx, sid, "", time.Now()); err != nil {
+		t.Fatalf("UpsertSession: %v", err)
+	}
+	if err := st.ReconcileSession(ctx, sid); err != nil {
+		t.Fatalf("ReconcileSession: %v", err)
+	}
+	handler, _, _, _ := newTestAPI(t, st)
+
+	body := getOK(t, handler, "/api/sessions/"+sid).Body.Bytes()
+	assertNoBodyColumns(t, body, "session")
+
+	var got struct {
+		Calls []json.RawMessage `json:"calls"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode session: %v", err)
+	}
+	if len(got.Calls) != 50 {
+		t.Errorf("calls = %d, want 50", len(got.Calls))
+	}
+}
+
+// --- the detail route's decoded response body (br-GI-7-03, T4) ------------
+
+// brotliBody encodes data as a brotli stream. That is what a stored response
+// body routinely is: Claude Code advertises "br" and the proxy tees the bytes
+// unmodified, so the detail view cannot decode them in the browser --
+// DecompressionStream has no br support and the no-build-step rule forbids
+// bundling a library.
+func brotliBody(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := brotli.NewWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		t.Fatalf("brotli write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("brotli close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// gzipBody encodes data as a gzip stream -- see TestDetailMarksCorruptTailBody
+// for why the corrupt-tail case needs this rather than brotli.
+func gzipBody(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// detailFor seeds one stored proxy row and serves its detail. wireCap is
+// applied only when non-nil, so the unwired-seam case is expressible.
+func detailFor(t *testing.T, body []byte, respHeaders string, wireCap *int) eventDetail {
+	t.Helper()
+	st := newTestStore(t)
+	ev := seedEvent(t, st, func(e *store.Event) {
+		e.RespBody = body
+		e.RespHeaders = respHeaders
+	})
+	handler, _, _, _ := newTestAPI(t, st)
+	if wireCap != nil {
+		handler.SetBodyCapBytes(*wireCap)
+	}
+	path := "/api/requests/" + strconv.FormatInt(ev.ID, 10)
+	return decodeJSON[eventDetail](t, getOK(t, handler, path).Body)
+}
+
+func intPtr(n int) *int { return &n }
+
+func TestDetailDecodesResponseBody(t *testing.T) {
+	plain := []byte(`{"type":"message","content":[{"type":"text","text":"hi"}]}`)
+	got := detailFor(t, brotliBody(t, plain), `{"Content-Encoding":["br"]}`, intPtr(1<<20))
+
+	if got.RespBodyCompleteness != decode.Complete {
+		t.Errorf("Completeness = %v, want Complete", got.RespBodyCompleteness)
+	}
+	if !bytes.Equal(got.RespBodyDecoded, plain) {
+		t.Errorf("RespBodyDecoded = %q, want the decoded body", got.RespBodyDecoded)
+	}
+	// The stored bytes are never rewritten: replay reads them straight from
+	// the row, so a decode that wrote back would change what a replay sends.
+	if !bytes.Equal(got.RespBody, brotliBody(t, plain)) {
+		t.Error("RespBody was rewritten; decoding must be display-only")
+	}
+}
+
+func TestDetailExactCapBodyIsComplete(t *testing.T) {
+	payload := bytes.Repeat([]byte("abcdefgh"), 128) // exactly 1024
+	got := detailFor(t, brotliBody(t, payload), `{"Content-Encoding":["br"]}`, intPtr(1024))
+
+	if got.RespBodyCompleteness != decode.Complete {
+		t.Errorf("Completeness = %v, want Complete (the withdrawn len==cap test would say TruncatedAtCap)",
+			got.RespBodyCompleteness)
+	}
+	if !bytes.Equal(got.RespBodyDecoded, payload) {
+		t.Errorf("len(RespBodyDecoded) = %d, want %d", len(got.RespBodyDecoded), len(payload))
+	}
+}
+
+func TestDetailMarksCapTruncatedBody(t *testing.T) {
+	payload := bytes.Repeat([]byte("abcdefgh"), 512)
+	got := detailFor(t, brotliBody(t, payload), `{"Content-Encoding":["br"]}`, intPtr(1024))
+
+	if got.RespBodyCompleteness != decode.TruncatedAtCap {
+		t.Errorf("Completeness = %v, want TruncatedAtCap", got.RespBodyCompleteness)
+	}
+	if !bytes.Equal(got.RespBodyDecoded, payload[:1024]) {
+		t.Error("RespBodyDecoded is not the decoded prefix")
+	}
+}
+
+// detailRawFor is detailFor's raw-body twin: the same fixture, but the bytes
+// the browser receives rather than the decoded eventDetail. The distinction is
+// the whole point of the test below -- decoding into eventDetail compares the
+// typed constant, which passes for any encoding at all.
+func detailRawFor(t *testing.T, body []byte, respHeaders string, wireCap *int) []byte {
+	t.Helper()
+	st := newTestStore(t)
+	ev := seedEvent(t, st, func(e *store.Event) {
+		e.RespBody = body
+		e.RespHeaders = respHeaders
+	})
+	handler, _, _, _ := newTestAPI(t, st)
+	if wireCap != nil {
+		handler.SetBodyCapBytes(*wireCap)
+	}
+	return getOK(t, handler, "/api/requests/"+strconv.FormatInt(ev.ID, 10)).Body.Bytes()
+}
+
+// TestDetailPinsCompletenessWireValue pins the *numeric* form of
+// RespBodyCompleteness that app.js reads. app.js hard-codes
+// COMPLETE=0 .. NOT_DECODED=3 (app.js:113-116) and compares them as integers in
+// readPathMarker.
+//
+// Every other Go test decodes the response into eventDetail and compares the
+// typed constant, which is enough for a reordered iota -- the constants move
+// with the code and those tests fail. What none of them can see is the wire
+// *spelling*, because they decode and encode through the same codec: a change
+// that is self-consistent on the Go side (a paired Marshal/Unmarshal, or the
+// type becoming a string) round-trips through every one of them and turns every
+// marker branch in the browser false, rendering a truncated or corrupt body
+// with no marker. That is the "absence indistinguishable from a failure" class
+// this story exists to close, and this is the only test that reads the bytes
+// the browser actually receives.
+//
+// All four values, not just the one a cap-truncated fixture happens to
+// produce: pinning one integer leaves the other three free to drift, and they
+// are most of the mapping the browser depends on.
+func TestDetailPinsCompletenessWireValue(t *testing.T) {
+	// The same payload TestDetailMarksCorruptTailBody uses, and deliberately:
+	// the cut points below were read off the real decoder rather than assumed.
+	// gzip emits incrementally, so half its stream still yields a prefix; a
+	// heavily repetitive payload compresses so far that a naive half of a
+	// *smaller* one lands on NotDecoded instead, which is how the first draft
+	// of this table was wrong.
+	payload := bytes.Repeat([]byte(`{"content":"a longer body "}`), 512)
+	gz := gzipBody(t, payload)
+	br := brotliBody(t, payload)
+
+	cases := []struct {
+		name string
+		body []byte
+		hdr  string
+		cap  *int
+		want int
+	}{
+		// A body with no Content-Encoding returns early and is Complete, so
+		// the tool's ordinary case can never be labelled undecodable.
+		{"Complete", []byte(`{"ok":true}`), `{"Content-Type":["application/json"]}`, intPtr(1024), 0},
+		{"TruncatedAtCap", br, `{"Content-Encoding":["br"]}`, intPtr(1024), 1},
+		{"PartialCorrupt", gz[:len(gz)/2], `{"Content-Encoding":["gzip"]}`, intPtr(1 << 20), 2},
+		// brotli emits per meta-block, so a stream cut near its start decodes
+		// to nothing at all. Cutting it *late* is worse than useless as a
+		// fixture -- a prefix of these bytes is one byte short of the whole
+		// stream and the reader reports Complete on the six bytes it got.
+		{"NotDecoded", br[:10], `{"Content-Encoding":["br"]}`, intPtr(1 << 20), 3},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := detailRawFor(t, tc.body, tc.hdr, tc.cap)
+			want := `"RespBodyCompleteness":` + strconv.Itoa(tc.want)
+			if !bytes.Contains(raw, []byte(want)) {
+				t.Errorf("detail does not carry %s -- app.js compares %d as an integer and would "+
+					"draw no marker:\n%s", want, tc.want, raw)
+			}
+		})
+	}
+}
+
+// TestDetailMarksCorruptTailBody uses gzip, not brotli, and that is not a
+// convenience: brotli's reader emits per meta-block, so a stream cut mid-way
+// decodes to *zero* bytes and lands on NotDecoded rather than here. gzip and
+// zstd emit incrementally, so a truncated stream really does yield a clean
+// prefix followed by a read error. Claude Code advertises all four codings, so
+// both shapes reach a stored row.
+func TestDetailMarksCorruptTailBody(t *testing.T) {
+	payload := bytes.Repeat([]byte(`{"content":"a longer body "}`), 512)
+	whole := gzipBody(t, payload)
+	got := detailFor(t, whole[:len(whole)/2], `{"Content-Encoding":["gzip"]}`, intPtr(1<<20))
+
+	if got.RespBodyCompleteness != decode.PartialCorrupt {
+		t.Fatalf("Completeness = %v, want PartialCorrupt", got.RespBodyCompleteness)
+	}
+	if len(got.RespBodyDecoded) == 0 {
+		t.Error("RespBodyDecoded is empty, want the decoded prefix")
+	}
+	if !bytes.Equal(got.RespBodyDecoded, payload[:len(got.RespBodyDecoded)]) {
+		t.Error("RespBodyDecoded is not a prefix of the original")
+	}
+}
+
+func TestDetailFallsBackToRawOnCorruptBody(t *testing.T) {
+	raw := append([]byte{0xff, 0xff, 0xff, 0xff}, bytes.Repeat([]byte{0xff}, 32)...)
+	got := detailFor(t, raw, `{"Content-Encoding":["br"]}`, intPtr(1<<20))
+
+	if got.RespBodyCompleteness != decode.NotDecoded {
+		t.Errorf("Completeness = %v, want NotDecoded", got.RespBodyCompleteness)
+	}
+	if !bytes.Equal(got.RespBodyDecoded, raw) {
+		t.Error("RespBodyDecoded is not the raw body")
+	}
+	// A body we cannot read is a rendering state, not a server error.
+	if got.BodyCapBytes != 1<<20 {
+		t.Errorf("BodyCapBytes = %d, want the wired cap", got.BodyCapBytes)
+	}
+}
+
+func TestDetailUnencodedBodyIsComplete(t *testing.T) {
+	plain := []byte("data: {\"type\":\"message_start\"}\n\n")
+	got := detailFor(t, plain, `{"Content-Type":["text/event-stream"]}`, intPtr(1<<20))
+
+	if got.RespBodyCompleteness != decode.Complete {
+		t.Errorf("Completeness = %v, want Complete -- a body that needs no decompression is not NotDecoded",
+			got.RespBodyCompleteness)
+	}
+	if !bytes.Equal(got.RespBodyDecoded, plain) {
+		t.Errorf("RespBodyDecoded = %q, want %q", got.RespBodyDecoded, plain)
+	}
+}
+
+// TestDetailUnwiredCapServesRawBody is the guard against decode.Body's
+// non-positive-limit error being surfaced as a decode failure: on a body that
+// decodes fine, that would render "it would not decompress".
+func TestDetailUnwiredCapServesRawBody(t *testing.T) {
+	plain := []byte(`{"type":"message"}`)
+	encoded := brotliBody(t, plain)
+	hdr := `{"Content-Encoding":["br"]}`
+
+	for _, tc := range []struct {
+		name    string
+		wireCap *int
+	}{
+		{"never wired", nil},
+		{"wired to zero", intPtr(0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := detailFor(t, encoded, hdr, tc.wireCap)
+			if got.BodyCapBytes != 0 {
+				t.Errorf("BodyCapBytes = %d, want 0", got.BodyCapBytes)
+			}
+			if got.RespBodyCompleteness == decode.NotDecoded {
+				t.Error("Completeness = NotDecoded; a missing cap must not manufacture a decode failure")
+			}
+			if !bytes.Equal(got.RespBodyDecoded, encoded) {
+				t.Error("RespBodyDecoded is not the raw stored body")
+			}
+		})
 	}
 }

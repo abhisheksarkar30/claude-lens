@@ -56,10 +56,16 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 		},
 	}
 
-	if cfg.BodyPolicy == "off" {
-		return rp, nil
-	}
 	bodyCap := cfg.BodyCapBytes
+
+	// "off" narrows what is *kept*, not what is recorded. The row still
+	// carries method, path, status, redacted headers and timing; only the two
+	// bodies are dropped, which is what --body-policy's own banner promises
+	// ("calls are recorded without their bodies"). Returning the bare
+	// ReverseProxy here -- which this did until br-GI-7-09 -- installed no
+	// captureState, so no row reached the sink at all and an operator reaching
+	// for the most private setting silently lost the records too.
+	captureBodies := cfg.BodyPolicy != "off"
 
 	rp.ModifyResponse = func(res *http.Response) error {
 		st, ok := res.Request.Context().Value(stateKey{}).(*captureState)
@@ -70,13 +76,37 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 
 		status := res.StatusCode
 		respHeaders := redactHeaders(res.Header)
+		if !captureBodies {
+			// No buffer and no TeeReader: this wrapper copies no bytes, it
+			// exists only so onClose knows the call is over. CaptureComplete
+			// is true because nothing was narrowed -- an absent body is the
+			// policy's doing, not a cap's or a stream's.
+			orig := res.Body
+			res.Body = &teeCloser{r: orig, c: orig, onClose: func() {
+				st.submit(status, respHeaders, nil, true, nil)
+			}}
+			return nil
+		}
 		respBuf := newBoundedBuffer(bodyCap)
 		orig := res.Body
 		res.Body = &teeCloser{
 			r: io.TeeReader(orig, respBuf),
 			c: orig,
 			onClose: func() {
-				st.submit(status, respHeaders, respBuf.Bytes(), !respBuf.truncated, nil)
+				// Both buffers, not just the response's. A request body over the
+				// cap is stored as a prefix just as a response body is, and
+				// reporting only one half leaves the row claiming a complete
+				// capture while holding a truncated request -- the exact
+				// "truncated looks identical to complete" defect the marker
+				// exists to prevent, in the half a response-side fixture never
+				// reaches.
+				//
+				// st.reqBody is non-nil here and needs no guard: this closure
+				// runs only on the captureBodies path, where the field is set
+				// before the request is sent and the request's body is fully
+				// teed by the time the response body closes.
+				st.submit(status, respHeaders, respBuf.Bytes(),
+					!respBuf.truncated && !st.reqBody.truncated, nil)
 			},
 		}
 		return nil
@@ -85,9 +115,6 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authKind := ClassifyAuthKind(r.Header)
 
-		reqBuf := newBoundedBuffer(bodyCap)
-		r.Body = &teeCloser{r: io.TeeReader(r.Body, reqBuf), c: r.Body}
-
 		st := &captureState{
 			start:       time.Now(),
 			method:      r.Method,
@@ -95,9 +122,13 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 			remoteAddr:  r.RemoteAddr,
 			authKind:    authKind,
 			reqHeaders:  redactHeaders(r.Header),
-			reqBody:     reqBuf,
 			sk:          sk,
 			fallbackSeq: fallbackSeqCounter,
+		}
+		if captureBodies {
+			reqBuf := newBoundedBuffer(bodyCap)
+			r.Body = &teeCloser{r: io.TeeReader(r.Body, reqBuf), c: r.Body}
+			st.reqBody = reqBuf
 		}
 		if rm, ok := r.Context().Value(replayKey{}).(ReplayMeta); ok {
 			st.noCapture = rm.NoCapture
@@ -198,6 +229,12 @@ func (st *captureState) submit(status int, respHeaders http.Header, respBody []b
 	if st.noCapture {
 		return
 	}
+	// reqBody is nil under --body-policy off, and nil is the point: the column
+	// is NULL, which means "no body was kept", never a zero-length body.
+	var reqBody []byte
+	if st.reqBody != nil {
+		reqBody = st.reqBody.Bytes()
+	}
 	st.sk.Submit(&sink.CapturedCall{
 		StartedAt:       st.start,
 		TTFB:            st.ttfb,
@@ -209,7 +246,7 @@ func (st *captureState) submit(status int, respHeaders http.Header, respBody []b
 		AuthKind:        st.authKind,
 		ReqHeaders:      st.reqHeaders,
 		RespHeaders:     respHeaders,
-		ReqBody:         st.reqBody.Bytes(),
+		ReqBody:         reqBody,
 		RespBody:        respBody,
 		CaptureComplete: captureComplete,
 		ReplayOf:        st.replayOf,
@@ -235,7 +272,21 @@ func (st *captureState) requestID(respHeaders http.Header) string {
 		}
 	}
 	attempt := atomic.AddUint64(st.fallbackSeq, 1)
-	sum := sha256.Sum256(st.reqBody.Bytes())
+	// reqBody is nil under --body-policy off, and the hash of it is a
+	// constant. That costs the key nothing: this branch is already the
+	// fallback for "upstream sent no Request-Id", and the started_at_ns and
+	// attempt fields below are what make the key unique. The hash's only job is
+	// to *separate* two calls whose bodies differ; two calls whose bodies are
+	// alike hash alike, which is why the attempt counter is what keeps them
+	// apart -- and a body we never kept has no hash to contribute either way.
+	// Guarded rather than branched at the call site because this runs on the
+	// ErrorHandler path too, where respHeaders is nil and the early return
+	// above cannot help.
+	var reqBody []byte
+	if st.reqBody != nil {
+		reqBody = st.reqBody.Bytes()
+	}
+	sum := sha256.Sum256(reqBody)
 	return fmt.Sprintf("proxy:%x:%d:%d", sum, st.start.UnixNano(), attempt)
 }
 

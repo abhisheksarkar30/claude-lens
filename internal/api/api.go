@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/consumer"
+	"github.com/abhisheksarkar30/claude-lens/internal/decode"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/sink"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
@@ -46,7 +47,12 @@ import (
 // an interface, not a concrete type).
 type Store interface {
 	GetEvent(ctx context.Context, id int64) (*store.Event, error)
-	ListEvents(ctx context.Context, f store.EventFilter) ([]*store.Event, error)
+	ListEvents(ctx context.Context, f store.EventFilter) ([]*store.EventSummary, error)
+
+	// ListEventsFull is the replay poll's read: replay.OutcomeOf takes a whole
+	// row, so the poll -- one row per interval, not fifty per tab switch --
+	// names the full-width read explicitly.
+	ListEventsFull(ctx context.Context, f store.EventFilter) ([]*store.Event, error)
 	CountEvents(ctx context.Context, f store.EventFilter) (int, error)
 	EventWarnings(ctx context.Context, eventID int64) ([]store.Warning, error)
 	ListWarnings(ctx context.Context, f store.WarningFilter) ([]store.Warning, error)
@@ -55,7 +61,7 @@ type Store interface {
 	GetSession(ctx context.Context, id string) (*store.Session, error)
 	ListSessions(ctx context.Context, limit, offset int) ([]*store.Session, error)
 	CountSessions(ctx context.Context) (int, error)
-	SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error)
+	SessionEventsSummary(ctx context.Context, sessionID string) ([]*store.EventSummary, error)
 	StatsSummary(ctx context.Context, f store.EventFilter) (store.StatsSummary, error)
 	StatsByModel(ctx context.Context, f store.EventFilter) ([]store.ModelStats, error)
 	StatsByPeriod(ctx context.Context, f store.EventFilter, granularity string) ([]store.PeriodStats, error)
@@ -116,6 +122,16 @@ type api struct {
 	// routes answer 503 instead, and the tab shows the error.
 	sourceHealth func(ctx context.Context) ([]SourceHealth, error)
 	accounts     func(ctx context.Context) (Accounts, error)
+
+	// bodyCapBytes is the read-path decode cap, injected by SetBodyCapBytes.
+	// 0 means unwired, which is a supported state -- see decodeRespBody.
+	bodyCapBytes int
+
+	// proxyMode backs GET /api/mode. It is a seam for the same reason
+	// sourceHealth is one: the settings read lives in internal/cli, and
+	// internal/cli already imports this package, so the reverse edge is a
+	// build cycle rather than a guard violation.
+	proxyMode func(ctx context.Context) (ProxyMode, error)
 }
 
 // SetPricing wires GET/POST /api/prices to loader's table and override file.
@@ -137,7 +153,9 @@ func (a *api) SetIngestTrigger(fn func(ctx context.Context) error) { a.ingestTri
 // SetSourceHealth wires GET /api/sources to fn, which reads per-collector
 // health out of internal/ingest. Leaving it unset is supported: the route
 // answers 503 rather than an empty list.
-func (a *api) SetSourceHealth(fn func(ctx context.Context) ([]SourceHealth, error)) { a.sourceHealth = fn }
+func (a *api) SetSourceHealth(fn func(ctx context.Context) ([]SourceHealth, error)) {
+	a.sourceHealth = fn
+}
 
 // SetAccounts wires GET /api/accounts (and the subscription half of
 // GET /api/quota) to fn, which reads the configured accounts out of
@@ -187,6 +205,7 @@ func New(st Store, sk *sink.Sink, cons *consumer.Consumer, broker *Broker, asset
 	mux.HandleFunc("/api/accounts", methodGet(a.listAccounts))
 	mux.HandleFunc("/api/models", methodGet(a.models))
 	mux.HandleFunc("/api/reconcile", methodGet(a.reconcile))
+	mux.HandleFunc("/api/mode", methodGet(a.mode))
 	mux.HandleFunc("POST /api/accounts", a.saveAccounts)
 	mux.HandleFunc("POST /api/secrets", a.setSecret)
 	mux.HandleFunc("POST /api/ingest", a.triggerIngest)
@@ -364,10 +383,69 @@ func (a *api) listRequests(w http.ResponseWriter, r *http.Request) {
 }
 
 // eventDetail is /api/requests/{id}'s response shape: the event's own
-// fields (promoted from the embedded pointer) plus its warnings attached.
+// fields (promoted from the embedded pointer) plus its warnings attached,
+// plus the decoded response body and the two fields that keep it honest.
 type eventDetail struct {
 	*store.Event
 	Warnings []store.Warning `json:"warnings"`
+
+	// RespBodyDecoded is the response bytes the view renders: the decoded
+	// form when the cap was wired and decoding ran, and the raw RespBody
+	// otherwise. Equalling RespBody does NOT by itself mean "undecoded" --
+	// that is also true of a body with no Content-Encoding.
+	RespBodyDecoded []byte `json:"RespBodyDecoded"`
+	// RespBodyCompleteness is what decides the view's marker.
+	// NotDecoded means RespBodyDecoded is RespBody unchanged.
+	RespBodyCompleteness decode.Completeness `json:"RespBodyCompleteness"`
+	// BodyCapBytes == 0 means the read cap is unwired -- never a zero-byte
+	// cap. The view selects its "cap not configured" line off this *before*
+	// consulting RespBodyCompleteness, so a missing cap can never manufacture
+	// the "would not decompress" state.
+	BodyCapBytes int `json:"BodyCapBytes"`
+}
+
+// decodeRespBody returns the bytes the detail view should render for a stored
+// response, how complete they are, and the cap they were read under.
+//
+// Decoding is display-only and never rewrites the stored row: replay sends
+// orig.ReqBody/orig.RespHeaders straight from the row, so nothing here has a
+// route back to a replay.
+func (a *api) decodeRespBody(ev *store.Event) ([]byte, decode.Completeness, int) {
+	if a.bodyCapBytes <= 0 {
+		// The seam is unwired. Do not call decode.Body: with a non-positive
+		// limit it returns the raw body *and* an error, which the view would
+		// render as "would not decompress" for a body that decodes fine.
+		// BodyCapBytes == 0 is what says so. The bytes served are the whole
+		// stored body, so Complete is accurate and draws no marker.
+		return ev.RespBody, decode.Complete, 0
+	}
+	// A malformed header blob degrades to an empty header set, which carries
+	// no Content-Encoding and is therefore Complete: the body is shown raw,
+	// never a 500.
+	hdr := http.Header{}
+	if ev.RespHeaders != "" {
+		_ = json.Unmarshal([]byte(ev.RespHeaders), &hdr)
+	}
+	decoded, _, completeness, err := decode.Body(hdr, ev.RespBody, a.bodyCapBytes)
+	if err != nil {
+		return ev.RespBody, decode.NotDecoded, a.bodyCapBytes
+	}
+	return decoded, completeness, a.bodyCapBytes
+}
+
+// SetBodyCapBytes wires the read-path decode cap. A non-positive n is
+// ignored, so leaving the seam unwired is a supported state and a zero can
+// never reach decode.Body.
+//
+// The cap has to be injected because this package cannot read it: the
+// configured BodyCapBytes lives in internal/config, which the import guard
+// bans, and the cap's default is unexported in internal/consumer, so the
+// consumer import this package already holds still buys no reachable
+// fallback.
+func (a *api) SetBodyCapBytes(n int) {
+	if n > 0 {
+		a.bodyCapBytes = n
+	}
 }
 
 func (a *api) getRequest(w http.ResponseWriter, r *http.Request) {
@@ -393,7 +471,14 @@ func (a *api) getRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, eventDetail{Event: ev, Warnings: warnings})
+	decoded, completeness, cap := a.decodeRespBody(ev)
+	writeJSON(w, http.StatusOK, eventDetail{
+		Event:                ev,
+		Warnings:             warnings,
+		RespBodyDecoded:      decoded,
+		RespBodyCompleteness: completeness,
+		BodyCapBytes:         cap,
+	})
 }
 
 type statsResponse struct {
@@ -533,10 +618,12 @@ func (a *api) listSessions(w http.ResponseWriter, r *http.Request) {
 // cost totals, invariant 5) plus its calls and their combined warnings.
 type sessionDetail struct {
 	*store.Session
-	// Calls is chronological: store.SessionEvents already returns
+	// Calls is chronological: store.SessionEventsSummary already returns
 	// oldest-first (bounded by the session resolver's own gap window), so
-	// unlike deepseek-lens's getSession this needs no reversal.
-	Calls []*store.Event `json:"calls"`
+	// unlike deepseek-lens's getSession this needs no reversal. Summary rows,
+	// not full ones: this route renders a call list, and a session's rows can
+	// run to fifty 1 MB bodies the list never shows.
+	Calls []*store.EventSummary `json:"calls"`
 	// Warnings is the union of every warning raised across the session's
 	// calls, one entry per occurrence.
 	Warnings []store.Warning `json:"warnings"`
@@ -554,7 +641,7 @@ func (a *api) getSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	calls, err := a.store.SessionEvents(r.Context(), id)
+	calls, err := a.store.SessionEventsSummary(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

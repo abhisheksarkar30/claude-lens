@@ -358,10 +358,10 @@ func TestReplayGateBounds(t *testing.T) {
 	at := replayCostThresholdUSD
 	f := func(v float64) *float64 { return &v }
 
-	if _, gated := replayGate(&store.Event{CostUSD: f(at)}); gated {
+	if _, gated := replayGate(&store.Event{EventSummary: store.EventSummary{CostUSD: f(at)}}); gated {
 		t.Fatalf("a row costing exactly $%.2f was gated; the boundary should be allowed", at)
 	}
-	if _, gated := replayGate(&store.Event{CostUSD: f(at + 0.01)}); !gated {
+	if _, gated := replayGate(&store.Event{EventSummary: store.EventSummary{CostUSD: f(at + 0.01)}}); !gated {
 		t.Fatal("a row over the threshold was not gated")
 	}
 	if reason, gated := replayGate(&store.Event{}); !gated || !strings.Contains(reason, "unpriced") {
@@ -369,7 +369,7 @@ func TestReplayGateBounds(t *testing.T) {
 	}
 	// A subscription row has no cost_usd at all -- its api-equivalent figure is
 	// the only thing that can bound the replay, so it has to be consulted.
-	if _, gated := replayGate(&store.Event{ApiEquivalentCostUSD: f(9.0)}); !gated {
+	if _, gated := replayGate(&store.Event{EventSummary: store.EventSummary{ApiEquivalentCostUSD: f(9.0)}}); !gated {
 		t.Fatal("a subscription row's api-equivalent cost did not gate the replay")
 	}
 }

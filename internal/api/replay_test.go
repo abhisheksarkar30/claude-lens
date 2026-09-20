@@ -94,7 +94,7 @@ func (f *replayFixture) capture(t *testing.T) *store.Event {
 
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		rows, err := f.st.ListEvents(context.Background(), store.EventFilter{Source: "proxy", Limit: 1})
+		rows, err := f.st.ListEventsFull(context.Background(), store.EventFilter{Source: "proxy", Limit: 1})
 		if err != nil {
 			t.Fatalf("ListEvents: %v", err)
 		}
@@ -128,7 +128,7 @@ func (f *replayFixture) postReplay(t *testing.T, id int64, host, origin, query s
 // row on the table, which after a replay is the replay.
 func (f *replayFixture) recordedReplay(t *testing.T, origID int64) *store.Event {
 	t.Helper()
-	rows, err := f.st.ListEvents(context.Background(), store.EventFilter{ReplayOf: &origID, Limit: 1})
+	rows, err := f.st.ListEventsFull(context.Background(), store.EventFilter{ReplayOf: &origID, Limit: 1})
 	if err != nil {
 		t.Fatalf("ListEvents: %v", err)
 	}

@@ -18,11 +18,31 @@ an explicit policy to narrow it:
 | `--body-policy` | Behaviour |
 |---|---|
 | `full` (**default**) | body captured whole, up to `--body-cap-bytes` |
-| `truncated` | narrowed before storage |
-| `off` | no body captured |
+| `off` | no body captured; the **call is still recorded** (br-GI-7-09) |
+
+There were three values, and the third was `truncated` — accepted by `Validate` and read nowhere, so
+it executed byte-identical code to `full`. It is now **rejected**, not aliased (see below).
 
 `events.capture_complete` records whether what was stored is the whole thing or was narrowed, so a
-reader can tell "this is everything" from "this is what we kept".
+reader can tell "this is everything" from "this is what we kept". It covers **both** bodies since
+`br-GI-7-08`; before that it was derived from the response buffer alone, so a request body cut at the
+cap was stored as a prefix with the row still reporting a whole capture. It is a *capture* flag:
+`off`, where nothing was captured, leaves it true, and so does a `transcript_content` narrowed at the
+cap, because a reconstruction is not a capture.
+
+Two corrections since this record was written, both of which change what the policy above actually
+buys you and neither of which invalidates the decision itself:
+
+- **`off` did not mean "no bodies".** Until `br-GI-7-09` the proxy returned the bare `ReverseProxy`
+  under `off`, so *no call row was written at all* — a strictly larger withholding than the flag, the
+  banner, this file and the README all described. The code now matches the words.
+- **`truncated` was inert, and is now gone.** `config.Validate` accepted it and `internal/proxy`'s only
+  policy branch is `== "off"`, so it executed byte-identical code to `full` — the value that reads as
+  *narrow it* stored the body whole. Whether it was ever meant to mean *uncapped* is not recorded
+  anywhere, and that is the reason it is rejected rather than aliased to `full`: on a flag whose whole
+  job is deciding what content reaches the database, the permissive default is the wrong side to
+  silently land on when the operator's intent was plainly the other one. A `config.toml` or script
+  still passing it now fails at startup with a message naming the two values that work.
 
 Credentials are kept out by a separate mechanism — redaction before the tee
 ([../security-and-permissions.md](../security-and-permissions.md)) — not by refusing to store

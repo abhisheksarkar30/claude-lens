@@ -190,8 +190,40 @@ func runChecks(cfg *config.Config) []doctorCheck {
 
 	checks = append(checks, secretProtectionCheck())
 	checks = append(checks, clientConfigCheck())
+	checks = append(checks, dbSchemaCheck(cfg))
 
 	return checks
+}
+
+// dbSchemaCheck reports the database's schema version beside the one this
+// binary knows.
+//
+// After a successful Open the two are equal by construction -- Open migrates
+// before it returns -- so the FAIL branch is Open's own failure, which is where
+// a version skew surfaces (a database written by a newer clens is refused
+// there, not reported as a mismatch here). The number is still worth printing:
+// it answers "did this database get brought forward?", which is otherwise only
+// answerable by reading the file's header, and reading a WAL-mode SQLite
+// file's bytes does not answer it at all.
+//
+// It opens its own connection rather than reusing sourceHealthRows': the two
+// sit either side of the checks block, and doctor is a diagnostic run once by
+// hand, not a hot path. Opening here also means a `clens doctor` on a database
+// that has never been migrated brings it forward, which is the same side effect
+// sourceHealthRows has always had.
+func dbSchemaCheck(cfg *config.Config) doctorCheck {
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		return doctorCheck{"db_schema", statusFail, err.Error()}
+	}
+	defer st.Close()
+
+	v, err := st.UserVersion(context.Background())
+	if err != nil {
+		return doctorCheck{"db_schema", statusFail, err.Error()}
+	}
+	return doctorCheck{"db_schema", statusPass,
+		fmt.Sprintf("version %d (this binary: %d)", v, store.SchemaVersion())}
 }
 
 // portCheck reports whether addr can currently be bound. A bind failure

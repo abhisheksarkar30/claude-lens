@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"io"
@@ -41,7 +42,7 @@ func seedEvent(t *testing.T, st *store.Store, ev *store.Event) int64 {
 // apiRow and subRow are the two billing shapes the split tests need. The
 // figures are deliberately far apart so a merged total would be obvious.
 func apiRow(requestID string, cost float64) *store.Event {
-	return &store.Event{
+	return &store.Event{EventSummary: store.EventSummary{
 		RequestID:      requestID,
 		Source:         "proxy",
 		BillingMode:    "api",
@@ -54,9 +55,7 @@ func apiRow(requestID string, cost float64) *store.Event {
 		CostSource:     "shipped",
 		Status:         200,
 		Method:         "POST",
-		Path:           "/v1/messages",
-		ReqBody:        []byte(`{"model":"claude-sonnet-5","max_tokens":1024}`),
-	}
+		Path:           "/v1/messages"}, ReqBody: []byte(`{"model":"claude-sonnet-5","max_tokens":1024}`)}
 }
 
 func subRow(requestID string, equivalent float64) *store.Event {
@@ -615,6 +614,41 @@ func TestNewTailerGuardKeepsTheSeededBillingMode(t *testing.T) {
 	}
 }
 
+// TestNewTailerWiresTheBodyPolicy is br-GI-7-09's wiring half, read back through
+// the Tailer's BodyPolicy() accessor.
+//
+// The seam is the whole point: internal/jsonlogs deliberately does not import
+// internal/config, so the policy can only arrive from this one helper. Deleting
+// the wiring line leaves the tailer on its seeded "full" default, which is
+// exactly the state the bead was written about -- an install running
+// --body-policy off still storing transcript content whole. Asserting the
+// tailer's *own* behaviour would pass either way; only reading back what
+// newTailer wired can fail.
+func TestNewTailerWiresTheBodyPolicy(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+
+	cfg := config.Default()
+	cfg.BodyPolicy = "off"
+	cfg.BodyCapBytes = 4096
+
+	policy, capBytes := newTailer(cfg, t.TempDir(), st).BodyPolicy()
+	if policy != "off" || capBytes != 4096 {
+		t.Errorf("BodyPolicy() = (%q, %d), want (off, 4096) -- newTailer did not wire the configured policy",
+			policy, capBytes)
+	}
+
+	// And it is the configured value, not a constant: a second, different
+	// config must come back different, or the assertion above would pass on a
+	// hard-coded "off".
+	cfg.BodyPolicy = "full"
+	cfg.BodyCapBytes = 1024
+	policy, capBytes = newTailer(cfg, t.TempDir(), st).BodyPolicy()
+	if policy != "full" || capBytes != 1024 {
+		t.Errorf("BodyPolicy() = (%q, %d), want (full, 1024)", policy, capBytes)
+	}
+}
+
 // T14: newTailer consumes resolvedAPIPrefixes rather than a hand-rolled list,
 // in both directions. Read through the ModelBilling() accessor beside
 // Account(). Dropping the resolver from newTailer -- so that the shipped
@@ -652,5 +686,110 @@ func TestNewTailerWiresResolvedAPIPrefixes(t *testing.T) {
 	}
 	if account != "payg" || mode != "api" {
 		t.Errorf("ModelBilling = (%q, %q), want (payg, api)", account, mode)
+	}
+}
+
+// TestLsJSONKeepsBodyFields (T3, br-GI-7-01): `ls --json` is a
+// machine-readable contract that encodes each whole row, so its read must name
+// ListEventsFull explicitly. On the summary projection the four header/body
+// keys would vanish from the output with no error and no test failure -- the
+// exact class of silent contract change this bead exists to prevent.
+//
+// It decodes into store.Event rather than into a map, which also pins that
+// moving the scalar block into an embedded EventSummary left the wire keys
+// alone.
+func TestLsJSONKeepsBodyFields(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+	ev := apiRow("req_bodies", 1.0)
+	ev.ReqHeaders = `{"authorization":["[redacted]"]}`
+	ev.RespHeaders = `{"content-type":["application/json"]}`
+	ev.ReqBody = []byte(`{"model":"claude-sonnet-5"}`)
+	ev.RespBody = []byte(`{"type":"message"}`)
+	seedEvent(t, st, ev)
+
+	var buf bytes.Buffer
+	if err := runLs([]string{"--json"}, &buf); err != nil {
+		t.Fatalf("runLs --json: %v", err)
+	}
+	lines := nonEmptyLines(buf.String())
+	if len(lines) != 1 {
+		t.Fatalf("ls --json wrote %d lines, want 1:\n%s", len(lines), buf.String())
+	}
+	var got store.Event
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatalf("ls --json line is not a stored event: %v\n%s", err, lines[0])
+	}
+
+	for _, c := range []struct {
+		name      string
+		got, want string
+	}{
+		{"ReqHeaders", got.ReqHeaders, ev.ReqHeaders},
+		{"RespHeaders", got.RespHeaders, ev.RespHeaders},
+		{"ReqBody", string(got.ReqBody), string(ev.ReqBody)},
+		{"RespBody", string(got.RespBody), string(ev.RespBody)},
+	} {
+		if c.got != c.want {
+			t.Errorf("ls --json %s = %q, want %q", c.name, c.got, c.want)
+		}
+	}
+}
+
+// gzipBody encodes data as a gzip stream: a stored response body routinely is
+// one, since the proxy tees the bytes unmodified and Claude Code advertises
+// gzip among its codings.
+func gzipBody(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w := gzip.NewWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// TestShowBodyDecodesResponse (T5, br-GI-7-03): the terminal shows the same
+// decoded response the dashboard does, and names the reason when it cannot
+// show all of it. Before this, `clens show --body` printed a stored compressed
+// body as mojibake -- the observed failure this story opens with -- because
+// printBody writes the stored bytes verbatim.
+func TestShowBodyDecodesResponse(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+	plain := []byte(`{"type":"message","content":[{"type":"text","text":"hi"}]}`)
+
+	decodable := apiRow("req_br", 1.0)
+	decodable.RespHeaders = `{"Content-Encoding":["gzip"]}`
+	decodable.RespBody = gzipBody(t, plain)
+	okID := seedEvent(t, st, decodable)
+
+	var buf bytes.Buffer
+	if err := runShow([]string{itoa(okID), "--body"}, &buf); err != nil {
+		t.Fatalf("runShow: %v", err)
+	}
+	if !strings.Contains(buf.String(), string(plain)) {
+		t.Errorf("show --body did not print the decoded response:\n%s", buf.String())
+	}
+	if strings.Contains(buf.String(), "would not decompress") {
+		t.Error("show --body marked a decodable body as undecodable")
+	}
+
+	// A capped body prints its marker rather than presenting a prefix as the
+	// whole response.
+	big := apiRow("req_big", 1.0)
+	big.RespHeaders = `{"Content-Encoding":["gzip"]}`
+	big.RespBody = gzipBody(t, bytes.Repeat([]byte("abcdefgh"), 512))
+	bigID := seedEvent(t, st, big)
+
+	buf.Reset()
+	if err := runShow([]string{itoa(bigID), "--body", "--body-cap-bytes=1024"}, &buf); err != nil {
+		t.Fatalf("runShow: %v", err)
+	}
+	if !strings.Contains(buf.String(), "truncated at the read cap of 1024 bytes") {
+		t.Errorf("show --body did not print the truncation marker:\n%s", buf.String())
 	}
 }

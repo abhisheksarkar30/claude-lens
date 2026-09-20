@@ -96,7 +96,8 @@ func TestAssetsTheFourNewTabsHaveTheirMountPoints(t *testing.T) {
 // TestAssetsChartsAreInlineSVG: the charts are built as SVG markup strings in
 // app.js -- no charting library, no image file, no canvas. The positive half
 // (each chart really emits an <svg>) matters as much as the negative half: a
-// chart function that quietly returns '' is a blank panel with no error.
+// chart function that quietly returns an empty string is a blank panel with
+// no error.
 func TestAssetsChartsAreInlineSVG(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
@@ -355,6 +356,14 @@ func clickBranch(js, anchor string) (pre, catch string, ok bool) {
 // declaration per block with unindented closing braces, which is what makes
 // this two-line scan enough; it is a test helper, not a parser.
 func funcBody(js, name string) (string, bool) {
+	// Normalized to LF before slicing. app.js is LF in the repository, but a
+	// Windows checkout with core.autocrlf=true hands this function CRLF -- and
+	// then the "\n}\n" terminator below never matches, so the slice silently
+	// runs to the end of the file and every caller's assertions are made
+	// against that tail instead of one function. They do not fail; they pass
+	// vacuously, which is worse. Normalizing here fixes all callers at once
+	// rather than asking each one to remember.
+	js = strings.ReplaceAll(js, "\r\n", "\n")
 	start := strings.Index(js, "function "+name+"(")
 	if start < 0 {
 		return "", false
@@ -365,4 +374,178 @@ func funcBody(js, name string) (string, bool) {
 		return rest, true
 	}
 	return rest[:end], true
+}
+
+// TestAssetsTheBadgeIsInTheHeader (br-GI-7-05) is the positional half of the
+// badge guard. The mechanical half -- app.js looks up an id that index.html
+// defines -- is TestAssetsEveryLookupHasAMount's job; this one asserts *where*
+// the badge lives.
+//
+// It belongs in the header because the incident it exists for was a dashboard
+// that looked healthy while Claude Code was pointed at another product's port.
+// Putting the answer on the Sources tab would make it depend on the user
+// already suspecting something -- which is exactly what they could not do.
+func TestAssetsTheBadgeIsInTheHeader(t *testing.T) {
+	html := readAsset(t, "index.html")
+
+	start := strings.Index(html, `<header class="app-header">`)
+	if start < 0 {
+		t.Fatal("index.html has no app-header block")
+	}
+	end := strings.Index(html[start:], "</header>")
+	if end < 0 {
+		t.Fatal("the app-header block is never closed")
+	}
+	header := html[start : start+end]
+
+	if !strings.Contains(header, `id="proxy-mode"`) {
+		t.Error("the proxy-mode badge is not inside the app header, so it is not on every tab")
+	}
+	if !strings.Contains(readAsset(t, "app.js"), "$('proxy-mode')") {
+		t.Error("app.js never looks up the proxy-mode badge")
+	}
+}
+
+// TestAssetsTheBodyRendererEscapes (br-GI-7-04, T6) is a source-shape
+// assertion, not a behavioural one.
+//
+// The ceiling, stated rather than implied: there is no JS runtime in this
+// toolchain and no dependency here is a JS engine -- this file is regex and
+// text over the embedded bytes -- so what follows proves the escaping *call is
+// present in the source*, not that the rendered pixels are safe. That is the
+// strongest guarantee the no-build-step, no-browser-automation posture allows.
+//
+// It is worth having anyway, because the thing it guards is the story's one
+// real vulnerability: bodies are arbitrary bytes from a remote endpoint going
+// into innerHTML, on a page that also holds a replay button that spends money.
+// A body containing </script> or <img onerror=...> is a live injection path,
+// and "every body goes through one esc()" is only true while it stays true.
+func TestAssetsTheBodyRendererEscapes(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body, ok := funcBody(js, "bodySection")
+	if !ok {
+		t.Fatal("app.js has no top-level bodySection: the body renderer must be one function so esc() has one home")
+	}
+	// The vacuity guard, first: a rename that defeats the extraction would
+	// otherwise leave every assertion below passing on an empty string.
+	if strings.TrimSpace(body) == "" {
+		t.Fatal("bodySection sliced out empty -- the extraction is broken, not the renderer")
+	}
+	if !strings.Contains(body, "bytesB64") {
+		t.Fatalf("the bodySection slice does not mention its body parameter, so it is not the renderer:\n%s", body)
+	}
+	if !strings.Contains(body, "esc(") {
+		t.Error("bodySection never calls esc(): a body goes into innerHTML unescaped")
+	}
+
+	// The read-path markers, and the order they are selected in. An unwired cap
+	// has to be checked before the completeness is consulted, or a body that
+	// decodes fine gets labelled "would not decompress" merely because nobody
+	// wired the cap -- the missing cap is not evidence about the bytes. This is
+	// positional rather than symbolic because the defect is exactly an
+	// ordering one, and no assertion on the strings alone can see it.
+	read, ok := funcBody(js, "readPathMarker")
+	if !ok {
+		t.Fatal("app.js has no top-level readPathMarker")
+	}
+	if strings.TrimSpace(read) == "" {
+		t.Fatal("readPathMarker sliced out empty -- the extraction is broken")
+	}
+	for _, want := range []string{
+		"response shown raw — read cap not configured",
+		"response truncated at the read cap of ",
+		"response decoded only partially — its tail was corrupt",
+		"response shown undecoded — it would not decompress",
+	} {
+		if !strings.Contains(read, want) {
+			t.Errorf("readPathMarker is missing the marker %q", want)
+		}
+	}
+	capAt := strings.Index(read, "BodyCapBytes")
+	completenessAt := strings.Index(read, "RespBodyCompleteness")
+	if capAt < 0 || completenessAt < 0 {
+		t.Fatalf("readPathMarker does not read both BodyCapBytes and RespBodyCompleteness:\n%s", read)
+	}
+	if capAt > completenessAt {
+		t.Error("readPathMarker consults RespBodyCompleteness before BodyCapBytes, so an unwired cap can manufacture the 'would not decompress' state")
+	}
+
+	// The capture-incomplete marker, which is the CLI's own wording the plan
+	// pins (show.go). CaptureComplete is false for either cause, so the line
+	// must not claim the cap unconditionally.
+	capture, ok := funcBody(js, "captureMarker")
+	if !ok {
+		t.Fatal("app.js has no top-level captureMarker")
+	}
+	if !strings.Contains(capture, "incomplete (truncated, or the stream ended early)") {
+		t.Error("captureMarker does not carry the CLI's own wording for an incomplete capture")
+	}
+	// Both bodies, not just the response (br-GI-7-08). The row does not record
+	// which side was cut, so the lengths are the only evidence -- and a version
+	// that checked RespBody alone reads a request-truncated row as "does not
+	// record which cause" while its stored request body sits at exactly the
+	// cap. That is the state the manual run's row 84769 produces, and it is why
+	// the request half is asserted here rather than assumed.
+	if !strings.Contains(capture, "ReqBody") || !strings.Contains(capture, "RespBody") {
+		t.Error("captureMarker does not compare both stored bodies against the read cap")
+	}
+
+	// Both transcript states. Both are asserted because both are reachable on
+	// the same row type and a single label would silently reclassify the other:
+	// a row with content is a reconstruction, a row without is an absence.
+	for _, want := range []string{
+		"not captured — transcript source",
+		"reconstructed from transcript — not a wire capture",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js is missing the transcript state %q", want)
+		}
+	}
+
+	// The third content column needs the third marker (br-GI-7-09).
+	// transcript_content is bounded by the same cap the bodies are, so without
+	// this a reconstruction cut at the cap renders identically to a whole one --
+	// the defect this story exists to close, on the column the bodies' marker
+	// does not reach.
+	tcap, ok := funcBody(js, "transcriptCapMarker")
+	if !ok {
+		t.Fatal("app.js has no top-level transcriptCapMarker: capped transcript content is unmarked")
+	}
+	if strings.TrimSpace(tcap) == "" {
+		t.Fatal("transcriptCapMarker sliced out empty -- the extraction is broken")
+	}
+	if !strings.Contains(tcap, "BodyCapBytes") || !strings.Contains(tcap, "TranscriptContent") {
+		t.Error("transcriptCapMarker does not compare the stored transcript against the read cap")
+	}
+	// The negative half, which is the half that matters: the marker must not be
+	// driven by CaptureComplete. That flag is about the two teed bodies, and a
+	// jsonl row whose content was capped has truncated no capture -- wiring the
+	// two together would label every capped reconstruction as a broken capture.
+	if strings.Contains(tcap, "CaptureComplete") {
+		t.Error("transcriptCapMarker keys off CaptureComplete: a capped transcript is not a truncated capture")
+	}
+	// ...and the same reasoning the bodies' marker follows: an unwired cap is
+	// not evidence about the bytes, so it is checked before any comparison.
+	if strings.Index(tcap, "BodyCapBytes") > strings.Index(tcap, "TranscriptContent") {
+		t.Error("transcriptCapMarker compares TranscriptContent before checking BodyCapBytes is wired")
+	}
+
+	// And it must actually be *called*, which is not the same assertion.
+	// Deleting the call from the transcript branch leaves this function perfect
+	// and never rendered, and every check above still passes -- the marker
+	// would simply never appear, which is precisely the defect the marker
+	// exists to prevent.
+	//
+	// Scoped to showCall's body, not the whole file: `transcriptCapMarker(e)`
+	// also matches the function's own definition, so a file-wide Contains is
+	// satisfied by the definition alone and passes with the call deleted. That
+	// vacuous version was written first and the mutation check caught it.
+	call, ok := funcBody(js, "showCall")
+	if !ok {
+		t.Fatal("app.js has no top-level showCall, so the call site cannot be located")
+	}
+	if !strings.Contains(call, "transcriptCapMarker(e)") {
+		t.Error("transcriptCapMarker is defined but never called from showCall: the marker never renders")
+	}
 }

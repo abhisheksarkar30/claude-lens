@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/api"
 	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
@@ -174,5 +175,105 @@ func TestWriteSeamsDoNotImportConfigOrIngest(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// --- the proxy-mode seam (br-GI-7-05) -------------------------------------
+
+// TestProxyModeNormalizesTheServeBannerString is the case a string comparison
+// gets wrong on the tool's own output: printBanner writes "http://" +
+// cfg.ProxyAddr while cfg.ProxyAddr is the bare host:port, and
+// readSettingsBaseURL returns the settings string verbatim. Reporting the bad
+// state for a correctly-pointed client is the one answer this indicator must
+// not give.
+func TestProxyModeNormalizesTheServeBannerString(t *testing.T) {
+	const proxyAddr = "127.0.0.1:8797"
+	if got := configuredAgainst("http://"+proxyAddr, true, proxyAddr); got != api.ProxyConfiguredMatch {
+		t.Errorf("serve banner string: got %v, want Match", got)
+	}
+}
+
+func TestProxyModeBaseURLSpellings(t *testing.T) {
+	const proxyAddr = "127.0.0.1:8797"
+	tests := []struct {
+		name     string
+		settings string
+		ok       bool
+		want     api.ProxyConfigured
+	}{
+		{"exact host:port", proxyAddr, true, api.ProxyConfiguredMatch},
+		{"https scheme", "https://" + proxyAddr, true, api.ProxyConfiguredMatch},
+		{"trailing slash", "http://" + proxyAddr + "/", true, api.ProxyConfiguredMatch},
+		{"trailing path", "http://" + proxyAddr + "/v1/messages", true, api.ProxyConfiguredMatch},
+		{"localhost for loopback", "http://localhost:8797", true, api.ProxyConfiguredMatch},
+		{"a different port", "http://127.0.0.1:8787", true, api.ProxyConfiguredMismatch},
+		// The port is the signal, so a bare host is never a match.
+		{"bare host, no port", "http://127.0.0.1", true, api.ProxyConfiguredMismatch},
+		// readSettingsBaseURL reports not-found for both an absent file and an
+		// absent key; either way it is Unknown, never a mismatch.
+		{"no setting at all", "", false, api.ProxyConfiguredUnknown},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := configuredAgainst(tc.settings, tc.ok, proxyAddr); got != tc.want {
+				t.Errorf("configuredAgainst(%q, %v) = %v, want %v", tc.settings, tc.ok, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestProxyModeObservedWindow pins the boundary. Without a stated window
+// "receiving" has no definition and nothing to test against; the badge reports
+// on a live proxy, and a row from last week is not evidence it is running now.
+func TestProxyModeObservedWindow(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+	ctx := context.Background()
+
+	observed := func() bool {
+		at, err := st.LatestProxyStartedAt(ctx)
+		if err != nil {
+			t.Fatalf("LatestProxyStartedAt: %v", err)
+		}
+		return !at.IsZero() && time.Since(at) <= proxyRecentWindow
+	}
+
+	// No proxy row has ever been written: the zero time, not "now minus a
+	// week", so this must read as not receiving.
+	if observed() {
+		t.Fatal("an empty store reads as receiving")
+	}
+
+	// A jsonl-only store must also read as not receiving: the consumer's
+	// LastWriteAt counts every source, which is why it is not the source here.
+	sub := apiRow("req_jsonl", 1.0)
+	sub.Source = "jsonl"
+	sub.FirstSource = "jsonl"
+	seedEvent(t, st, sub)
+	if observed() {
+		t.Fatal("a transcript-only store reads as receiving")
+	}
+
+	seedEvent(t, st, apiRow("req_proxy", 1.0))
+	if !observed() {
+		t.Fatal("a fresh proxy row does not read as receiving")
+	}
+
+	// Older than the window: written, but not evidence of a live proxy now.
+	old := apiRow("req_old", 1.0)
+	old.StartedAt = time.Now().Add(-2 * proxyRecentWindow)
+	seedEvent(t, st, old)
+	// LatestProxyStartedAt takes the max, so the fresh row above still wins;
+	// add a store whose only row is stale instead.
+	st2 := openTestStore(t, withHome(t))
+	stale := apiRow("req_stale", 1.0)
+	stale.StartedAt = time.Now().Add(-2 * proxyRecentWindow)
+	seedEvent(t, st2, stale)
+	at, err := st2.LatestProxyStartedAt(ctx)
+	if err != nil {
+		t.Fatalf("LatestProxyStartedAt: %v", err)
+	}
+	if !at.IsZero() && time.Since(at) <= proxyRecentWindow {
+		t.Errorf("a row %v old reads as receiving (window %v)", time.Since(at), proxyRecentWindow)
 	}
 }

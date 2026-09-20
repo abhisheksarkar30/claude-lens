@@ -16,7 +16,7 @@ import (
 // Store is the read slice quota needs: events for burn, quota_snapshots
 // for the cross-check.
 type Store interface {
-	ListEvents(ctx context.Context, filter store.EventFilter) ([]*store.Event, error)
+	ListEvents(ctx context.Context, filter store.EventFilter) ([]*store.EventSummary, error)
 	ListQuotaSnapshots(ctx context.Context, account string, limit int) ([]store.QuotaSnapshot, error)
 }
 
