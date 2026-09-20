@@ -195,14 +195,32 @@ function readPathMarker(e) {
 // row does not record which of the two it was. Claiming the cap unconditionally
 // would be a second, quieter defect in the thing that exists to report the
 // first.
+//
+// CaptureComplete decides *whether* the marker draws; the length comparison
+// only decides *which* body to name in it. The order matters and is the
+// deliberate half: a body whose length merely equals the cap is a coincidence,
+// not evidence, so it must not conjure a marker for a capture the proxy
+// recorded as whole. What it can do is stop the marker saying "the row does not
+// record which cause" when one stored body is sitting there at exactly the cap
+// — which is what checking the response alone produces for a request-side cut
+// (br-GI-7-08).
+//
+// Rows written before that bead keep capture_complete = 1 and draw nothing,
+// because nothing here can distinguish their cut request body from a
+// coincidence either. The fix is not retroactive.
 function captureMarker(e) {
   if (e.CaptureComplete) return '';
-  const n = wireBytes(e.RespBody).length;
-  if (e.BodyCapBytes && n === e.BodyCapBytes) {
-    return 'incomplete (truncated, or the stream ended early) — the stored body is exactly the ' +
-      fmtInt(e.BodyCapBytes) + '-byte read cap, so the cap is the cause on this row';
+  const atCap = [];
+  if (e.BodyCapBytes) {
+    if (wireBytes(e.ReqBody).length === e.BodyCapBytes) atCap.push('request');
+    if (wireBytes(e.RespBody).length === e.BodyCapBytes) atCap.push('response');
   }
-  return 'incomplete (truncated, or the stream ended early) — the row does not record which cause';
+  if (atCap.length === 0) {
+    return 'incomplete (truncated, or the stream ended early) — the row does not record which cause';
+  }
+  return 'incomplete (truncated, or the stream ended early) — the stored ' +
+    (atCap.length === 2 ? 'request and response bodies are' : atCap[0] + ' body is') +
+    ' exactly the ' + fmtInt(e.BodyCapBytes) + '-byte read cap, so the cap is the cause on this row';
 }
 
 // --------------------------------------------------------- list/detail modes

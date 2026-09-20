@@ -76,7 +76,20 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 			r: io.TeeReader(orig, respBuf),
 			c: orig,
 			onClose: func() {
-				st.submit(status, respHeaders, respBuf.Bytes(), !respBuf.truncated, nil)
+				// Both buffers, not just the response's. A request body over the
+				// cap is stored as a prefix just as a response body is, and
+				// reporting only one half leaves the row claiming a complete
+				// capture while holding a truncated request -- the exact
+				// "truncated looks identical to complete" defect the marker
+				// exists to prevent, in the half a response-side fixture never
+				// reaches.
+				//
+				// st.reqBody is non-nil here and needs no guard: it is set before
+				// the request is sent, this closure runs only after the response
+				// body is closed, and BodyPolicy "off" returns before
+				// ModifyResponse is installed at all.
+				st.submit(status, respHeaders, respBuf.Bytes(),
+					!respBuf.truncated && !st.reqBody.truncated, nil)
 			},
 		}
 		return nil

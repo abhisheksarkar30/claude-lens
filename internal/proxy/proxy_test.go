@@ -199,6 +199,101 @@ func TestBodyCapTruncation(t *testing.T) {
 	}
 }
 
+// TestCaptureCompleteCoversBothBodies (br-GI-7-08) is the guard for the
+// defect the GI#7 manual run found: the flag was submitted as
+// !respBuf.truncated, the response buffer's alone, so a request body over the
+// cap produced a row reporting a complete capture while holding a prefix of
+// the request. Every other fixture in that story truncates a response, which
+// is why none of them could reach it.
+//
+// All the cases are one table on purpose. The regression this guards is as
+// much "the response half stopped being checked" as "the request half is not",
+// and a request-only test would let the first through.
+func TestCaptureCompleteCoversBothBodies(t *testing.T) {
+	const bodyCap = 64
+
+	var respLen int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Drain the request first: the tee only sees what upstream reads, so a
+		// handler that ignored the body would leave the buffer short and pass
+		// the over-cap case for the wrong reason.
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("draining the request body: %v", err)
+		}
+		w.Write([]byte(strings.Repeat("y", respLen)))
+	}))
+	defer upstream.Close()
+
+	cases := []struct {
+		name       string
+		reqLen     int
+		respLen    int
+		wantWhole  bool
+		wantReqCut bool
+		wantRespCt bool
+	}{
+		{"request over the cap", 200, 8, false, true, false},
+		{"request exactly at the cap", bodyCap, 8, true, false, false},
+		{"request under the cap", 10, 8, true, false, false},
+		{"response over the cap", 10, 200, false, false, true},
+		{"both over the cap", 200, 200, false, true, true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			respLen = tc.respLen
+			cfg := testConfig(upstream.URL)
+			cfg.BodyCapBytes = bodyCap
+			sk := sink.New(16)
+			h, err := New(cfg, sk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxySrv := httptest.NewServer(h)
+			defer proxySrv.Close()
+
+			reqBody := strings.Repeat("x", tc.reqLen)
+			resp, err := http.Post(proxySrv.URL+"/v1/messages", "application/json",
+				strings.NewReader(reqBody))
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The client's view is unaffected either way: the cap bounds what
+			// clens stores, never what it forwards.
+			got, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if len(got) != tc.respLen {
+				t.Fatalf("client received %d bytes, want the full %d", len(got), tc.respLen)
+			}
+
+			call := captureOne(t, sk)
+			if call.CaptureComplete != tc.wantWhole {
+				t.Errorf("CaptureComplete = %v, want %v", call.CaptureComplete, tc.wantWhole)
+			}
+			wantReq := tc.reqLen
+			if wantReq > bodyCap {
+				wantReq = bodyCap
+			}
+			if len(call.ReqBody) != wantReq {
+				t.Errorf("ReqBody = %d bytes, want %d", len(call.ReqBody), wantReq)
+			}
+			if tc.wantReqCut && len(call.ReqBody) != bodyCap {
+				t.Errorf("a request reported as cut is not at the cap: %d", len(call.ReqBody))
+			}
+			wantResp := tc.respLen
+			if wantResp > bodyCap {
+				wantResp = bodyCap
+			}
+			if len(call.RespBody) != wantResp {
+				t.Errorf("RespBody = %d bytes, want %d", len(call.RespBody), wantResp)
+			}
+			if tc.wantRespCt && len(call.RespBody) != bodyCap {
+				t.Errorf("a response reported as cut is not at the cap: %d", len(call.RespBody))
+			}
+		})
+	}
+}
+
 func TestResponseDerivedRequestIDWins(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Request-Id", "req_abc123")

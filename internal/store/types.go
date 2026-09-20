@@ -68,8 +68,11 @@ type EventSummary struct {
 	ReplayOf    string
 	ReplayEdits string
 
-	// CaptureComplete is false when the body was truncated or the stream
-	// ended without message_stop — the merge-precedence flag.
+	// CaptureComplete is false when either body was truncated or the stream
+	// ended without message_stop — the merge-precedence flag. Which of the
+	// two bodies was cut is not recorded on the row; the detail view names
+	// it by comparing each stored body's length against the read cap it was
+	// configured with.
 	CaptureComplete bool
 
 	// Proxy-only, empty for a source="jsonl" row.

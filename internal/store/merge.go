@@ -154,6 +154,15 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 		existing.CacheReadTokens != incoming.CacheReadTokens ||
 		existing.ThinkingTokens != incoming.ThinkingTokens
 
+	// The rule is "prefer the more complete record". Both halves of a capture
+	// count: since br-GI-7-08 CaptureComplete is also false when only the
+	// *request* body was cut at the read cap, a proxy row in that state no
+	// longer wins this pick against a wholly-captured jsonl row for the same
+	// request. That is deliberate and conservative -- with one body known to
+	// be a prefix, the record that is whole is the safer one to quote -- and
+	// it costs nothing in visibility, because a differing pair is still
+	// reported through `mismatch` above. Pinned by a test so a later change
+	// to it is a decision rather than a side effect.
 	winner := existing
 	switch {
 	case existing.CaptureComplete && incoming.CaptureComplete:

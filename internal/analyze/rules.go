@@ -169,15 +169,22 @@ func ruleRefusal(_ parse.Meta, usage parse.Usage, _ *store.Event) (store.Warning
 	return warning(KindRefusal, SeverityWarn, detail), true
 }
 
-// ruleStreamIncomplete fires on a streamed response the store recorded as
-// an incomplete capture -- CaptureComplete is false exactly when the body
-// was truncated or the SSE stream ended without message_stop.
+// ruleStreamIncomplete fires on a streamed response the store recorded as an
+// incomplete capture -- CaptureComplete is false exactly when a body was
+// truncated at the read cap or the SSE stream ended without message_stop.
+//
+// The detail states the disjunction rather than picking a cause, because the
+// rule cannot tell the two apart and this is the only place that ever claimed
+// it could. The cap is runtime configuration and is not on the event, so a
+// request body cut at it and a stream that ended early reach here as the same
+// flag; naming message_stop would be asserting one of two on no evidence. The
+// wording matches what `clens show` and the dashboard already say.
 func ruleStreamIncomplete(_ parse.Meta, usage parse.Usage, ev *store.Event) (store.Warning, bool) {
 	if !usage.IsStream || ev.CaptureComplete {
 		return store.Warning{}, false
 	}
 	return warning(KindStreamIncomplete, SeverityError,
-		"the SSE stream ended without a message_stop event"), true
+		"incomplete (truncated, or the stream ended early)"), true
 }
 
 func ruleRateLimited(_ parse.Meta, _ parse.Usage, ev *store.Event) (store.Warning, bool) {

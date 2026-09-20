@@ -70,12 +70,19 @@ disagreement is not lost — and it is the conservative direction: with a body k
 the record that is wholly captured is the safer one to quote. Asserted rather than left as a side
 effect.
 
-**5. `app.js`'s `captureMarker` must check both bodies.** It names the cap only when a stored body's
-length equals it, and today it compares `RespBody` alone. Without this, row 84769 renders *"the row
-does not record which cause"* while the cap is knowably the cause — a weaker statement than the one
-the data supports. It compares both and names whichever matched.
+**5. `app.js`'s `captureMarker` must check both bodies.** `CaptureComplete` decides *whether* the
+marker draws and keeps doing so — a body whose length merely equals the cap is a coincidence, not
+evidence, and must not conjure a marker for a capture the proxy recorded as whole. What the length
+comparison decides is *which* body the marker names, and today it compares `RespBody` alone: a
+re-captured row of row 84769's shape reports a cut request body as *"the row does not record which
+cause"*, a weaker statement than the data supports. It compares both and names whichever matched.
 
-**6. `cli/show.go` needs no change.** Its marker at `:82` is already driven by `!CaptureComplete`, so
+**6. The fix is not retroactive, and cannot be.** Row 84769 as it exists in the store keeps
+`capture_complete = 1` — it was written by the binary before this bead — and no client-side logic
+should guess otherwise from a length match, for the reason above. It stays unmarked. New rows of the
+same shape are marked, and the 84,765 pre-existing rows are unaffected in both directions.
+
+**7. `cli/show.go` needs no change.** Its marker at `:82` is already driven by `!CaptureComplete`, so
 widening the flag is what makes `clens show` print it too.
 
 ### What this bead does not fix
@@ -104,8 +111,9 @@ silent behaviour change.
 - A request body over the cap produces a row with `CaptureComplete` false; a request body at or under
   the cap still produces true, and a response body over the cap still produces false.
 - `clens show` prints its incomplete marker for a request-truncated row (`show.go:82`, unchanged).
-- The detail page draws the capture marker for row 84769's shape and names the **request** as the
-  body at the cap.
+- A newly captured row of row 84769's shape draws the capture marker and names the **request** as the
+  body at the cap — confirmed on a live run against the store copy, not only in a fixture. The
+  pre-existing row itself stays unmarked, per item 6 above.
 - `ruleStreamIncomplete` no longer says the stream ended without `message_stop`; it states the
   disjunction it can justify, and still fires on the same rows.
 - The merge case is asserted: a request-truncated proxy row does not win the token pick against a
@@ -151,5 +159,5 @@ silent behaviour change.
 - `internal/store/merge.go` (modify — the comment on the precedence rule, so the decision is where
   the code is)
 - `internal/store/merge_test.go` (modify — the merge case)
-- `internal/web/app.js` (modify — `captureMarker` compares both bodies)
+- `internal/web/app.js` (modify — `captureMarker` names whichever body is at the cap)
 - `internal/web/assets_test.go` (modify — T6's extended assertion)

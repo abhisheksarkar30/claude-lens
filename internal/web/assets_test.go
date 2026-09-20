@@ -480,6 +480,15 @@ func TestAssetsTheBodyRendererEscapes(t *testing.T) {
 	if !strings.Contains(capture, "incomplete (truncated, or the stream ended early)") {
 		t.Error("captureMarker does not carry the CLI's own wording for an incomplete capture")
 	}
+	// Both bodies, not just the response (br-GI-7-08). The row does not record
+	// which side was cut, so the lengths are the only evidence -- and a version
+	// that checked RespBody alone reads a request-truncated row as "does not
+	// record which cause" while its stored request body sits at exactly the
+	// cap. That is the state the manual run's row 84769 produces, and it is why
+	// the request half is asserted here rather than assumed.
+	if !strings.Contains(capture, "ReqBody") || !strings.Contains(capture, "RespBody") {
+		t.Error("captureMarker does not compare both stored bodies against the read cap")
+	}
 
 	// Both transcript states. Both are asserted because both are reachable on
 	// the same row type and a single label would silently reclassify the other:

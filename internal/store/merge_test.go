@@ -823,3 +823,54 @@ func TestMergeFillsTranscriptColumnsBothWays(t *testing.T) {
 		}
 	})
 }
+
+// TestMergePrefersTheWhollyCapturedRowOverATruncatedRequest (br-GI-7-08) pins
+// the merge consequence of widening CaptureComplete to cover both bodies.
+//
+// Before that bead the flag was false only for a truncated *response*, so a
+// proxy row with a cut request body counted as complete and -- being the row
+// written second -- took the token pick on the `winner = incoming` branch. It
+// now counts as incomplete, and the wholly-captured jsonl row already on the
+// row takes the pick instead. That is deliberate (with one body known to be a
+// prefix, the record that is whole is the safer one to quote) but it is a
+// behaviour change, so it is asserted here rather than left to be discovered.
+//
+// The write order is load-bearing and is why the proxy row is second: with the
+// jsonl row second both orderings pick it, and the test would pass whether the
+// flag changed or not.
+func TestMergePrefersTheWhollyCapturedRowOverATruncatedRequest(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	// The transcript's own record of the request: whole.
+	jsonl := fullEvent("req-gi7-merge-trunc")
+	jsonl.Source, jsonl.FirstSource = "jsonl", "jsonl"
+	jsonl.CaptureComplete = true
+	jsonl.InputTokens, jsonl.OutputTokens = 111, 55
+	if _, _, err := st.InsertEvent(ctx, jsonl); err != nil {
+		t.Fatalf("InsertEvent jsonl: %v", err)
+	}
+
+	// The proxy capture, arriving after: request body cut at the read cap, so
+	// br-GI-7-08 marks the capture incomplete.
+	proxy := fullEvent("req-gi7-merge-trunc")
+	proxy.Source, proxy.FirstSource = "proxy", "proxy"
+	proxy.CaptureComplete = false
+	proxy.InputTokens, proxy.OutputTokens = 100, 50
+	id, _, err := st.InsertEvent(ctx, proxy)
+	if err != nil {
+		t.Fatalf("InsertEvent proxy (merge): %v", err)
+	}
+
+	got, err := st.GetEvent(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	if got.InputTokens != 111 || got.OutputTokens != 55 {
+		t.Errorf("tokens = %d/%d, want the wholly-captured row's 111/55: a request-truncated "+
+			"capture must not win the pick", got.InputTokens, got.OutputTokens)
+	}
+	if !got.CaptureComplete {
+		t.Error("merged CaptureComplete = false, want true: one side captured the request whole")
+	}
+}

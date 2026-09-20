@@ -248,8 +248,23 @@ func TestRuleRefusal(t *testing.T) {
 
 func TestRuleStreamIncomplete(t *testing.T) {
 	incomplete := &store.Event{EventSummary: store.EventSummary{CaptureComplete: false}}
-	if _, fired := ruleStreamIncomplete(parse.Meta{}, parse.Usage{IsStream: true}, incomplete); !fired {
+	w, fired := ruleStreamIncomplete(parse.Meta{}, parse.Usage{IsStream: true}, incomplete)
+	if !fired {
 		t.Error("an incomplete stream did not fire stream_incomplete")
+	}
+	if w.Severity != string(SeverityError) {
+		t.Errorf("severity = %q, want %q", w.Severity, SeverityError)
+	}
+	// The rule cannot tell a body cut at the read cap from a stream that ended
+	// early -- the cap is runtime config and is not on the event -- and since
+	// br-GI-7-08 a truncated *request* body reaches it too. Asserting
+	// message_stop would be asserting one of two causes on no evidence, so the
+	// wording has to stay the disjunction.
+	if strings.Contains(w.Detail, "message_stop") {
+		t.Errorf("detail claims the message_stop cause the rule cannot know: %q", w.Detail)
+	}
+	if !strings.Contains(w.Detail, "truncated") || !strings.Contains(w.Detail, "stream ended early") {
+		t.Errorf("detail = %q, want both causes named", w.Detail)
 	}
 	complete := &store.Event{EventSummary: store.EventSummary{CaptureComplete: true}}
 	if _, fired := ruleStreamIncomplete(parse.Meta{}, parse.Usage{IsStream: true}, complete); fired {
