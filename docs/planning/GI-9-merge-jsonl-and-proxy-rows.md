@@ -35,8 +35,8 @@ Two things change beyond the key itself:
 
 - **The proxy stops deciding identity.** The rule moves to the cold path, in one function, because
   the answer now depends on a parsed response body — which the hot path must not touch.
-- **A backfill retires the historical duplicates**, because forward-only would leave 28,405 surplus
-  rows and every double-counted total in place.
+- **A backfill retires the historical duplicates**, because forward-only would leave an estimated
+  28,405 surplus rows and every double-counted total in place.
 
 One thing that *looked* like it needed changing does not. A merge cannot move a row between sessions —
 the incoming event's insert fails on the unique constraint before it ever holds a row, and the update
@@ -330,12 +330,14 @@ be re-derived, and no JSONL session is asked to own a row it could not account f
 Two consequences the design depends on, both stated so a later change is a decision rather than a
 drift:
 
-- **The survivor's session is the only reconcile target, and only when the survivor's token columns
-  actually moved.** `InsertEvent`/`InsertEvents` already reconcile `insertOrMerge`'s returned session
-  ([internal/store/store.go:260](../../internal/store/store.go#L260),
-  [:288](../../internal/store/store.go#L288)) — which is correct precisely *because* a merge rewrites
-  the surviving row's tokens in place while leaving its session alone. Do not "consolidate" the two
-  session columns into the incoming row's.
+- **On the ordinary merge path the survivor's session is the only reconcile target, and only when the
+  survivor's token columns actually moved.** `InsertEvent`/`InsertEvents` reconcile `insertOrMerge`'s
+  returned session ([internal/store/store.go:260](../../internal/store/store.go#L260),
+  [:288](../../internal/store/store.go#L288)) — the **survivor's**, not the incoming event's, which is
+  correct precisely *because* a merge rewrites the surviving row's tokens in place while leaving its
+  session alone. Do not "consolidate" the two session columns into the incoming row's. This is a
+  statement about the **merge** path. D4's rekey collision is a different path — it deletes a row as
+  well as merging one — and there the set of sessions to reconcile is larger; D4 states it.
 - **No merge can vacate a session.** The incoming INSERT fails on the unique constraint *before* the
   incoming event ever holds a row, so there is no second row to remove and no session left holding
   totals for a row it no longer has. This was this plan's own first answer, and it was wrong; §2.6
@@ -344,9 +346,9 @@ drift:
 
 ### D4 — The backfill is two mechanisms behind one command
 
-Forward-only would leave 28,405 surplus rows and every historical total double-counted, so the story
-carries the backfill. The two halves re-key from genuinely different sources, which is why one command
-has two mechanisms rather than a shared loop:
+Forward-only would leave an estimated 28,405 surplus rows and every historical total double-counted, so
+the story carries the backfill. The two halves re-key from genuinely different sources, which is why
+one command has two mechanisms rather than a shared loop:
 
 **Proxy half — re-key in place.** The value is already stored, inside `resp_body`, so these rows need
 no re-read. Each row is processed in its **own transaction**:
@@ -354,8 +356,9 @@ no re-read. Each row is processed in its **own transaction**:
 1. for each `source='proxy'` row whose `request_id` is synthetic **and** whose body yields an id: decode
    the body and extract the id;
 2. if the new key is free, re-key the row (`UPDATE events SET request_id = ? WHERE id = ?`);
-3. if the new key is taken, merge the two rows, then **delete the source row**, then
-   `ReconcileSession` the session that source row belonged to.
+3. if the new key is taken, merge the two rows, then **delete the source row**, then reconcile
+   **both** sessions the operation touched — the survivor's and the deleted row's — through
+   `reconcileSessionTx`, the tx-taking form (§4).
 
 The body must be decoded first (`decode.Body`, as `processCall` does at
 [internal/consumer/consumer.go:302](../../internal/consumer/consumer.go#L302)); **145 of the 724 proxy
@@ -365,10 +368,33 @@ for those rows while reporting success for the rest.
 Step 3 has three parts rather than the one it looks like it needs, and this is the story's one real
 correctness trap. `mergeEvents` writes the **existing** row and leaves the source row untouched under
 its old `proxy:` key, so "merge instead" on its own produces a duplicate — the survivor plus the row
-that was supposed to disappear. Hence the delete. And hence the reconcile: a proxy row **always** has a
-`sessions` row (§2.6), so deleting one without re-deriving leaves that session's totals permanently
-high, which is exactly the drift §5(3) asserts against. The delete is also what makes "a second run is
-a no-op" true — the row is gone, so nothing is left for a second pass to find.
+that was supposed to disappear. Hence the delete. The delete is also what makes "a second run is a
+no-op" true — the row is gone, so nothing is left for a second pass to find.
+
+**The reconcile covers two sessions, and the second one is easy to miss.** The deleted row's session
+needs re-deriving because a proxy row **always** has a `sessions` row (§2.6), so removing one without
+re-deriving leaves that session's totals permanently high. But the *survivor's* session needs it too,
+and that half is not about the delete at all: `mergeEvents` copies the **winner's** six token columns
+onto the surviving row
+([internal/store/merge.go:208-214](../../internal/store/merge.go#L208-L214)), and the winner can be the
+incoming row — when both sides are complete captures the pick is `winner = incoming`
+([internal/store/merge.go:168-169](../../internal/store/merge.go#L168-L169)). So the survivor keeps its
+own `session_id` while carrying the other row's tokens, and its session's aggregate moves. `InsertEvent`
+already reconciles exactly that session — `insertOrMerge` returns `result.SessionID`, the survivor's
+([internal/store/store.go:270-280](../../internal/store/store.go#L275-L280)) — which is the rule the
+rekey path has to reproduce rather than approximate. Reconcile the **set**
+`{survivor.SessionID, deleted.SessionID}`; when they are equal it is one call, and nothing here depends
+on them being equal.
+
+**Use `reconcileSessionTx`, not `ReconcileSession`.** `ReconcileSession`
+([internal/store/store.go:672-682](../../internal/store/store.go#L672-L682)) opens its **own**
+`BeginTx`, and the pool is pinned to a single connection (`db.SetMaxOpenConns(1)`,
+[internal/store/store.go:72](../../internal/store/store.go#L72)). Calling it from inside the per-row
+transaction below leaves the outer transaction holding the only connection and the inner `BeginTx`
+waiting on the pool with no deadline — a **hang**, not an error, and one no test would report as a
+failure rather than a timeout. `reconcileSessionTx`
+([internal/store/store.go:684](../../internal/store/store.go#L684)) is unexported and takes a `*sql.Tx`,
+which is why both existing callers use it and why the rekey methods must live in `internal/store` (§4).
 
 **JSONL half — delete, then re-ingest.** A stored JSONL row cannot be re-keyed in place: its old key
 holds a uuid and the message id it *should* hold was never stored. The only place that value exists is
@@ -377,9 +403,9 @@ the transcript. So the half is:
 1. delete `source='jsonl' AND request_id LIKE 'jsonl:%'`;
 2. zero the byte cursors and re-run the tailer — the mechanism `clens ingest --rebuild` already owns.
 
-Delete-and-re-ingest is not only about the un-stored id. It must **also collapse the 28,405 surplus
-duplicate lines §2.4 measures**, and an in-place re-key would have to reimplement that collapse. The
-collapse, not the key storage, is the reason this half re-ingests.
+Delete-and-re-ingest is not only about the un-stored id. It must **also collapse the surplus §2.4
+estimates**, and an in-place re-key would have to reimplement that collapse. The collapse, not the key
+storage, is the reason this half re-ingests.
 
 **Re-ingest re-prices, and the command's contract must say so.** The tailer prices each row as it
 writes it, against the price table in force *now* — not the one in force when the row was first
@@ -433,13 +459,16 @@ Each row's re-key (and any merge it triggers) is therefore committed in its **ow
 partial run leaves the rows already re-keyed correct and the remainder still synthetic, so re-running
 picks up where it stopped. Nothing is atomic across the whole half, deliberately.
 
-**`--dry-run` must report "would re-key N, would leave M synthetic (no body id)".** **8 rows with
-`resp_body IS NULL`** plus **41 whose body yields no id** stay synthetic forever, and the operator needs
-to see that number before the run.
+**`--dry-run` must report "would re-key N, would leave M synthetic (no body id)".** **4 rows with
+`resp_body IS NULL`** plus **61 whose body yields no id** — 65 of 728, the same population D1 counts —
+stay synthetic forever, and the operator needs to see that number before the run.
 
-**The JSONL half must report deleted-vs-inserted**, with the expected ratio (re-inserted below deleted
-by roughly the surplus §2.4 measures). `clens ingest --rebuild` provides no such check, and the plan's
-own principle — a run that did one half must not read as done — applies **inside** the half too.
+**The JSONL half must report deleted-vs-inserted**, and that report is the run's own evidence for how
+much duplication there was. It is **not** §2.4's 28,405: §2.4 estimates duplication by grouping on
+`(session_id, token quintuple, 5s bucket)`, while this half deletes and re-inserts whole rows, so its
+ratio counts one row per collapsing key and runs larger (§5(3)). `clens ingest --rebuild` provides no
+such check, and the plan's own principle — a run that did one half must not read as done — applies
+**inside** the half too.
 
 Ordering against the forward fix is strict: **the key rule must land before the backfill runs**, or the
 re-ingest recreates the very keys the delete just removed.
@@ -500,7 +529,7 @@ never built.
 | `internal/sink/sink.go` | `CapturedCall.RequestID` renamed `RequestIDHeader` — its doc comment at `:57-61` calls the field "the cross-source dedup key", which D2 makes false, and the name would otherwise invite back the two-tier split D2 deletes (`internal/consumer/consumer.go:403` is the only reader) |
 | `internal/proxy/proxy.go` | `captureState.requestID` and `fallbackSeqCounter` deleted; `submit` passes the header value |
 | `internal/proxy/proxy_test.go` | the fallback-key test moves to `internal/consumer` |
-| `internal/store/store.go` | the `rekey` store methods: the body-id scan, the in-place re-key, and the collision path's merge → **delete** → `ReconcileSession`. **The merge path itself is unchanged** — §2.6 shows no row ever changes session, so `insertOrMerge` and its callers keep today's shape |
+| `internal/store/store.go` | the `rekey` store methods: the body-id scan, the in-place re-key, and the collision path's merge → **delete** → reconcile **both** touched sessions via `reconcileSessionTx` (not the exported `ReconcileSession`, which opens its own transaction and would hang against `SetMaxOpenConns(1)`) — all in one per-row transaction. **The merge path itself is unchanged** — §2.6 shows no row ever changes session, so `insertOrMerge` and its callers keep today's shape |
 | `internal/cli/rekey.go` (new) | the command, `--yes` / `--dry-run`, both halves |
 | `internal/cli/rekey_test.go` (new) | §5 |
 | `cmd/clens/main.go` | register `rekey` |
@@ -509,8 +538,8 @@ never built.
 | `docs/context/storage-schema.md` | its own "the only destructive command" claim at `:151` — same correction as `cli-and-tooling.md`, a different file |
 | `docs/context/data-privacy-and-compliance.md` | `:106-107` and `:111` also assert purge is the only command that deletes rows; three files carry the claim, so all three move together |
 | `docs/context/workflows.md` | the merge now fires; the identity rule |
-| `docs/context/INDEX.md` | its "18-entry dispatch table in `cmd/clens/main.go`" becomes 19 |
-| `docs/context/decisions/000-index.md` | "**Seven** architectural forks" becomes eight, with the new 008 |
+| `docs/context/INDEX.md` | its "18-entry dispatch table in `cmd/clens/main.go`" becomes 19; **and `:41`'s "seven genuine forks" becomes eight** — `:114`'s "moved six → seven" is dated history and stays |
+| `docs/context/decisions/000-index.md` | "**Seven** architectural forks" becomes eight, with the new 008 — **twice**, at `:5` and again at `:25` ("the status of all seven") |
 | `docs/planning/GI-1-claude-lens-v1.md` | §Cross-source identity: the line-1105 fallback claim (the documented fallback was never built), and test 11(b) never exercised (not falsified) |
 | `docs/acceptance.md` | test 11(b) — never exercised on this install, therefore moot |
 | `docs/context/decisions/008-…` (new) | the identity decision (D1) |
@@ -558,18 +587,33 @@ dedup key.
 
 **Unit — `internal/store`.** **No merge-path test, because there is no merge-path change** (§2.6). The
 `rekey` store methods are exercised through the `internal/cli/rekey` tests below, which is where their
-only caller lives. An earlier draft specified a "both sessions re-derived" assertion; it is removed
-because it **could not fail** — with both session rows seeded, the session the merge does not keep owns
-no events, so its aggregate is zero before and after and the assertion holds either way. That is the
-vacuous-assertion shape §7 warns about, and it is worse than no test because it reads as coverage.
+only caller lives. An earlier draft specified a "both sessions re-derived" assertion **for the merge
+path**; it is removed because there it **could not fail** — the incoming event's insert fails before it
+holds a row, so the session the merge does not keep owns no events, and its aggregate is zero before and
+after either way. That is the vacuous-assertion shape §7 warns about, and it is worse than no test
+because it reads as coverage. The same-sounding assertion **is** required for the rekey collision (D4),
+for the opposite reason: there a row genuinely is deleted and the survivor genuinely takes the other
+row's tokens, so both aggregates move and the assertion can fail.
 
 **Unit — `internal/cli/rekey`.** `--dry-run` deletes nothing (assert row counts unchanged, and that
 both halves reported a non-zero count); `--yes` re-keys a synthetic proxy row to its body id; a
 re-key that collides merges and leaves **one** row with `source_refs` unioned and no content lost —
 and the assertion must be on the **row count**, not only on `source_refs`, because this collision is
 proxy-vs-proxy: both sides already carry `source`, so a union shows nothing and the test would pass
-with the source row still sitting there under its old key. Then assert the deleted row's session
-totals were re-derived; a second run is a no-op; a run with neither flag refuses.
+with the source row still sitting there under its old key. Then assert **both** sessions were
+re-derived — the survivor's as well as the deleted row's (D4) — and that a second run is a no-op; a
+run with neither flag refuses.
+
+**The JSONL half is the destructive one and needs its own case.** Every test above is proxy-half, and
+the half that deletes ~71k rows would otherwise ship on the strength of a printed count. The fixture
+already exists in the repo — `TestIngestRebuildRereadsWithoutDuplicating`
+([internal/cli/additions_test.go:54](../../internal/cli/additions_test.go#L54)) writes a real transcript
+under `withHome(t)`'s temp `~/.claude/projects/proj1/session1.jsonl` and runs `runIngest`; reuse that
+shape. Ingest a transcript with a **duplicate** pair (same `message.id`, different `uuid`, no
+`requestId`) plus one line with a real `requestId`, run `rekey --yes`, and assert: the `jsonl:`-prefixed
+rows are gone, the duplicate collapsed to one row, the `requestId` row survived, and the transcript file
+is still on disk (the half is re-derivable, which §6 leans on). Then a `--dry-run` on the same fixture
+deletes nothing.
 
 **Integration.** A JSONL line with no `requestId` and a proxy capture of the same request, ingested
 through the real paths, produce **one** row — the end-to-end statement of the whole story, and the one
@@ -583,8 +627,14 @@ whose `source_refs` contains **both** `proxy` and `jsonl`: **0 today, expected 5
 stated in **rows**, and 511 is a row count because D1 collapses one id to one row; an earlier pass of
 this plan stated the same relation as 238 and got the unit wrong — 238 was a *pair* count over
 transcript **lines**, which is why it is not the target (§2.3). (3) The row count for the rekeyed
-window drops by the surplus §2.4 measures, and the run reports the expected handful of `source_mismatch`
-warnings (§6).
+window drops, and the drop is read from the command's **own deleted-vs-inserted report** (D4) rather
+than compared against §2.4's 28,405 — those are two measurements of two different groupings. §2.4
+groups by `(session_id, token quintuple, 5s bucket)` to estimate how much duplication exists; the rekey
+drops exactly the rows whose `requestKey` collapses, one per distinct id. The second is the larger
+number, which is the point: a post-rekey JSONL count of at most `16,804 + 42,008 = 58,812` rows against
+today's 88,032 puts the drop at **≥ 29,220**, already more than §2.4's estimate. So the acceptance line
+is "the report shows a drop of tens of thousands of rows", and the run says which. Then the run reports
+the expected handful of `source_mismatch` warnings (§6).
 
 ## 6. Risk areas
 
@@ -645,11 +695,12 @@ warnings (§6).
   user running `off` here gets the JSONL half's fix only.
 - **Retention may make part of the backfill moot.** If `retention_days` is configured, the oldest
   duplicates would age out anyway; the backfill's value is bounded by that window.
-- **Most proxy rows have no JSONL counterpart and keep their `proxy:` key forever.** Of the 663 ids the
-  proxy stores in a body, **511 have a transcript counterpart**; the other 152 are auxiliary or
-  uncaptured calls with no transcript line, and their synthetic key is correct and permanent. Expected,
-  not a bug. The old "the 39-pair sample is small" hedge understated the finding; the base rate above is
-  the real evidence, and §5's live acceptance re-runs the merge count after the change.
+- **Most proxy rows *do* have a JSONL counterpart, and the two groups want different keys.** Of the 663
+  ids the proxy stores in a body, **511 have a transcript counterpart** and are the design's target; the
+  other 152 are auxiliary or uncaptured calls with no transcript line, and their synthetic key is
+  correct and permanent. Expected, not a bug. The old "the 39-pair sample is small" hedge understated
+  the finding; the base rate above is the real evidence, and §5's live acceptance re-runs the merge
+  count after the change.
 
 ## 7. Self-review
 
@@ -662,7 +713,8 @@ way here are recorded rather than quietly dropped, because each is the natural f
 merge changes a row's session (§2.6 — it cannot, and the trace is three lines); that the documented
 fallback had to be *measured* before it could be rejected (§2.5 — it matches zero rows, so measuring its
 variants was beside the point); and that a re-key collision is "just a merge" (D4 — the merge writes the
-survivor and leaves the source row behind, so the collision path has to delete and reconcile).
+survivor and leaves the source row behind, so the collision path has to delete *and* re-derive both
+sessions it touched, and it must use the tx-taking reconcile rather than the one that opens its own).
 
 **As a QA engineer.** The cases that matter are the ones where the rule must *not* fire: two distinct
 requests that share a session and token counts **with different `message.id`s** — which the existing
@@ -723,3 +775,4 @@ path's delete-plus-reconcile, all new code with one caller.
 | 2026-09-20 | Round 1 revision (H1–H3, M1–M5, L1–L8). §2.2's causal claim replaced with the mixed-session evidence and the mechanism labelled an inference; D6 rewritten (GI-1 is internally consistent; test 11(b) never exercised, not falsified); §2.5 rewritten around the documented fallback (0 of 415); M1's honest store-reconcile justification and D4's proxy-half-first ordering; D1's header-tier reason; §6 merge-token deltas and `source_mismatch`; `internal/sink/sink.go` added to §4; §2 counts moved to the decoded-body re-measure; L1–L8 applied. |
 | 2026-09-20 | Round 2 revision (F2.1–F2.8). **F2.1** — the merge-reconcile design section deleted outright (a merge changes no row's session, so the reconcile is already complete); §2.6 reduced to the non-defect it always was, and §4 lists no merge-path file; §8's first bullet and §9's bead list lose its references. **F2.2** — §5's `internal/store` test removed as unfailable by construction. **F2.3** — §2 pinned to **one snapshot**; the two-pass table dropped, one timestamp stated once; §2.5's `0 of 415` restated as **0 of 338** and the generous-variant table labelled `257 of the 338`. **F2.4** — 203 distinct ids vs 238 `(id, transcript-line)` pairs stated in §2.3; §6's `90 + 148 = 238` and `~30%` residual pinned to that denominator; §5's acceptance target set to **203 rows** with the 238-vs-203 explanation. **F2.5** — proxy session ids unified to **146** (§1/§2.1/§2.5), the stored-JSONL total to **87,340** (§2.1/§6), and the bodiless-id count to **49** (D1/D4/§2.3). **F2.6** — D2's guard corrected to decode the **body's** own `type` (`NonStreamFrame` synthesises the frame type, so the frame-type guard was a no-op); §4's field count corrected and §5 gains the type-gate negative case. **F2.7** — §6's retry claim replaced with the shared-id risk, referencing `TestRetryPreservesTwoRows`. **F2.8** — §6's `--body-policy` bullet retitled to D5's narrowed wording; both hand-maintained `cli_test.go` tables added to §4. **Renumbering:** §9's old bead 05 (the store reconcile) is deleted and the beads that followed shift down by one (old 06–08 → new 05–07), so round-1 artifacts' "bead 08" reads as **bead 07**. |
 | 2026-09-20 | Round 3 revision (F3.1–F3.7, plus the count rewrite). **F3.1 (MAJOR)** — D4's proxy-half collision path was "merge instead; nothing is lost", which leaves the source row behind under its old `proxy:` key; it is now merge → **delete** → `ReconcileSession`, in the row's own transaction, with §5's rekey test asserting the **row count** (a proxy-vs-proxy collision shows no `source_refs` union, so the union assertion alone passes with the duplicate still there). **D3 re-added** in its narrowed form — which session owns a merged row, and why `session_id` stays unrewritten — as F3.1's reconcile rationale needs a home, and §3 no longer skips from D2 to D4. **F3.2/F3.4** — §6's `338 − 238` and §1's bare `257` replaced with same-pass figures. **F3.3** — `storage-schema.md:151` and `data-privacy-and-compliance.md:106-107,111` added to §4; three docs carry the "purge is the only destructive command" claim, not one. **F3.5** — §5's `TestPolicyOffSurvivesAMissingRequestID` corrected: it pins the *absence* of a panic, and after D2 the guard is deleted rather than moved (`sha256.Sum256(nil)` is defined), so a ported test would pass while covering nothing. **F3.7** — D4 now states that the JSONL half **re-prices**: ~70k rows restated against the current price table, `cost_source` moving with it and `billing_mode` able to flip, while the proxy half does not. **Count rewrite** — every §2 figure re-measured in one read-only pass (728 proxy rows, 663 body ids, **511** verbatim in transcripts, 0 of 728 headers, 184 sessions, 88,032 JSONL rows, 42,008 distinct `message.id`s in 123,880 usage lines), the earlier pass's numbers kept only where labelled as such, §5's acceptance target moved from 203 to **511 rows**, and §2's preamble now names the absolute counts perishable and the structural facts not. |
+| 2026-09-20 | Round 4 revision (F4.1–F4.7). **F4.1 (MAJOR)** — D4 step 3 reconciled only the **deleted** row's session, but a merge also rewrites the **survivor's** token columns (the winner can be the incoming row when both captures are complete), so the survivor's aggregate moves too. It now reconciles the **set** `{survivor.SessionID, deleted.SessionID}`, and D3's "the survivor's session is the only reconcile target" is scoped to the merge path, which is what it always described. **F4.2 (MAJOR)** — D4 and §4 named the exported `ReconcileSession`, which opens its own `BeginTx`; against `SetMaxOpenConns(1)` that blocks the outer per-row transaction on the pool with no deadline — a hang, not an error. Both now name `reconcileSessionTx`, which is what `InsertEvent`/`InsertEvents` already use. **F4.3** — §5(3) compared the rekey's row drop against §2.4's 28,405, two measurements of two different groupings; it now reads the drop from the command's own deleted-vs-inserted report, with `88,032 − (16,804 + 42,008) ≥ 29,220` as the bound, and the 28,405 uses in §1/D4 are labelled estimates. **F4.4** — D4's stale `49` (8 + 41) corrected to the same-pass `65` (4 + 61) that D1 and §2.3 carry. **F4.5** — §6's heading inverted its own body; 511 of 663 *do* have a counterpart. **F4.6** — §4 missed `INDEX.md:41` and `000-index.md:25`, both of which carry the "seven forks" claim, while `INDEX.md:114` is dated history and stays. **F4.7** — §5 exercised only the proxy half; the destructive JSONL half now has its own case, reusing the transcript fixture `TestIngestRebuildRereadsWithoutDuplicating` already establishes at `internal/cli/additions_test.go:54` (the reviewer believed no fixture existed), and the state-vs-invariant distinction between the merge path's removed assertion and the rekey path's required one is spelled out. |
