@@ -145,10 +145,18 @@ file at `~/.clens/config.toml` > defaults.
 server-rendered shell over the same SQLite file, with an SSE stream for live
 updates and hand-rolled inline SVG charts.
 
+Its header carries a proxy-mode badge on every tab, because a dashboard that
+looks healthy while the client is pointed at another port is the failure it
+exists to catch: `proxy: active` when Claude Code's `ANTHROPIC_BASE_URL` names
+this process and calls are arriving, `proxy: receiving, client elsewhere` when
+calls arrive from a client pointed somewhere else, and `proxy: not receiving —
+base URL not set in settings.json` when the variable only exists in your shell
+— which is what `clens serve`'s own banner tells you to do.
+
 | Tab | Shows |
 |---|---|
 | Overview | totals, and the most recent calls |
-| Calls | the call log with filters; the **id** cell link replaces the list with that call's full request and response, under a `‹ all calls` control |
+| Calls | the call log with filters; the **id** cell link replaces the list with that call's full request and response — including both sides' **headers** and their **bodies**, each in a collapsed box with its byte count. A capture the proxy could not finish says so, and a transcript-sourced row has no wire bodies at all, so it says *"not captured — transcript source"* rather than drawing empty boxes |
 | Sessions | one row per run, with both cost models labelled side by side |
 | Warnings | findings by kind, and one row per occurrence |
 | Stats | totals over a window, charted by day, week, or month |
@@ -239,9 +247,18 @@ the defaults are chosen to hold that:
   Windows.** Go's file-permission argument is a no-op on Windows, so `0600`
   there would be a false comfort; the Windows path sets an ACL instead.
 - **The bodies are stored, and that is the point.** Full request and response
-  bodies are captured, so the content — every prompt and every file the agent
-  read — is the asset this tool is protecting. `--body-policy truncated` and
-  `off` narrow that; the database file is the thing to protect.
+  bodies are captured, and they are readable from the dashboard's call detail
+  as well as from `clens show`. So the content — every prompt and every file the
+  agent read — is the asset this tool is protecting. `--body-policy truncated`
+  and `off` narrow that; the database file is the thing to protect.
+- **A transcript row's content is a reconstruction, not a capture.** The JSONL
+  collector stores one assistant message's `content` in `transcript_content` /
+  `transcript_role` — its own columns, never `req_body`, because a transcript
+  excerpt is a reconstruction of intent rather than the request that produced
+  it: no system prompt, no tool schemas, and nothing the proxy would have seen.
+  A transcript also carries no headers at all, so such a row renders no header
+  tables. The dashboard labels it *"reconstructed from transcript — not a wire
+  capture"* to keep that provenance visible.
 - **Fail open.** A broken observer never breaks your coding session: the proxy
   returns what upstream returned, or a synthesized error if upstream was
   unreachable, and a capture failure is logged rather than propagated.

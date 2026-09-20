@@ -892,16 +892,87 @@ the schema or the merge.
 
 ## 10. Recorded manual run
 
-To be completed in Phase 5 against a live `clens serve` on a populated store. The run must show, at
-minimum: the Calls list fetch dropping from ~12 MB to a small payload; the session drill-down fetch
-bounded the same way; a real captured call rendering readable request *and* response bodies; a
-truncated capture showing its marker; a transcript row saying "not captured"; the boot log's
-`checkRedaction` self-test still firing against a seeded un-redacted header; and the badge across its
-states — including the mispointed one (reproducible by pointing `ANTHROPIC_BASE_URL` back at 8787) and
-the **unknown** one (no `ANTHROPIC_BASE_URL` in `settings.json`, the printed-banner onboarding path),
-which must read *"not set in settings.json"* and never *"client elsewhere"*.
+Performed 2026-09-20 against the branch head, on a **copy** of the live store (`~/.clens/lens.db`,
+82.7 MB, 84,765 rows, `user_version = 0`, 45 columns) served on `127.0.0.1:8897/8898` so the running
+instance on `8797/8798` was never touched. Where a state needed a controlled input the run used a
+redirected `CLAUDE_CONFIG_DIR` — which the tool honours for **both** `settings.json` and the
+`~/.claude/projects` transcript root — rather than editing the user's real config.
 
----
+**The migration, on a real store.** This is the case no unit test can be: the copy is a genuine
+pre-change database at production size. `Open` brought it from `user_version 0` to `1`, `events` from
+45 to 47 columns, both transcript columns present, and the row count unchanged at 84,765. The ALTERs
+are additive, so the migration took the instant the schema exec did.
+
+**The Calls list fetch.** Fifty proxy rows carry 15,325,964 bytes of stored blobs; base64 those and
+the pre-projection payload is 20,259,652 bytes. The projected route returns **47,766 bytes** — 424×
+smaller, and larger than the ~12 MB the plan estimated, so the projection matters more than it
+claimed. The payload is computed as `measured + base64(blobs)` rather than measured against a
+pre-change binary; the blobs are the exact set the projection omits. The session drill-down for the
+busiest session returns 52,090 bytes on the same projection.
+
+**A real captured call.** A `POST /v1/messages` with a deliberately invalid key went through the
+proxy of the copy, so upstream refused it at no cost: row 84766, status 401, `CaptureComplete` true,
+`BodyCapBytes` 262144, `RespBodyCompleteness` 0 (`Complete`), no read-path marker — correct, the 401
+carries no `Content-Encoding`. Its stored `X-Api-Key` is `["[redacted]"]` and the raw key appears
+nowhere in the served row. Both bodies render readable: the request JSON in full, and the response
+through the same `bodySection` the page uses, with its byte counts and no marker.
+
+**A truncated capture.** With `-body-cap-bytes 512` and a local stub upstream returning a 2,711-byte
+body, row 84770 came back `CaptureComplete` false, `BodyCapBytes` 512, stored response exactly 512
+bytes. The page shows *"incomplete (truncated, or the stream ended early) — the stored body is
+exactly the 512-byte read cap, so the cap is the cause on this row"*, and draws **no** read-path
+marker: the response had no `Content-Encoding`, so it is `Complete`, and the two markers are
+correctly independent.
+
+**A transcript row, both states.** `CLAUDE_CONFIG_DIR` was redirected at a synthetic
+`projects/demo/demo.jsonl` and `clens ingest` run against the copy, so the rows come from the real
+collector rather than an insert. Two assistant lines, one with `message.content` and one without:
+row 84771 stores 258 bytes of content with role `assistant` and a NULL `req_body`; row 84772 stores
+neither. The page renders the first as *"reconstructed from transcript — not a wire capture — 258
+bytes"* with the content and no header tables, and the second as *"not captured — transcript
+source"* with no boxes at all. 84,630 pre-existing jsonl rows are in the second state.
+
+**`checkRedaction` at boot.** A row seeded with an un-redacted `X-Api-Key` into the newest 500 rows
+made the startup self-test fire, and only that row: `serve: proxy: RedactCheck: header "X-Api-Key" is
+not redacted (holds 26 bytes that should not be there)`. This is the check bead 01's retyping of the
+read path could have silently disarmed.
+
+**The badge, all six states.** Driven by `CLAUDE_CONFIG_DIR` (three settings.json shapes: pointing at
+8897, pointing back at **8787**, and absent) against both the populated copy and a fresh empty
+database for `Observed` false:
+
+| configured | observed | badge |
+|---|---|---|
+| match | yes | `proxy: active` |
+| match | no | `proxy: configured, not receiving` |
+| mismatch (8787) | yes | `proxy: receiving, client elsewhere` |
+| mismatch (8787) | no | `proxy: off` |
+| unknown | yes | `proxy: receiving — base URL not set in settings.json` |
+| unknown | no | `proxy: not receiving — base URL not set in settings.json` |
+
+The unknown row reads *"not set in settings.json"* in both its variants and never *"client
+elsewhere"*, which is the property F3.5 exists for.
+
+### What the run found that no bead covers
+
+**A request body cut at the read cap does not clear `CaptureComplete`.** Row 84769 was sent with a
+1,753-byte request body under `-body-cap-bytes 512`: the stored `req_body` is 512 bytes, and the row
+reports `capture_complete = 1`. The response-side cut on row 84770 correctly reports false. The cause
+is `internal/proxy/proxy.go:79`, which submits `!respBuf.truncated` — the response buffer's flag
+only. The request buffer keeps its own `truncated` flag (`proxy.go:249`, set at `:260` and `:265`)
+and it is never read.
+
+So the D3 capture marker is reachable for a truncated **response** and unreachable for a truncated
+**request**: the page shows a 512-byte prefix of a 1,753-byte request with its byte count and no
+marker, which is precisely the "a truncated capture and a complete one look identical" defect this
+story exists to close, surviving in the one half the run could not exercise from the response side.
+
+This is out of every bead's file list — `internal/proxy/proxy.go` appears in none of them, and the
+package is the hot path CLAUDE.md fences off. It is also not a one-line change in effect: widening
+`CaptureComplete` to include request truncation would change when `analyze`'s incomplete-stream rule
+fires (`rules.go:176`) and how the cross-source merge prefers one row over another
+(`merge.go:159-181`). Recorded here rather than fixed, because which of those two is wanted is a
+design decision the plan does not make, and the run's job is to report the state as it is.
 
 ## Change History
 
@@ -916,3 +987,4 @@ which must read *"not set in settings.json"* and never *"client elsewhere"*.
 | v7 | 2026-09-20 | Round 6 review. D2 pins the `Completeness` value for a response body with **no** `Content-Encoding`: `Body`'s early return (`decode.go:63-65`, ahead of the cap logic) yields `Complete`, not `NotDecoded` — `RespBodyDecoded` equals `RespBody` and **no** read-path marker is drawn, so the tool's central case (a plain or SSE-streamed response) can never show the *"would not decompress"* text (F6.1); the `Complete`/`NotDecoded` enum comments are reworded (the `NotDecoded` comment now names a **compressed** body that produced no decoded bytes) so neither can be read as covering the unencoded case (F6.1); the fail-open sentence and the `NotDecoded`-marker invariant are qualified the same way, and D3's "equals the raw `RespBody`" clause no longer reads as an equivalence (F6.1); T4 gains the plain/unencoded case (`TestDetailUnencodedBodyIsComplete` — `Complete`, `RespBodyDecoded == RespBody`, never the marker) alongside the cap-truncated, corrupt-tail and unwired-cap cases (F6.1) |
 | v8 | 2026-09-20 | Round 7 review. D2's rationale for injecting the cap no longer asserts a false import edge: `internal/api` does **not** fail to import `internal/consumer` — `api.go:37` carries that import in production code (`consumer *consumer.Consumer`, `api.go:73`) and the guard's ban list is exactly `secret`/`config`/`ingest`, never consumer. The clause is reworded to the two real facts: the configured `BodyCapBytes` lives in `internal/config`, which the guard bans, and the cap's default is an **unexported** constant (`defaultBodyCapBytes`, `consumer.go:24`), so the `consumer` import `api` already holds still buys no reachable value — the cap can only arrive as the injected `SetBodyCapBytes` seam (F7.1) |
 | converged | 2026-09-20 | Round 8 review returned `NO_FURTHER_FINDINGS` with zero findings: the round-7 fix (F7.1) verified against source, and no new BLOCKER/MAJOR/MINOR raised. Cross-review loop closed after 8 rounds; plan v8 is the converged plan |
+| Phase 5 | 2026-09-20 | §10 filled in with the manual run against a copy of the live store, on the branch head. All eight of §10's items reproduced; one state did not — a request body cut at the read cap leaves `CaptureComplete` true (`proxy.go:79` reads only the response buffer's flag), so the capture marker is unreachable for that half. Recorded there, not fixed: no bead owns `internal/proxy`, and widening the flag changes the analyze and merge behaviour it feeds |
