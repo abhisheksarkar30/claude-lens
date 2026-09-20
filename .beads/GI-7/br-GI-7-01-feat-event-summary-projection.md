@@ -229,7 +229,7 @@ error**, not a silent default.
 - `internal/api/replay_test.go` (modify — `capture`/`recordedReplay` on `ListEventsFull`; literals)
 - `internal/api/broker_test.go` (modify — fixture literals)
 - `internal/cli/serve.go` (modify — `checkRedaction` on `ListEventsFull`)
-- `internal/cli/export.go` (modify — both reads on `ListEventsFull`)
+- `internal/cli/export.go` (modify — the JSON read on `ListEventsFull`; the CSV read stays on `ListEvents` and `rowValues` retypes to `*store.EventSummary`, per the correction in the Description above)
 - `internal/cli/ls.go` (modify — `--json` on `ListEventsFull`; `statusCell` retyped)
 - `internal/cli/tail.go` (modify — `printNew` retyped to `[]*store.EventSummary`)
 - `internal/cli/show.go` (modify — `displayModel`/`statusCell` pass `&ev.EventSummary`)

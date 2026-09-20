@@ -223,9 +223,13 @@ opting in is visible:
   `ev.ReqHeaders` (`:266-270`) and hands it to `proxy.RedactCheck`. Miss this and it `continue`s on
   every row and reports zero findings, always, with no error and no log — a security control disabled
   by default.
-- `internal/cli/export.go:90,131` — `clens export`'s two reads. Its JSON form is documented as the
-  complete dump *including the captured bodies* (`export.go:18-21`), so it needs the full path and both
-  reads stay on it.
+- `internal/cli/export.go:90,131` — `clens export`'s two reads, and they do **not** move together.
+  The JSON form is documented as the complete dump *including the captured bodies* (`export.go:18-21`),
+  so `:90` switches to `ListEventsFull`. The CSV form stays on `ListEvents`: `exportColumns`
+  (`:109-116`) carries no header or body column and `rowValues` reads only scalars, so the full-width
+  read would pull 256 KB per row to emit none of it. `rowValues` retypes to `*store.EventSummary`.
+  (Corrected in Phase 5 — the converged plan sent both reads to the full path, and this row is the
+  one artifact that never absorbed the round-1 correction the review log records.)
 - `internal/api/replay.go:246` — `awaitReplayRow`'s **return value is not reduced to `.ID`** (F3.1).
   `api/replay.go:142` hands the row to `replay.OutcomeOf(*store.Event, …)`, so the row must stay a
   full `*store.Event`; `newestReplay` (`:224`) shares the method family and stays on the full path
@@ -653,7 +657,7 @@ dashboard is where a user actually sits. The check should be surfaced where it i
 | `internal/decode/decode_test.go` | the ten `Body(…)` call sites (`:71`, `:95`, `:112`, `:132`, `:153`, `:168`, `:173`, `:180`, `:190`, `:202`) take the new fourth result — the signature change breaks every one, so the file moves with `decode.go` (F4.3); `:202`'s corrupt-tail case is the natural home for the `PartialCorrupt` unit assertion, alongside T4's API-level coverage |
 | `internal/cli/show.go` | `--body` decodes the response half via `decode.Body`; prints the undecoded/truncated marker — D2; its `displayModel`/`statusCell` calls pass `&ev.EventSummary` (`:61-62`) — F3.2 |
 | `internal/cli/serve.go` | `checkRedaction` switches to `ListEventsFull` — D1; wire `SetProxyMode`, `SetBodyCapBytes` — D2/D5 |
-| `internal/cli/export.go` | Both reads (`:90`, `:131`) switch to `ListEventsFull` — D1 |
+| `internal/cli/export.go` | JSON read (`:90`) switches to `ListEventsFull`; the CSV read (`:131`) stays on `ListEvents` and `rowValues` retypes to `*store.EventSummary` — D1 |
 | `internal/cli/ls.go`, `tail.go`, `stats.go`, `purge.go`, `format.go` | take `[]*store.EventSummary` in their **table** paths (metadata-only) — D1; **`ls.go`'s `--json` branch is the exception and reads through `ListEventsFull`** (`:55-62` encodes the whole row, so its documented output — every `store.Event` key, the four header/body fields included — must not change with the list retype) — D1/F5.2; `statusCell` (`ls.go:105`) and `displayModel` (`format.go:230`) take `*store.EventSummary` so one definition serves both halves, and `printNew` (`tail.go:84`) is retyped with the page — F3.2 |
 | `internal/quota/quota.go` | takes `[]*store.EventSummary` (metadata-only) — D1 |
 | `internal/api/replay.go` | `newestReplay` / `awaitReplayRow` stay on `ListEventsFull` and keep their `*store.Event` signatures — the row flows to `replay.OutcomeOf` at `api/replay.go:142` — D1/F3.1 |
@@ -969,10 +973,15 @@ story exists to close, surviving in the one half the run could not exercise from
 
 This is out of every bead's file list — `internal/proxy/proxy.go` appears in none of them, and the
 package is the hot path CLAUDE.md fences off. It is also not a one-line change in effect: widening
-`CaptureComplete` to include request truncation would change when `analyze`'s incomplete-stream rule
-fires (`rules.go:176`) and how the cross-source merge prefers one row over another
-(`merge.go:159-181`). Recorded here rather than fixed, because which of those two is wanted is a
-design decision the plan does not make, and the run's job is to report the state as it is.
+`CaptureComplete` to include request truncation changes when `analyze`'s incomplete-stream rule fires
+(`rules.go:176`) and how the cross-source merge prefers one row over another (`merge.go:159-181`).
+
+**Resolved by `br-GI-7-08`, authored for this finding.** The run was right that the plan does not make
+that decision, so the bead makes it and records it: the analyzer warning stops asserting the
+`message_stop` cause it cannot know and states the disjunction instead, and the merge keeps its
+"prefer the more complete record" rule, now covering a cut request body, pinned by a test. Once the
+decision was written down there was nothing left for the plan to arbitrate, which is why this
+paragraph said "rather than fixed" only until the bead existed.
 
 ## Change History
 
@@ -987,4 +996,4 @@ design decision the plan does not make, and the run's job is to report the state
 | v7 | 2026-09-20 | Round 6 review. D2 pins the `Completeness` value for a response body with **no** `Content-Encoding`: `Body`'s early return (`decode.go:63-65`, ahead of the cap logic) yields `Complete`, not `NotDecoded` — `RespBodyDecoded` equals `RespBody` and **no** read-path marker is drawn, so the tool's central case (a plain or SSE-streamed response) can never show the *"would not decompress"* text (F6.1); the `Complete`/`NotDecoded` enum comments are reworded (the `NotDecoded` comment now names a **compressed** body that produced no decoded bytes) so neither can be read as covering the unencoded case (F6.1); the fail-open sentence and the `NotDecoded`-marker invariant are qualified the same way, and D3's "equals the raw `RespBody`" clause no longer reads as an equivalence (F6.1); T4 gains the plain/unencoded case (`TestDetailUnencodedBodyIsComplete` — `Complete`, `RespBodyDecoded == RespBody`, never the marker) alongside the cap-truncated, corrupt-tail and unwired-cap cases (F6.1) |
 | v8 | 2026-09-20 | Round 7 review. D2's rationale for injecting the cap no longer asserts a false import edge: `internal/api` does **not** fail to import `internal/consumer` — `api.go:37` carries that import in production code (`consumer *consumer.Consumer`, `api.go:73`) and the guard's ban list is exactly `secret`/`config`/`ingest`, never consumer. The clause is reworded to the two real facts: the configured `BodyCapBytes` lives in `internal/config`, which the guard bans, and the cap's default is an **unexported** constant (`defaultBodyCapBytes`, `consumer.go:24`), so the `consumer` import `api` already holds still buys no reachable value — the cap can only arrive as the injected `SetBodyCapBytes` seam (F7.1) |
 | converged | 2026-09-20 | Round 8 review returned `NO_FURTHER_FINDINGS` with zero findings: the round-7 fix (F7.1) verified against source, and no new BLOCKER/MAJOR/MINOR raised. Cross-review loop closed after 8 rounds; plan v8 is the converged plan |
-| Phase 5 | 2026-09-20 | §10 filled in with the manual run against a copy of the live store, on the branch head. All eight of §10's items reproduced; one state did not — a request body cut at the read cap leaves `CaptureComplete` true (`proxy.go:79` reads only the response buffer's flag), so the capture marker is unreachable for that half. Recorded there, not fixed: no bead owns `internal/proxy`, and widening the flag changes the analyze and merge behaviour it feeds |
+| Phase 5 | 2026-09-20 | §10 filled in with the manual run against a copy of the live store, on the branch head. All eight of §10's items reproduced; one state did not — a request body cut at the read cap leaves `CaptureComplete` true (`proxy.go:79` reads only the response buffer's flag), so the capture marker is unreachable for that half. The finding became `br-GI-7-08`, which fixes it and decides the two ripples the plan could not: the analyzer warning's wording and the merge's row preference. §4's `export.go` rows also corrected — the CSV read never moved to the full path |
