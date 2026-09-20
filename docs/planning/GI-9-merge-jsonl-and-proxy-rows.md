@@ -18,9 +18,10 @@ written through the endpoint that omits it, and the correlation is exact: of the
 lines whose `message.id` matches a stored proxy body id, **2,807 carry no `requestId`** — zero
 exceptions. One mixed session (`4842d0f2…`) runs both models from the one client against **two
 endpoints** — 1,380 `claude-sonnet-5` lines, every one carrying a `requestId`, against 113
-`deepseek-flash` lines, none carrying one — and `requestId` is present **precisely when the request did
-not traverse this proxy**. The plan's *Cross-source identity* assumption (test 11b) was therefore never
-merely unverified — it is unverifiable as written.
+`deepseek-flash` lines, none carrying one — a line carries a `requestId` when its response came from a
+header-sending upstream, and the requests that traverse this proxy do not, so presence and proxying are
+inverse **on this install**. The plan's *Cross-source identity* assumption (test 11b) was therefore
+never merely unverified — it is unverifiable as written.
 
 **The identity already exists on both sides and is simply unused.** The upstream mints a message id,
 the proxy stores it inside the response body it already keeps, and Claude Code writes the same value
@@ -88,7 +89,7 @@ Consequences measured:
 | Proxy rows | 728 (all on the `proxy:` fallback) |
 | Proxy session ids that appear as JSONL sessions | **0 of 184** |
 
-### 2.2 `requestId` is present exactly when the request did not traverse this proxy
+### 2.2 `requestId` tracks the upstream endpoint, and on this install the endpoint is disjoint from the proxy
 
 Across all 728 stored proxy responses, the observed header set is
 `date, server, vary, access-control-allow-credentials, strict-transport-security, via, x-amz-cf-id,
@@ -105,8 +106,14 @@ Code sends none either, so the response header is the only direction that could 
 `requestId` is populated from that upstream **response** header — an inference about Claude Code's own
 behaviour, but one its data now pins down rather than merely suggests. Of the **2,807** transcript
 lines whose `message.id` matches a stored proxy body id, **2,807 carry no `requestId`**: zero
-exceptions. So `requestId` is present **precisely when the request did not traverse this proxy**, and
-the mixed session is the rule at its sharpest:
+exceptions. **The measured leg is one-way, and it is its contrapositive that is usable**: every line
+that traversed this proxy carries no `requestId`, so every line that *carries* one did **not** traverse
+it. The converse — absent ⟹ traversed — is not measured and does not hold, and the next bullet is the
+counterexample: no-`requestId` sessions exist that **predate** the proxy's first stored row, so their
+absence is not proxy-caused. The field marks the **endpoint** that answered, not the proxy; the requests
+this proxy forwards happen to reach a header-less one, and a request sent straight to that same endpoint
+would carry none either. That is why presence and proxying are inverse **on this install**, and the
+mixed session is the rule at its sharpest:
 
 - One session (`4842d0f2…`) runs both models from the one client against **two endpoints**: **1,380
   `claude-sonnet-5` lines, every one carrying a `requestId`**, against **113 `deepseek-flash` lines,
@@ -185,7 +192,12 @@ matcher.
 
 **The misses are absentees, not mismatches — measured, not inferred from row metadata.** The drawer is
 exactly where this story's own defect would hide: a response the client received, wrote a line for, and
-whose id does not match the body id. The discriminator is defined so that the zero means something: for
+whose id does not match the body id. **The drawer's figures are their own pass, on the grown corpus —
+they are not a complement of the 947-of-1,203 above.** They were re-measured separately once the corpus
+had grown: of that pass's **303** ids with no verbatim transcript match, **0** mismatched. The three
+figures in the ratio paragraph (1,203 ids / 947 matched / 303 unmatched) therefore come from **two
+passes on two corpora** and do not close as one census (`1,203 − 947 = 256`, not 303); the 0-mismatch
+result is unaffected either way. The discriminator is defined so that the zero means something: for
 each proxy id with **no** verbatim transcript match, take a transcript line in the same session whose
 `[started_at, ended_at]` interval — widened by §2.5's **3.2s** median offset — overlaps the row's and
 whose token columns match, and ask whether that candidate carries a **different** `message.id`. A
@@ -289,25 +301,32 @@ No row changes session on any path, so no session can be left holding totals for
 has. Reconciling the survivor's session — which both callers already do — is the whole job, and it is
 required precisely because a merge *does* rewrite the surviving row's token columns in place.
 
-The asymmetry is still worth stating, with its cause, **as the proxy is currently written**: the
-`sessions` table holds **184 rows, precisely the 184 distinct proxy `session_id`s**, while **0 of 207**
-JSONL sessions have one — because `SetSessionRecorder`
+The asymmetry **that D4's ordering argument rested on is what this story ends (D7).** As the proxy is
+currently written, the `sessions` table holds **184 rows, precisely the 184 distinct proxy
+`session_id`s**, while **0 of 207** JSONL sessions have one — because `SetSessionRecorder`
 ([internal/jsonlogs/jsonlogs.go:143](../../internal/jsonlogs/jsonlogs.go#L143)) has **no caller anywhere
-in the module**. So a merged row always lands in a **proxy** session, and that, not any reconcile
-change, is what makes D4's ordering necessary: a JSONL session has no aggregate row to hold the row.
+in the module**, so the JSONL half silently records no `sessions` rows at all. That, not any reconcile
+change, is why a merged row presently always lands in a **proxy** session and why an ordering was
+argued to matter: a JSONL survivor would land in a session with no aggregate row to hold it.
 
 **The 0-of-184 overlap is a consequence of the proxy's code, not a property of the data.** The proxy
-*sees* the true conversation id: `x-claude-code-session-id` arrives in **1,364** stored proxy **request**
-headers, has **3** distinct values, and all **3 are real JSONL `sessionId`s** — yet **0** of them appear
-in `events.session_id`, because the proxy discards the header and reconstructs a session id
-heuristically instead. So "only proxy sessions have a materialised aggregate" and "the two session sets
-never overlap" hold **as the proxy is currently written**, and wherever this document leans on them
-(D3, D4's ordering argument, §8's first bullet) it means exactly that. GI-9's scope is unchanged — this
-is not the story to store the header — but §8 records how small that follow-on story is. The
-Sessions-view consequence of the asymmetry is real and is recorded in §8; it is not this section's
-subject.
+*already receives* the true conversation id: `x-claude-code-session-id` arrives in **1,364** stored
+proxy **request** headers, has **3** distinct values, and all **3 are real JSONL `sessionId`s** — and
+it is **already on disk**: the consumer stores every header map verbatim on the row
+([internal/consumer/consumer.go:442-447](../../internal/consumer/consumer.go#L442-L447),
+[schema.sql:55](../../internal/store/schema.sql#L55)), and `redactHeaders` neither lists it nor mutates
+the original ([internal/proxy/redact.go:29-48](../../internal/proxy/redact.go#L29-L48)). What the proxy
+does **not** do is promote it: the header selects a grouping key and nothing else
+([internal/session/session.go:70-78](../../internal/session/session.go#L70-L78)), the row's `session_id`
+is a **minted** `s_<unixMilli>_<hex>` ([session.go:58,80-84](../../internal/session/session.go#L80-L84)),
+and **0** of the 1,364 values ever reach `events.session_id`. So "only proxy sessions have a
+materialised aggregate" and "the two session sets never overlap" hold **only as the proxy is currently
+written**; **D7 ends both**, and it is a small change precisely because the value is already captured —
+no new capture and no new retention. The sessions consequence that this section records as an
+asymmetry is the state D7 removes.
 
-**Nothing follows from this for the store**, which is why §4 lists no merge-path change.
+**Nothing follows from this for the store's merge path**, which is why §4 lists no merge-path change:
+D7 changes which value a *writer* puts in `session_id`, not any rule about what a merge does with it.
 
 ## 3. Design
 
@@ -432,26 +451,31 @@ identity rule expressed in two packages and makes a string prefix load-bearing f
 
 ### D3 — Which session owns a merged row, and why `session_id` stays unrewritten
 
+**D7, below, changes *which value* that session is; this decision is about the rule that a merge never
+changes it, and it holds unchanged.**
 Once a JSONL row and a proxy row share a key, one row survives and it belongs to exactly one session.
 The rule is already in `mergeEvents` and this story does **not** change it:
 `merged.FirstSource = existing.FirstSource` and `merged.SessionID = existing.SessionID`
 ([internal/store/merge.go:226-227](../../internal/store/merge.go#L226-L227)) — the row keeps the
 session it was **first written under**, and the later arrival never displaces it.
 
-That is the right rule here, and the reason is §2.6's asymmetry rather than a preference. On the
-ordinary ordering the proxy row is written live and the JSONL row arrives minutes later, so the
-survivor is the **proxy** session — which is the only kind of session that has an aggregate row at all
-**as the proxy is currently written** (it discards the true conversation id the request header carries,
-§2.6), since `SetSessionRecorder` has no caller. A merged row therefore always lands somewhere its
-totals can be re-derived, and no JSONL session is asked to own a row it could not account for.
+That is the right rule here, and **D7 is what makes it right rather than merely conventional.** Once
+both sources write the **same conversation id**, the survivor's session is the conversation whichever
+source it is, and every session it can land in has an aggregate row, because D7 wires the JSONL half's
+recorder. As the proxy is currently written the reason was §2.6's asymmetry instead — on the ordinary
+ordering the survivor was always a **proxy** session, the only kind with an aggregate row — and D7 ends
+that asymmetry rather than leaning on it. So the rule above is unchanged; the *guarantee* it used to
+need an ordering argument to stand on is now a property of the identity.
 
-**That guarantee is a property of the ordinary ordering, not of the merge.** It holds because the proxy
-row is the one already in the table, and `mergeEvents` keeps `existing`. Nothing in `mergeEvents` checks
-the *source* of the row it is merging into, so any path where a JSONL row gets a key first produces a
-JSONL survivor — a row in a session with no aggregate, invisible to `clens sessions` and the dashboard's
-Sessions tab. The live merge cannot do that, because the proxy row always gets there first. D4's rekey
-collision can, and D4 carries the rule that prevents it. Stated here so that a later path which merges
-without that rule is a decision rather than an accident.
+**That guarantee used to be a property of the ordinary ordering rather than of the merge; D7 makes it a
+property of the merge.** As the proxy is currently written, `mergeEvents` keeps `existing` without
+checking the *source* of the row it is merging into, so any path where a JSONL row got a key first
+produced a JSONL survivor — a row in a session with no aggregate, invisible to `clens sessions` and the
+dashboard's Sessions tab. The live merge could not do that because the proxy row always got there first,
+and D4's rekey collision could — which is why round 6 gave D4 a branch on the taker's source. **Under
+D7 that harm is gone at the root**: both rows are in the same conversation session, that session has an
+aggregate row, and neither source is privileged. D4's source branch is deleted with the rest of the
+swapped-call design (D4), and no later path needs to check a survivor's source either.
 
 Two consequences the design depends on, both stated so a later change is a decision rather than a
 drift:
@@ -463,21 +487,24 @@ drift:
   correct precisely *because* a merge rewrites the surviving row's tokens in place while leaving its
   session alone. Do not "consolidate" the two session columns into the incoming row's. This is a
   statement about the **merge** path. D4's rekey collision is a different path — it deletes a row as
-  well as merging one — and there the set of sessions to reconcile is larger; D4 states it.
+  well as merging one — and there the set to reconcile is the **distinct sessions among the two
+  rows**, usually one under D7; D4 states it.
 - **No merge can vacate a session.** The incoming INSERT fails on the unique constraint *before* the
   incoming event ever holds a row, so there is no second row to remove and no session left holding
   totals for a row it no longer has. This was this plan's own first answer, and it was wrong; §2.6
   carries the trace. The one path that *does* delete a merged-away row is D4's re-key collision, and
   that path reconciles explicitly for exactly this reason.
 
-### D4 — The backfill is two mechanisms behind one command
+### D4 — The backfill is three passes behind one command
 
 Forward-only would leave an estimated 28,405 surplus rows and every historical total double-counted, so
-the story carries the backfill. The two halves re-key from genuinely different sources, which is why
-one command has two mechanisms rather than a shared loop:
+the story carries the backfill. The passes repair from genuinely different sources, which is why one
+command runs three of them rather than a shared loop: pass 1 re-keys rows whose identity is inside
+`resp_body`, pass 2 re-attributes rows whose session is inside `req_headers`, and pass 3 deletes and
+re-derives the JSONL rows whose identity was never stored at all.
 
-**Proxy half — re-key in place.** The value is already stored, inside `resp_body`, so these rows need
-no re-read. Each row is processed in its **own transaction**:
+**Pass 1 — the proxy half: re-key in place.** The value is already stored, inside `resp_body`, so these
+rows need no re-read. Each row is processed in its **own transaction**:
 
 1. for each `source='proxy'` row whose `request_id` is **synthetic** — the predicate is
    `request_id LIKE 'proxy:%'`, and it must be the **prefix**, not "the body yields an id different
@@ -486,9 +513,12 @@ no re-read. Each row is processed in its **own transaction**:
    keys on the same header value — converting D1's working Anthropic case into the non-merging case D1
    exists to avoid — **and** whose body yields an id: decode the body and extract the id;
 2. if the new key is free, re-key the row (`UPDATE events SET request_id = ? WHERE id = ?`);
-3. if the new key is taken, resolve the collision by the **taker's source**, then delete whichever row
-   did not survive and reconcile every session whose figures moved — through `reconcileSessionTx`, the
-   tx-taking form (§4). See "the taker can be a JSONL row" below; it is not the edge case it looks like.
+3. if the new key is taken, **merge into the taker and delete the row that did not survive**, then
+   reconcile the distinct sessions among the two rows — through `reconcileSessionTx`, the tx-taking
+   form (§4). The taker is whatever holds the key (`getEventByRequestIDTx` filters on `request_id`
+   alone, [`merge.go:82-84`](../../internal/store/merge.go#L82-L84)), and after D1 that is usually the
+   **JSONL row** — the ordinary case, not a corner, because the JSONL row for a request is written
+   minutes after the proxy row for it.
 
 The body must be decoded first (`decode.Body`, as `processCall` does at
 [internal/consumer/consumer.go:302](../../internal/consumer/consumer.go#L302)), and the scan must pass
@@ -506,70 +536,80 @@ its old `proxy:` key, so "merge instead" on its own produces a duplicate — the
 that was supposed to disappear. Hence the delete. The delete is also what makes "a second run is a
 no-op" true — the row is gone, so nothing is left for a second pass to find.
 
-**The taker can be a JSONL row, and after D1 it usually is.** The lookup that finds the taker,
-`getEventByRequestIDTx`, filters on `request_id` alone — no `source`
-([internal/store/merge.go:82-84](../../internal/store/merge.go#L82-L84)). So step 3's "the two rows"
-are not two proxy rows: they are the proxy row being re-keyed and **whatever holds the key**. Post-D1
-the tailer keys each line by its `message.id`, and the key rule must land **before** the backfill runs
-(this section's own ordering rule, below), so by the time anyone runs `clens rekey` the recent JSONL
-rows already hold exactly the keys the proxy half is about to claim. That is the ordinary case, not a
-corner: the JSONL row for a request is written minutes after the proxy row for the same request.
+**Whichever source the taker is, the survivor is the taker, and under D7 that is correct.** Round 6
+gave step 3 a branch on the taker's source because a JSONL survivor landed in a session with no
+aggregate row. **D7 deletes the premise**: both rows are in the same conversation session, that session
+has an aggregate row, and the survivor's session is right whichever side it is. So step 3 needs no
+branch. It is the ordinary merge: the proxy row is the `incoming`, the taker is the `existing` holding
+the target key, and **nothing is re-keyed**, because the taker already holds the key the proxy row is
+claiming.
 
-Merge into that taker and the survivor is a JSONL row, in a JSONL session with no `sessions` row —
-the precise harm D4's ordering argument exists to prevent, arriving through the half that argument
-assumed was safe. So the surviving row is **always the proxy row**, whichever source the taker is:
+**The mechanism is a factored helper, not a hand-written merge, and the swap is gone with the reason
+for it.** `insertOrMerge`'s collision branch — load by key, `mergeEvents`, `updateEventTx`, attach
+`source_mismatch` ([`merge.go:112-131`](../../internal/store/merge.go#L112-L131)) — becomes an
+unexported **`mergeIntoExistingTx`**, and **both** `insertOrMerge` and the rekey path call it, so the
+live path and the rekey path cannot drift into two rules. The rekey path's call is the ordinary
+`mergeIntoExistingTx(proxyRow)`: it loads the taker by the target key, merges the proxy row into it, and
+the proxy row is then deleted by its own id (it is the `incoming` row and never holds a row of its own).
+**Nothing is re-keyed** — which is exactly why round 7's swapped `mergeEvents(proxyRow, taker)` and
+round 8's hand-written content rule existed, and why both were wrong: they were compensating for a
+session constraint **D7 deletes**.
 
-- **taker is a `proxy` row** — the taker survives as the merge target, per `mergeEvents`'
-  existing-survives rule, and the re-keyed row is merged into it and deleted. Both sessions are proxy
-  sessions, and both are reconciled.
-- **taker is a `jsonl` row** — the taker is deleted, and the **proxy** row survives carrying the
-  target key. Its content follows the winner pick plus per-column backfill (below), not a union; its
-  `id`, `session_id` and `first_source` are the proxy row's.
+**So the round-7/8/9 traps are kept below as a warning, not as a description of the design.** The two
+shapes *are* the silent failures in this story (§6), so a guard against reintroducing them is still
+worth carrying — but they are no longer reachable through the mechanism this section prescribes: one
+helper, one call, the taker as `existing`. Each dissolves as a design defect and survives only as a
+named failure mode:
 
-**The requirement is stated and the mechanism deliberately is not, because the obvious mechanism is
-wrong and silently so.** The natural reading of "the proxy row survives" is `mergeEvents(proxyRow,
-jsonlTaker)` with the arguments swapped, and that **does not work**:
+- **F7.1** — `mergeEvents` never assigns `RequestID` (`merged := *existing`,
+  [`merge.go:147`](../../internal/store/merge.go#L147)), so a **swapped** call writes the old synthetic
+  key straight back. Not a defect of this design, because this design does not swap: the proxy row is
+  the `incoming` and the taker already holds the target key, so nothing needs assigning. It stays as
+  the warning against putting the proxy row in the `existing` seat.
+- **F8.2** — "content is the union" is the inverse of `mergeEvents` (a winner pick plus a per-column
+  backfill). The helper inherits `mergeEvents`' content rule unchanged rather than restating it, so
+  this is true by construction now; the warning stands against hand-writing the content.
+- **F9.10** — the never-observed-usage override is part of `mergeEvents` and travels with it.
 
-- `mergeEvents` **never assigns `RequestID`** — the function body has no such line; it starts from
-  `merged := *existing` ([internal/store/merge.go:147](../../internal/store/merge.go#L147)) and copies
-  fields one at a time from there. So the swapped call returns a row still keyed by the proxy row's
-  **old synthetic key**, and `updateEventTx` binds `request_id` first
-  ([internal/store/merge.go:14-15](../../internal/store/merge.go#L14-L15),
-  [:69-79](../../internal/store/merge.go#L69-L79)) — so the write puts the old key straight back.
-  Deleting the taker then leaves **no** row holding the message id. The run reports success, re-keys
-  nothing on the ordinary case, and *succeeds on a second run* — the exact opposite of the no-op this
-  section promises.
-- `mergeEvents` also takes the key **and** the session from the same argument (`merged := *existing`).
-  The order that yields the right key is the one that yields the wrong session, and vice versa. This
-  operation cannot be expressed as a single `mergeEvents` call at all — that is the whole reason it
-  needs a helper rather than a call.
-- `mergeEvents` does **not** attach the `source_mismatch` warning either; `insertOrMerge` does
-  ([internal/store/merge.go:117-131](../../internal/store/merge.go#L117-L131)). A helper calling
-  `mergeEvents` directly merges a token-disagreeing collision **silently**, and §6 tells the operator
-  to expect a handful of those warnings from the run. The helper owns the warning, or the expectation
-  is false.
+**`mergeIntoExistingTx` is `insertOrMerge`'s collision branch, so its contract is `insertOrMerge`'s.**
+It loads the row holding `incoming.RequestID`, calls `mergeEvents(existing, incoming)`, writes the result
+with `updateEventTx`, and attaches `source_mismatch` on the same terms
+([`merge.go:112-131`](../../internal/store/merge.go#L112-L131)). The surviving row therefore keeps the
+taker's `id`, `session_id` and `request_id`, and its content is `mergeEvents`' **winner pick plus
+per-column backfill**, never a union. Three sub-rules are stated here anyway, because the rekey path is
+their second caller and each is silent when missed:
 
-So the helper's contract is a **requirement list, not an implementation sketch**: the surviving row is
-the proxy row's `id` and `session_id`; its `request_id` is the **target key**; its six token columns
-come from the winner and **`total_prompt_tokens` is re-derived from them in the same write** — it is a
-*derived* column the live paths recompute every time (`merge.go:214`, `store.go:261`, `:299`), so a
-helper that copies the winner's six columns and leaves the survivor's stored total in place ships a row
-whose `total_prompt_tokens` contradicts its own columns, the invariant CLAUDE.md calls "a tested
-invariant, not a convention"; the **winner pick is the full three-rule sequence** `mergeEvents`
-performs, including its **never-observed-usage override** (`merge.go:196-206`) — a side whose usage was
-never observed never takes the pick from a side that has some, so an implementer who stops at the
-two-case complete-frame switch diverges from live behaviour whenever the picked side is all-zero; the
-taker's row is **deleted** (freeing the `UNIQUE` key); the `source_mismatch` decision is the helper's to
-make on the same terms `insertOrMerge` makes it; and the touched sessions are reconciled.
+- **`total_prompt_tokens` is re-derived from the survivor's four prompt columns in the same write** — it
+  is a *derived* column the live paths recompute every time (`merge.go:214`, `store.go:261`, `:299`), so
+  a helper that copies the winner's six columns and leaves the survivor's stored total in place ships a
+  row whose `total_prompt_tokens` contradicts its own columns, the invariant CLAUDE.md calls "a tested
+  invariant, not a convention";
+- **`billing_mode`'s empty-mode derivation is part of the pick** (F10.3) — when the winner's mode is
+  empty the label follows the winner's cost column (`api` when the winner's `cost_usd` is non-NULL,
+  `subscription` when its `api_equivalent_cost_usd` is), and when the winner priced nothing it keeps
+  `existing.BillingMode` ([`merge.go:272-288`](../../internal/store/merge.go#L272-L288)). This is a
+  **fourth** rule after the complete-frame switch and the never-observed override, and it is reachable:
+  `billingModeForAuthKind` returns `""` for an unclassified `auth_kind`
+  ([consumer.go:475-484](../../internal/consumer/consumer.go#L475-L484)). An implementer who copies the
+  winner's empty mode ships a row whose cost column and mode column disagree, and an empty mode matches
+  none of the three aggregates' `CASE WHEN billing_mode = …` branches, so the row silently drops out of
+  every cost total — the code's own comment calls the naive alternative "worse than the defect";
+- **the deleted row's warnings** (F10.8) — `warnings.event_id` is `ON DELETE CASCADE`
+  ([`schema.sql:93-102`](../../internal/store/schema.sql#L93-L102)), so the taker's warnings vanish with
+  it. `insertOrMerge` re-computes the *arriving* side's warnings onto the survivor's id, so a live merge
+  accumulates both sides'; the helper therefore **re-attaches the deleted row's warnings to the
+  survivor** (upsert by `(event_id, kind)`), so the two callers agree. Reachable kinds on a JSONL row
+  are narrow but not zero: `source_mismatch` from an earlier `insertOrMerge`, and the tailer's
+  `peak_pricing` (the tailer is wired without `SetAnalyzers`,
+  [`ingest.go:79-97`](../../internal/cli/ingest.go#L79-L97)).
 
-**How those are sequenced inside the transaction, and which field is copied when, is the implementer's
-to work out against the real `merge.go`** — it is the first thing **br-GI-9-04**'s cross-review (Phase
-5.5) should be pointed at, and **this paragraph is deliberately not specified further here**. The reason
-is in §7: four consecutive rounds of plan-level review each found a defect one level deeper in this one
-paragraph, and the fifth was not a design error at all — it was a field-copy detail inside a function
-this plan does not own. Keeping on specifying below the resolution a document has is how a confident
-wrong mechanism gets written down; the plan settles *what* it can see and moves the *how* to the bead
-and its code review, where the real `merge.go` is the arbiter.
+**The sequencing is the ordinary merge's, so there is no longer an unspecified middle.** The helper is
+`insertOrMerge`'s collision branch with a second caller, and the only rekey-specific steps are the
+delete of the `incoming` proxy row after the write — which `insertOrMerge` does not need, because its
+incoming row never held a row at all — and the reconcile of the distinct sessions among the two rows.
+That contract is still the checklist **br-GI-9-04** carries (§9), because the live path and the rekey
+path now share it, and a change to `mergeEvents` must not be allowed to satisfy one caller and not the
+other.
 
 **"Content" is not a union, and saying so would specify the inverse of the live behaviour.** The
 tempting one-line summary of the content rule — "merge the two rows" — is wrong in a way an implementer
@@ -596,47 +636,45 @@ So the contract names the rule rather than a paraphrase of it.
 **The winner pick is order-dependent, and for two complete captures it follows `incoming`.**
 `case existing.CaptureComplete && incoming.CaptureComplete: winner = incoming`
 ([internal/store/merge.go:168-169](../../internal/store/merge.go#L168-L169)) — so with both sides
-complete, the measurement columns above follow the **incoming** argument, not `existing`. That is what
-makes the argument order in the helper load-bearing for the *figures* as well as for the key and the
-session, and it is the third distinct thing the order decides. The direction chosen here is still the
-right one — it reproduces the live seat — but the reason is the session and the identity, not
-indifference about the content.
+complete, the measurement columns above follow the **incoming** argument, not `existing`. In the rekey
+path the taker is `existing` and the **proxy row is `incoming`**, so the proxy row takes the pick; on
+the ordinary live ordering the proxy row is `existing` and the JSONL arrival is `incoming`, so the
+**JSONL** row takes it. **The two seats therefore differ, and this design accepts that.** The
+divergence shows only when both captures are complete *and* disagree on tokens — the same pair that
+raises `source_mismatch` and the handful §6 tells the operator to expect — so it is visible, not
+silent. The earlier design restored the live seat by swapping the arguments; the swap is what re-keyed
+nothing, so the cost of using one merge rule for both paths is that the rekey path's pick follows its
+own argument order rather than the live one.
 
 **The switch is not the whole rule.** After it, a winner that carries **no observed usage** loses the
 pick to the other side (`merge.go:196-206`) — the `--body-policy off` correction, where a row's zero is
 "never looked", not a measurement, so it never takes the pick from a row that has some. The complete
-statement is therefore the three-rule sequence: the complete-frame switch, then the observed-usage
-override. §5 pins the override with a fixture whose picked side carries all-zero usage while the other
-side does not, asserting the figures follow the **observed** side.
+statement is therefore the sequence: the complete-frame switch, then the observed-usage override, then
+the empty-`billing_mode` derivation (F10.3). §5 pins the override with a fixture whose picked side
+carries all-zero usage while the other side does not, asserting the figures follow the **observed**
+side.
 
-**The proxy row winning is not a new rule, it is the live behaviour restored.** On the live path the
-proxy row is `existing` because it was written first, so the JSONL arrival merges *into* it. The rekey
-path is the same merge with the arrival order reversed, and the helper restores the same outcome rather
-than inventing a different one. `insertOrMerge` hard-codes which argument is `existing` (it is the row
-it failed to insert), which is why this is a `rekey`-only helper in `internal/store` — **the live merge
-path is untouched** (§2.6, §4).
+**`insertOrMerge` hard-codes which argument is `existing`** — it is the row it failed to insert — which
+is why the collision branch has to be factored out as `mergeIntoExistingTx` rather than reached through
+`insertOrMerge`: the rekey path's `existing` is loaded by key, not by a failed insert. That factoring
+changes nothing about the live call, which still passes the row it could not insert, so **the live
+merge path is untouched** (§2.6, §4) — only its collision branch gains a second caller.
 
-**The reconcile set is source-dependent, and it is a set rather than a pair.** It is every session whose
-figures moved: the survivor's (the proxy session), and the session of whichever row was deleted. The two
-are the same session in the proxy-taker case only when both colliding rows happen to share one. In the
-JSONL-taker case the deleted row *is* the taker, so "the deleted row's session" already covers it —
-there is no third session, and no `sessions` row exists for it to reconcile anyway (§2.6). Reconcile the
-set rather than assuming its size.
+**The reconcile set is the distinct sessions among the two rows — usually one, and not always.** Under
+D7 a proxy row and a JSONL row for the same request carry the same conversation id, so in the ordinary
+case both rows of a collision share one session and a single `reconcileSessionTx` call covers the whole
+collision. **Do not claim it is always one**: a historical proxy row whose `req_headers` lacked
+`x-claude-code-session-id` keeps its minted `s_…` (pass 2 below), so the two rows can still differ and
+the set is then two. Reconcile the set rather than assuming its size.
 
-**The reconcile covers two sessions, and the second one is easy to miss.** The deleted row's session
-needs re-deriving because a proxy row **always** has a `sessions` row (§2.6), so removing one without
-re-deriving leaves that session's totals permanently high. But the *survivor's* session needs it too,
-and that half is not about the delete at all: `mergeEvents` copies the **winner's** six token columns
-onto the surviving row
-([internal/store/merge.go:208-214](../../internal/store/merge.go#L208-L214)), and the winner can be the
-incoming row — when both sides are complete captures the pick is `winner = incoming`
-([internal/store/merge.go:168-169](../../internal/store/merge.go#L168-L169)). So the survivor keeps its
-own `session_id` while carrying the other row's tokens, and its session's aggregate moves. `InsertEvent`
-already reconciles exactly that session — `insertOrMerge` returns `result.SessionID`, the survivor's
-([internal/store/store.go:270-280](../../internal/store/store.go#L275-L280)) — which is the rule the
-rekey path has to reproduce rather than approximate. In the **proxy-taker** case the set is
-`{survivor.SessionID, deleted.SessionID}`; when the two are equal it is one call, and nothing here
-depends on them being equal.
+**Both sides' figures move, so both sessions can.** The taker is deleted outright, and `mergeEvents`
+copies the **winner's** six token columns onto the surviving row
+([internal/store/merge.go:208-214](../../internal/store/merge.go#L208-214)), where the winner can be
+either side. Either way the sessions holding those rows must be re-derived — removing a row leaves its
+session's totals high, and moving its tokens leaves the survivor's wrong — and `InsertEvent` already
+reconciles exactly the survivor's, because `insertOrMerge` returns `result.SessionID`
+([internal/store/store.go:275-280](../../internal/store/store.go#L275-L280)); the rekey path reproduces
+that rule rather than approximating it.
 
 **Use `reconcileSessionTx`, not `ReconcileSession`.** `ReconcileSession`
 ([internal/store/store.go:672-682](../../internal/store/store.go#L672-L682)) opens its **own**
@@ -648,15 +686,50 @@ failure rather than a timeout. `reconcileSessionTx`
 ([internal/store/store.go:684](../../internal/store/store.go#L684)) is unexported and takes a `*sql.Tx`,
 which is why both existing callers use it and why the rekey methods must live in `internal/store` (§4).
 
-**JSONL half — delete, then re-ingest.** A stored JSONL row cannot be re-keyed in place: its old key
-holds a uuid and the message id it *should* hold was never stored. The only place that value exists is
-the transcript. So the half is:
+**Pass 2 — re-attribution: the historical proxy rows adopt their conversation id.** Pass 1 is about
+*keys*; this pass is about the *session*, and it exists because the forward fix (D7) only affects rows
+written after it lands — every proxy row already in the table still carries a minted `s_…`. Each such
+row's true conversation id is **already on disk** in its own stored `req_headers`
+(`x-claude-code-session-id`, D7), so this pass needs **no new capture and no new retention**: it reads a
+field the system already keeps.
 
-0. **check the precondition the delete rests on**, and refuse (or skip and report) if it fails: every
-   source file backing a `jsonl:`-keyed row exists, and its current size is not below the byte cursor
-   the tailer last recorded for it. Re-derivability is a *checked precondition of the run*, not an
-   assumption — §6 states why a shrunk or deleted transcript makes a row non-re-creatable, and §5 seeds
-   a missing/short file and asserts the refusal;
+1. for each `source='proxy'` row, read its `session_id` and its `req_headers`; rows whose headers carry
+   no such value keep their minted `s_…` and are **counted in `--dry-run` alongside N and M**, not
+   reported as re-attributed;
+2. **`UPDATE events SET session_id = ? WHERE id = ?`** — a direct write, and **it cannot route through
+   the merge**: `mergeEvents` never rewrites `session_id`
+   ([`merge.go:227`](../../internal/store/merge.go#L227)) and **that stays true** (D3), because this
+   pass is *re-attributing* rows, not merging them. **This is the one write path in the story that sets
+   `session_id` on an existing row** — stating it here is what stops a later reader concluding D3 was
+   relaxed;
+3. reconcile **both** sessions through `reconcileSessionTx`: the old `s_…` (a row left it) and the new
+   conversation id (a row joined it, so **upsert** it first — after pass 1 the conversation session may
+   not exist yet). Then **remove the old `sessions` row once re-deriving shows it empty**, or
+   `clens sessions` shows a ghost session with no rows.
+
+The upsert is not incidental: pass 2 can run before pass 3 has re-ingested anything, so nothing has
+created the conversation session yet, and a bare reconcile against a missing row would leave the
+aggregate unrepresented.
+
+**Pass 3 — the JSONL half: delete, then re-ingest.** A stored JSONL row cannot be re-keyed in place:
+its old key holds a uuid and the message id it *should* hold was never stored. The only place that value
+exists is the transcript. So the pass is:
+
+0. **check the precondition the delete rests on**, and refuse (or skip and report) if it fails. The
+   schema carries **no row→file link** — `events` has no transcript-path column (`path` is the request
+   URL path, proxy-only, [`schema.sql:53`](../../internal/store/schema.sql#L53)), and the key embeds a
+   `sessionId` and a `uuid`, not a path ([`dedup.go:104`](../../internal/jsonlogs/dedup.go#L104)) — and
+   the mapping is not a function anyway: a sidechain row takes the **parent's** `sessionId`
+   ([`jsonlogs.go:381-387`](../../internal/jsonlogs/jsonlogs.go#L381-L387)), so one session id owns the
+   parent file *and* every subagent file. The check is therefore stated over the set the schema **does**
+   carry — **every recorded `jsonl:<path>` cursor whose path is a transcript the re-ingest will walk**
+   ([`cursor.go:18`](../../internal/jsonlogs/cursor.go#L18)): the file exists and its current size is
+   not below the recorded byte cursor. And the delete is **scoped to what that walk can reproduce**: the
+   re-ingest is root-scoped (`resetJSONLCursors` walks `root` and zeroes only the `.jsonl` files it
+   finds, [`ingest.go:135-145`](../../internal/cli/ingest.go#L135-L145)), so a row whose transcript
+   lives outside `jsonlRoot()` would be deleted and never re-read — **the root-change case is a
+   refusal**, and §5 seeds it. Re-derivability is a *checked precondition of the run*, not an
+   assumption: §6 states why a shrunk or deleted transcript makes a row non-re-creatable;
 1. delete `source='jsonl' AND request_id LIKE 'jsonl:%'`;
 2. zero the byte cursors and re-run the tailer — the mechanism `clens ingest --rebuild` already owns.
 
@@ -686,51 +759,51 @@ the same key and merges.
 `jsonl:<sessionId>:<uuid>`, so the transcript line it came from is look-up-able with **no heuristic at
 all**, and an in-place join → re-key would avoid the destructive delete for the majority of rows. It
 falls short **only** on the duplicate-collapse problem above: a re-keyed-but-not-collapsed set keeps the
-surplus. Naming it is what makes "one command, two mechanisms" an argued decision rather than an
+surplus. Naming it is what makes "one command, three passes" an argued decision rather than an
 unexplained asymmetry.
 
-**Ordering: the proxy half runs first, then the JSONL half.** The survivor of a merge is whichever row
-is already in the table, and the survivor must be the row whose session has a **materialized
-aggregate** — and **as the proxy is currently written** only proxy sessions have one (§2.6, §8). Running
-the proxy half first means the JSONL
-half's re-ingested rows collide with the already-re-keyed proxy rows, the survivor keeps the **proxy**
-session, and `source_refs` unions as intended. Running the JSONL half first would make the JSONL row
-the survivor, and the merged row would land in a session with no `sessions` row — so it would vanish
-from `clens sessions` and the dashboard's Sessions tab.
+**Ordering: pass 1, then pass 2, then pass 3 — fixed, and now fixed only for determinism and
+reporting.** The sequence no longer decides anything: under D7 both rows of every collision carry the
+same conversation session, so either order yields the same row, the same key and the same session. The
+reason the ordering *was* argued for — proxy half first so the survivor keeps a session with a
+materialised aggregate — is dead with the asymmetry that made a JSONL session aggregate-less (§2.6,
+D7), and it is **dropped rather than re-justified**: there is no surviving reason. The sequence is kept
+because a fixed, stated order makes the run's output reproducible and its report readable, not because
+the outcome depends on it.
 
-**Ordering is not sufficient on its own, and the proxy half proves it.** The paragraph above reasons
-about the JSONL *half*'s re-ingest, where the proxy rows are unreachable-because-already-there. The
-proxy half has no such protection: it re-keys *onto* keys that post-D1 JSONL rows may already hold, so
-its own collisions can produce a JSONL survivor unless step 3 branches on the taker's source. Ordering
-gets the JSONL half right; step 3 gets the proxy half right. Both are needed, and neither is redundant
-— which is why step 3's branch is stated as a rule rather than left to the ordering argument.
-
-*Rejected alternative — have `rekey` upsert the survivor session.* With an upsert, a JSONL session
-could be the survivor. It is rejected because it would change what the Sessions view contains, and that
-is a separate story's decision (§8).
+*Rejected alternative — have `rekey` upsert the survivor session.* This is now **accepted, and is what
+pass 2 does**: the conversation session is upserted so a re-attributed row has somewhere to land. What
+the earlier rejection protected — a JSONL-only session appearing in the Sessions view with no rows —
+cannot happen, because the upsert is followed immediately by the row's update and the reconcile; the
+only upserted session with no rows would be one whose every row then moved again, which the same pass
+removes.
 
 **One command, `clens rekey`**, following the contract
 [cli-and-tooling.md](../context/cli-and-tooling.md) states for any destructive subcommand — and the
 repo currently has exactly one:
 
 - nothing happens without `--yes`;
-- `--dry-run` prints what `--yes` would do — both halves' counts, **plus the re-pricing and
-  re-derivability notes the operator needs** (below); **no row-level output**;
-- the two halves run in the order stated above, and the command reports each separately, because a run
-  that did one and failed the other must not read as "done".
+- `--dry-run` prints what `--yes` would do — all three passes' counts, **plus the re-pricing,
+  re-derivability and dangling-`replay_of` notes the operator needs** (below); **no row-level output**;
+- the three passes run in the order stated above, and the command reports each separately, because a run
+  that did one and failed another must not read as "done".
 
-**Per-row transactional merge, so a partial run is resumable.** The proxy half **overwrites
-`request_id` in place**, so a crash mid-run would otherwise lose the old→new mapping with no record.
-Each row's re-key (and any merge it triggers) is therefore committed in its **own transaction**: a
-partial run leaves the rows already re-keyed correct and the remainder still synthetic, so re-running
-picks up where it stopped. Nothing is atomic across the whole half, deliberately.
+**Per-row transactional merge, so a partial run is resumable.** Passes 1 and 2 each **overwrite a
+column in place** (`request_id`, then `session_id`), so a crash mid-run would otherwise lose the
+old→new mapping with no record. Each row's re-key or re-attribution (and any merge it triggers) is
+therefore committed in its **own transaction**: a partial run leaves the rows already done correct and
+the remainder still synthetic, so re-running picks up where it stopped. Nothing is atomic across a
+pass, deliberately.
 
-**`--dry-run` must report "would re-key N, would leave M synthetic (no body id)".** **4 rows with
-`resp_body IS NULL`** plus **61 whose body yields no id** — 65 of 728, the same population D1 counts —
-stay synthetic forever, and the operator needs to see that number before the run. A row whose body is
-compressed but decodes nothing (a non-positive `limit`, or a `Content-Encoding` the scan did not undo)
-belongs in **M**, not in **N** — the same "silently re-keys nothing" outcome as above, made visible
-rather than reported as re-keyed. §5 asserts the exact pair, not just that both counts are non-zero.
+**`--dry-run` must report "would re-key N, would leave M synthetic (no body id), would re-attribute K,
+would leave L unattributed".** **4 rows with `resp_body IS NULL`** plus **61 whose body yields no id**
+— 65 of 728, the same population D1 counts — stay synthetic forever, and the operator needs to see that
+number before the run. A row whose body is compressed but decodes nothing (a non-positive `limit`, or a
+`Content-Encoding` the scan did not undo) belongs in **M**, not in **N** — the same "silently re-keys
+nothing" outcome as above, made visible rather than reported as re-keyed. **K and L are pass 2's pair**:
+rows whose `req_headers` carry `x-claude-code-session-id` are re-attributed, and rows whose headers
+lack it keep their minted `s_…` and are counted in **L** — the same "would leave X alone" visibility,
+for the same reason. §5 asserts the exact N/M pair, not just that both counts are non-zero.
 
 **The JSONL half must report deleted-vs-inserted**, and that report is the run's own evidence for how
 much duplication there was. It is **not** §2.4's 28,405: §2.4 estimates duplication by grouping on
@@ -757,9 +830,15 @@ re-ingest recreates the very keys the delete just removed.
   not filtered.
 - **No schema change, and therefore no migration.** Every column this needs already exists
   (`request_id`, `resp_body`, and the `sessions` aggregates). `schemaVersion` stays `1`.
-- **`internal/proxy` stays a tee.** It loses a function (D2) and gains nothing.
+- **`internal/proxy` stays a tee.** It loses a function (D2) and gains nothing. It also gains no
+  session logic: nothing in D7 touches the hot path (`ExtractMeta` and `Resolve` both run in the cold
+  path, and the recorder is a tailer seam).
+- **`mergeEvents` still never rewrites `session_id`.** D3 holds. D7's re-attribution is a **direct
+  `UPDATE` on the rekey path**, not a merge rule, and the live merge path is untouched (§2.6, D4).
 - **What each source captures** is untouched. The proxy still stores the compressed body it received;
-  the tailer still stores the transcript content.
+  the tailer still stores the transcript content. **D7 adds no capture and no retention** — it reads
+  `x-claude-code-session-id` out of the `req_headers` the consumer already stores verbatim, and reads
+  the transcript `sessionId` the tailer already had.
 
 ### D6 — The two documents that disagree about test 11(b) are reconciled
 
@@ -769,11 +848,16 @@ relied on*" — a prospective precondition, not a claim of having verified. `:57
 and `:325-333` says "**Status: still open — not captured.**" Both docs agree.
 
 What this story measured does **not** record a negative result. **The equivalence was never exercised
-on this install — the configured upstream sends no `request-id` header — and it is therefore moot,
-because the design stops depending on it.** An endpoint that sends no `request-id` cannot falsify the
-Anthropic `request-id` ↔ `requestId` equivalence, so "it does not hold" would be a false negative. That
-wording — *never exercised, not falsified, and moot* — goes into both `docs/acceptance.md` and
-`docs/planning/GI-1-claude-lens-v1.md`.
+on this install — the configured upstream sends no `request-id` header — and it is therefore moot
+*here*, because no response this install served carries the header.** An endpoint that sends no
+`request-id` cannot falsify the Anthropic `request-id` ↔ `requestId` equivalence, so "it does not hold"
+would be a false negative. **"Moot" must not be written unscoped**: on an install whose upstream *does*
+send `request-id`, the equivalence is **load-bearing** — it is the only tier that can key a body with no
+id (D1) — **unverified**, and its failure is **silent** (§6: every merge key misses and the install gets
+zero merges, with no error raised). So the wording that goes into both `docs/acceptance.md` and
+`docs/planning/GI-1-claude-lens-v1.md` is *never exercised on this install, not falsified, and moot
+only where the header is absent* — and test 11(b)'s status is kept distinct from tier 1's unguarded
+risk, which the same sentence must not silently resolve.
 
 The genuinely wrong text in GI-1 is elsewhere. Its §Cross-source identity says the documented fallback
 "remains the operative identity" and specifies it as `(model, session_id, started_at ±1s, token
@@ -783,6 +867,76 @@ equivalence claim, is the correction worth landing at `:1105`. The same correcti
 at [internal/jsonlogs/dedup.go:95-99](../../internal/jsonlogs/dedup.go#L95-L99), which records the
 assumption as "not yet verified" when what is actually wrong is that it describes a fallback that was
 never built.
+
+### D7 — The session is the conversation the request already names
+
+The proxy already receives Claude Code's real conversation id — `x-claude-code-session-id`, present in
+**1,364** of ~1,400 stored request headers, **3** distinct values, all 3 real JSONL `sessionId`s (§2.6)
+— and already stores it verbatim in every row's `req_headers`. Reading it is **not** sufficient on its
+own, because one side already carries that exact value and the other never does:
+
+- **JSONL rows already carry the real conversation id**: `buildEvent` sets `session_id` from the line's
+  `sessionId` — the parent's for a sidechain, the filename stem as fallback
+  ([internal/jsonlogs/jsonlogs.go:381-386](../../internal/jsonlogs/jsonlogs.go#L381-L386)).
+- **Proxy rows always carry a minted `s_<unixMilli>_<hex>`**: `newSessionID`
+  ([internal/session/session.go:80-84](../../internal/session/session.go#L80-L84)) is returned
+  **unconditionally** by `Resolve` ([session.go:58](../../internal/session/session.go#L58)). The header
+  selects only a `groupKey` ([session.go:70-78](../../internal/session/session.go#L70-L78)); it never
+  becomes the id.
+
+So three changes, each a **consequence** of that gap rather than a preference:
+
+1. **`ExtractMeta` gains `x-claude-code-session-id` as a second source for `Meta.SessionHeader`**
+   ([internal/parse/meta.go:31-40](../../internal/parse/meta.go#L31-L40)). **`x-clens-session` still
+   wins** — it is the explicit operator override, so it is read first and the new header only fills the
+   value when it is absent. The comment block is updated: it currently documents only `x-clens-session`
+   and the `maxSessionHeaderLen` reasoning, and both must now cover the second source — the length bound
+   applies to whichever header supplies the value.
+2. **`Resolve` returns `meta.SessionHeader` as the id when non-empty**
+   ([internal/session/session.go:47-61](../../internal/session/session.go#L47-L61)), instead of minting
+   — placed **at the top**, ahead of the `seen`-map logic. A header-carrying call's identity *is* the
+   header; the inactivity-gap window is for header-less calls only. No code or doc assumes the `s_`
+   prefix (checked), so nothing downstream has to learn a second id shape.
+3. **The JSONL tailer is given a `SessionRecorder`.** Today **no caller anywhere in the module wires
+   one** — `SetSessionRecorder` ([internal/jsonlogs/jsonlogs.go:143](../../internal/jsonlogs/jsonlogs.go#L143))
+   is defined and never called — so `t.recorder` stays nil and the JSONL half silently records no
+   `sessions` rows. **That, not a design choice, is the real reason behind §2.6's "0 of 207".** The
+   wiring goes where the tailer is built — `newTailer`
+   ([internal/cli/ingest.go:78](../../internal/cli/ingest.go#L78)), the one shape both `runIngest`
+   ([ingest.go:53](../../internal/cli/ingest.go#L53)) and `addCollectors`
+   ([internal/cli/refresh.go:95](../../internal/cli/refresh.go#L95), reached from `serve` and `refresh`)
+   use, so the three callers cannot drift. Because the `collectorStore` surface newTailer takes does not
+   carry `UpsertSession`/`ReconcileSession`
+   ([jsonlogs.go:29-37](../../internal/jsonlogs/jsonlogs.go#L29-L37)), the recorder is **passed in**, not
+   constructed inside `newTailer`; §4 lists the files and the plumbing is the implementer's.
+
+**Only with (2) does the rest follow.** `ExtractMeta` alone takes 184 heuristic sessions to ~3 and stops
+the gap-splitting, **but those 3 stay `s_…` and still never equal a JSONL `sessionId`** — the sets stay
+disjoint, and D3, D4's ordering argument, the source branch and all three traps would survive untouched.
+Change (2) is what makes the proxy's `session_id` the same value the JSONL side already writes.
+
+**Consequences, each stated as a consequence rather than a preference.**
+
+- **D4 step 3's source branch is gone.** Both rows are in the same session, so the survivor's session is
+  correct whichever source the taker is.
+- **The reconcile set collapses to one session in the ordinary case** — and it is the *distinct* sessions
+  among the two rows, **not always one**: a proxy row whose headers lacked the id keeps its minted
+  `s_…`, so the two rows can still differ (D4).
+- **D4's ordering argument is dropped, not re-justified.** Its stated reason — "a JSONL session has no
+  aggregate row to hold the row" — is dead under (2)+(3): JSONL sessions now have aggregate rows, and
+  both rows share one session, so either order yields the same row, the same key and the same session.
+  The fixed sequence is kept **for determinism and reporting**, and D4 says plainly that the reason it
+  was argued for no longer holds.
+- **F7.1, F8.2 and F9.10 dissolve** — each was a consequence of the swapped call D7 makes unnecessary.
+  D4 keeps them only as a warning against reintroducing a swapped call or a hand-written merge.
+- **§8's first bullet and §2.6's asymmetry paragraph** described the disjoint-session state as a
+  constraint; it is what **this story ends**, and both are rewritten to say so.
+- **The visible behaviour change, which §6 and the PR body must name.** Today's **184 heuristic `s_…`
+  proxy sessions collapse to the 3 real conversations** — the same conversations the JSONL side already
+  knows — so `clens sessions` stops being proxy-only; and **a long conversation stops splitting at the
+  inactivity gap**, because one conversation is now one session. That is better for this story's
+  purpose, but it is **different from today** and belongs in the PR body. The **~3%** of requests
+  without the header fall back to today's gap-window behaviour, and `Resolver.Resolve` keeps its shape.
 
 ## 4. Files changed
 
@@ -798,21 +952,28 @@ never built.
 | `internal/sink/sink.go` | `CapturedCall.RequestID` renamed `RequestIDHeader` — its doc comment at `:57-61` calls the field "the cross-source dedup key", which D2 makes false, and the name would otherwise invite back the two-tier split D2 deletes (`internal/consumer/consumer.go:403` is the only reader) |
 | `internal/proxy/proxy.go` | `captureState.requestID` and `fallbackSeqCounter` deleted; `submit` passes the header value |
 | `internal/proxy/proxy_test.go` | three tests, three fates: `TestHashFallbackTwoAttemptsProduceDistinctIDs` (`:583`) **moves** to `internal/consumer` with the code; `TestResponseDerivedRequestIDWins` (`:551`) **changes meaning** (asserts the raw header value passes through, not that it is the dedup key); `TestPolicyOffSurvivesAMissingRequestID`'s synthetic-key assertion (`:456-458`) is **deleted** — it reads the renamed field, which is `""` on these nil-header paths, so the assertion goes red rather than moving |
-| `internal/store/store.go` | the `rekey` store methods: the body-id scan (predicate `request_id LIKE 'proxy:%'`, decoding with the config `BodyCapBytes`), the in-place re-key, and the collision helper — which the surviving row wins, deletes the taker, applies `mergeEvents`' **winner pick and per-column backfill** to the content (not a union) including its never-observed-usage override (`merge.go:196-206`), re-derives the survivor's `total_prompt_tokens` from its own four prompt columns in the same write, owns the `source_mismatch` decision that `insertOrMerge` owns on the live path, and reconciles every session whose figures moved via `reconcileSessionTx` (not the exported `ReconcileSession`, which opens its own transaction and would hang against `SetMaxOpenConns(1)`) — all in one per-row transaction. **Do not implement it as a `mergeEvents` call with the arguments swapped**: D4 states why that re-keys nothing, and it is br-GI-9-04's named trap. `insertOrMerge` hard-codes which argument is `existing`, which is why this is a `rekey`-only helper. **The live merge path itself is unchanged** — §2.6 shows no row ever changes session, so `insertOrMerge` and its callers keep today's shape |
-| `internal/cli/rekey.go` (new) | the command, `--yes` / `--dry-run`, both halves |
+| `internal/parse/meta.go` | `x-claude-code-session-id` as the **second** source for `Meta.SessionHeader` (`x-clens-session` still wins); the comment block covering both sources and the `maxSessionHeaderLen` bound (D7) |
+| `internal/parse/meta_test.go` | the second source, and that `x-clens-session` still overrides it when both are present (D7, §5) |
+| `internal/session/session.go` | `Resolve` returns `meta.SessionHeader` as the id when non-empty, placed ahead of the `seen`-map (D7) |
+| `internal/session/session_test.go` | the header's value **is** the id (today's cases assert only distinctness and keep passing with changed meaning); the header-less path still gap-groups (D7, §5) |
+| `internal/store/merge.go` | `insertOrMerge`'s collision branch factored into an unexported `mergeIntoExistingTx(ctx, tx, incoming)` (`getEventByRequestIDTx` → `mergeEvents` → `updateEventTx` → `source_mismatch`), called by `insertOrMerge` and by the rekey path — one implementation, one rule, so the two cannot drift (D4). **The live call is unchanged**: it still passes the row it failed to insert, so `insertOrMerge` and its callers keep today's shape |
+| `internal/store/store.go` | the `rekey` store methods: pass 1's body-id scan (predicate `request_id LIKE 'proxy:%'`, decoding with the config `BodyCapBytes`), the in-place re-key, and the collision path — `mergeIntoExistingTx(proxyRow)` with the taker as `existing`, then the `incoming` proxy row deleted, then the **distinct sessions among the two rows** reconciled via `reconcileSessionTx` (not the exported `ReconcileSession`, which opens its own transaction and would hang against `SetMaxOpenConns(1)`); **pass 2's** re-attribution — read `x-claude-code-session-id` from `req_headers`, `UPDATE events SET session_id = ? WHERE id = ?`, upsert + reconcile the new session, reconcile the old and remove its `sessions` row when empty; and pass 3's delete + re-ingest — all in per-row transactions. **Do not hand-write the merge and do not swap the arguments**: D4 states why the swap re-keys nothing, and `mergeIntoExistingTx` is the one rule both paths share. **The live merge path itself is unchanged** — §2.6 shows no row ever changes session, so only the collision branch is factored |
+| `internal/cli/ingest.go` | `newTailer` calls `SetSessionRecorder`, so `clens ingest` / `serve` / `refresh` all record JSONL `sessions` rows; its callers pass the resolver, because `collectorStore` does not carry `UpsertSession`/`ReconcileSession` (D7). `addCollectors` ([`refresh.go:94`](../../internal/cli/refresh.go#L94)) gains the resolver `serve` already builds |
+| `internal/cli/rekey.go` (new) | the command, `--yes` / `--dry-run`, all three passes |
 | `internal/cli/rekey_test.go` (new) | §5 |
 | `cmd/clens/main.go` | register `rekey` |
 | `internal/cli/cli_test.go` | add `rekey` to `TestNoCommandPrintsACredential` (~`:413`, currently **14 of the 18** dispatch names — it omits `ingest`, `refresh`, `reconcile` and `serve`) for symmetry: `rekey` prints counts, so its leak surface is nil, which is itself worth asserting. It is **not** added to `TestEveryCarriedOverCommandRunsAgainstATempStore` (~`:73`) — that table is the 10-entry *carried-over* set by design, and a new command is the wrong thing to add to a table named for carried-over commands. Neither table is derived from the `commands` map and **neither enumerates every subcommand**, so `rekey`'s registration is a deliberate edit in the credential table rather than a gap a complete list would have caught |
 | `docs/context/cli-and-tooling.md` | the `rekey` row; "the one destructive command" becomes two; and `:6`'s "map … of 18 subcommands" becomes 19 |
 | `docs/context/storage-schema.md` | its own "the only destructive command" claim at `:151` — same correction as `cli-and-tooling.md`, a different file |
-| `docs/context/data-privacy-and-compliance.md` | `:106-107` and `:111` also assert purge is the only command that deletes rows; three files carry the claim, so all three move together. **And `:111-113` is independently wrong**: it says `--dry-run --yes` "reports and deletes in one pass", citing [internal/cli/purge.go:20](../../internal/cli/purge.go#L20) for it — which says the opposite ("`--dry-run --yes` is simply a dry run"), and so does the code (`:45` refuses only when *neither* flag is set, and `purgeByAge` returns before deleting when `dryRun`). The doc misstates both the behaviour and its own citation; fix it here since the file is already being edited |
-| `docs/context/workflows.md` | the merge now fires; the identity rule |
-| `docs/context/testing-and-quality.md` | `:12`'s "**51 test files, 15,051 lines**" becomes 52 — a present-tense statement of current state, unlike the dated re-measurement note it sits beside, so it moves with the new `rekey_test.go` |
-| `docs/context/INDEX.md` | its "18-entry dispatch table in `cmd/clens/main.go`" becomes 19; **and `:41`'s "seven genuine forks" becomes eight** — `:114`'s "moved six → seven" is dated history and stays; and `:37`'s "trigger: 51 test files" becomes 52 (the new `internal/cli/rekey_test.go`) |
-| `docs/context/decisions/000-index.md` | "**Seven** architectural forks" becomes eight, with the new 008 — **twice**, at `:5` and again at `:25` ("the status of all seven") |
-| `docs/planning/GI-1-claude-lens-v1.md` | §Cross-source identity: the line-1105 fallback claim (the documented fallback was never built), and test 11(b) never exercised (not falsified) |
-| `docs/acceptance.md` | test 11(b) — never exercised on this install, therefore moot |
+| `docs/context/data-privacy-and-compliance.md` | `:106-107` and `:111` also assert purge is the only command that deletes rows; three files carry the claim, so all three move together. **And `:111-113` is independently wrong**: it says `--dry-run --yes` "reports and deletes in one pass", citing [internal/cli/purge.go:20](../../internal/cli/purge.go#L20) for it — which says the opposite ("`--dry-run --yes` is simply a dry run"), and so does the code (`:45` refuses only when *neither* flag is set, and `purgeByAge` returns before deleting when `dryRun`). The doc misstates both the behaviour and its own citation; fix it here since the file is already being edited. **This row also carries D7's privacy statement**: `rekey`/D7 add **no new capture and no new retention** — the conversation id is read out of the `req_headers` the consumer already stores verbatim, and re-attribution only rewrites a column from a value already on disk |
+| `docs/context/workflows.md` | the merge now fires; the identity rule; and the session rule (D7) — the proxy adopts `x-claude-code-session-id`, so `clens sessions` shows conversations rather than heuristic groups |
+| `docs/context/testing-and-quality.md` | `:12`'s "**51 test files, 15,051 lines**" and its re-measurement parenthetical are **one clause**: the parenthetical says the GI-7 re-measure "took the count 50 → 51", so bumping only the first number leaves the sentence contradicting its own provenance and leaves 15,051 stale. So the whole clause moves together — **52 test files**, the new line count, and the provenance sentence naming **this** story's new files (`rekey_test.go`, the added session/parse cases) rather than GI-7 |
+| `docs/context/INDEX.md` | its "18-entry dispatch table in `cmd/clens/main.go`" becomes 19; **and `:41`'s "seven genuine forks" becomes nine** (008 for D1 and 009 for D7) — `:114`'s "moved six → seven" is dated history and stays; and `:37`'s "trigger: 51 test files" becomes 52 (the new `internal/cli/rekey_test.go`) |
+| `docs/context/decisions/000-index.md` | "**Seven** architectural forks" becomes **nine**, with the new 008 (D1) and 009 (D7) — **twice**, at `:5` and again at `:25` ("the status of all seven"), plus a row for 009 in the table |
+| `docs/planning/GI-1-claude-lens-v1.md` | §Cross-source identity: the line-1105 fallback claim (the documented fallback was never built), and test 11(b) never exercised (not falsified) — **scoped**: moot on this install, load-bearing, unverified and silently-failing where an upstream sends `request-id` (D6) |
+| `docs/acceptance.md` | test 11(b) — never exercised on this install, therefore moot **here**; kept distinct from tier 1's unguarded risk on an install whose upstream sends the header (D6) |
 | `docs/context/decisions/008-…` (new) | the identity decision (D1) |
+| `docs/context/decisions/009-…` (new) | the session decision (D7): the proxy adopts the conversation id the request already carries |
 
 No new dependency. No schema change. No change to `internal/web`.
 
@@ -835,7 +996,25 @@ guard: a non-streaming body carrying a top-level `id` but a `type` that is **not
 case proves is the **shape** gate, not that a message-shaped `id` is per-request (that rests on §6's
 base rate and the integration assertion). Plus the **precedence**: a fixture with **two**
 `message_start` frames carrying **different** ids yields the **first** — the rule D2 states for the
-case the measured population (0 bodies with two ids, §2.3) cannot exclude.
+case the measured population (0 bodies with two ids, §2.3) cannot exclude. **And the session header
+source (D7):** `x-claude-code-session-id` populates `Meta.SessionHeader` when `x-clens-session` is
+absent, **and `x-clens-session` still wins** when both are present — the operator-override case that
+fails if the new source is read first.
+
+**Unit — `internal/session` (D7).** `Resolve` returns the header value **as the id** when
+`Meta.SessionHeader` is non-empty: two header-carrying calls separated by more than the gap window
+return the **same** id (a long conversation no longer splits), and that id is the header verbatim, not
+`s_…`. Two header-**less** calls beyond the gap still split, so the gap window is not dead — it is
+simply scoped to the calls that have no conversation id. `TestResolveHeaderOverridesPrefix` and
+`TestResolveHeaderOnOneCallDoesNotGroup` keep passing with **changed meaning**: they asserted
+*distinctness*, and now assert *identity* — so each gains the direct assertion too (the value is the
+header, not a minted `s_…`).
+
+**Unit — `internal/cli` tailer wiring (D7).** `runIngest` over a fixture transcript writes a `sessions`
+row for the transcript's `sessionId` — the case that fails **today**, where `t.recorder` is nil because
+no caller wires `SetSessionRecorder`, and the JSONL half records nothing. `TestIngestRebuildRereadsWithoutDuplicating`
+([internal/cli/additions_test.go:54](../../internal/cli/additions_test.go#L54)) already builds the
+fixture; assert the `sessions` row beside its row assertions.
 
 **Unit — `internal/consumer`.** The precedence table, all three tiers: a header value wins over a body
 id; a body id wins over the synthetic key; no header and no body id yields a synthetic key of the
@@ -914,38 +1093,52 @@ as well as the deleted row's (D4) — and that a second run is a no-op; a run wi
   asserted and recorded, so the collapse is a decision rather than an accident: it means a shared id
   loses a call, and this fixture is what makes that visible (D2, §6).
 
-**The collision has two shapes and the second one is the load-bearing case.** The proxy-vs-proxy
-fixture above pins the reconcile; it is also the shape the measured data says cannot happen (no body id
-is shared by two proxy rows, §6). The shape that *will* happen is a **JSONL taker**: a proxy row whose
-body id is already held by a `jsonl`-sourced row. Seed that — one `proxy:`-keyed row with a body
-carrying a `message.id`, and one `jsonl`-sourced row carrying that same id — and assert:
+**The collision has two shapes, and the second one is the load-bearing case.** The proxy-vs-proxy
+fixture above pins the reconcile, and it is also the shape the measured data says cannot happen (no body
+id is shared by two proxy rows, §6). The shape that *will* happen is a **JSONL taker**: a proxy row
+whose body id is already held by a `jsonl`-sourced row. Seed that — one `proxy:`-keyed row with a body
+carrying a `message.id`, and one `jsonl`-sourced row carrying that same id, **both in the same
+conversation session** (D7) — and assert:
 
-- the surviving row is the **proxy** row: `id` unchanged, `session_id` still the proxy session, and
+- the surviving row is the **taker's** row: `id` unchanged, `session_id` the shared conversation id, and
   `source_refs` now `["proxy","jsonl"]` (this one *does* show in the union — the sides genuinely
   differ, unlike the proxy-vs-proxy fixture);
-- **`request_id` on the surviving row is the target key** — the body's `message.id`, not the proxy
-  row's old `proxy:` value. This is the assertion that matters most and the one a naive implementation
-  passes without: `mergeEvents` never assigns `RequestID`, so a helper built on a swapped call leaves
-  the old key in place, deletes the taker, and hands back a row keyed by a synthetic string while every
-  other bullet here still holds. Assert it directly, and assert it **before** the second run, because
-  the bug's signature is a first run that does nothing and a second run that works;
-- the JSONL taker is gone (row count drops by one);
-- the deleted taker's session is untouched and no `sessions` row was created for it (§2.6);
-- **pin the token columns so bullet 4's aggregate assertion can fail**: both sides `capture_complete`
-  with **different** token columns, so the winner pick actually moves figures. Without the difference
-  the reconcile is a no-op and the bullet passes either way — the same pinning the proxy-vs-proxy
-  fixture needs, and omitted here in an earlier pass;
-- the proxy session's aggregate reflects the post-merge row, not the pre-merge one;
+- **`request_id` on the surviving row is the target key** — the body's `message.id`. It is the taker's
+  own key, so the value is **unchanged**, and that is the point: the proxy row is the `incoming` and
+  nothing is re-keyed. A **swapped** implementation leaves the proxy row's old `proxy:` value in place
+  while every other bullet here still holds, so assert the value directly, and assert it **before** the
+  second run — a silent no-op's signature is a first run that changes nothing and a second run that
+  works;
+- the **proxy** row (the `incoming`) is gone (row count drops by one);
+- **one** reconcile covers the collision, because both rows share the conversation session (D7) — so
+  the deleted row's session *is* the survivor's, asserted on that session's post-merge aggregate. The
+  **two-session** variant is the proxy-vs-proxy fixture above (a hand-seeded proxy row whose
+  `req_headers` lack the header, i.e. the **L** population), which keeps its two-session pinning and is
+  why the reconcile is stated as a **set** rather than "one";
+- **pin the token columns so the aggregate assertion can fail**: both sides `capture_complete` with
+  **different** token columns, so the winner pick actually moves figures. Without the difference the
+  reconcile is a no-op and the bullet passes either way — the same pinning the proxy-vs-proxy fixture
+  needs, and omitted here in an earlier pass;
 - **a `source_mismatch` warning is attached when the two sides disagree on tokens** — the helper owns
   this decision (D4), so a helper that omits it merges silently, and §6 tells the operator to expect a
   handful of these warnings *from the run*. Nothing else in §5 asserts one, and the live-acceptance line
   is the only other place they appear, so without this bullet the obligation is untested;
+- **the winner's empty-mode derivation is pinned** (F10.3): a collision whose picked side has an empty
+  `billing_mode` and a non-NULL cost column leaves the survivor's mode matching that column (`api` for
+  `cost_usd`, `subscription` for `api_equivalent_cost_usd`) rather than empty — the sub-rule a copy of
+  the winner's mode ships blank, dropping the row out of every cost aggregate;
+- **the deleted row's warnings survive** (F10.8): the taker carries a warning, the collision removes the
+  other row, and the survivor still holds the warning — the `ON DELETE CASCADE` case a hand-written
+  delete drops;
 - a **second** `rekey --yes` changes nothing (this is what a silent no-op first run would violate, so
   it is worth asserting after bullet 2 rather than trusting it).
 
-Without the source branch in D4 step 3 this case fails on the first bullet: the survivor comes back a
-JSONL row in a JSONL session, exactly as the ordering argument warns. A test that only ever seeds
-proxy-vs-proxy cannot see that, which is why both shapes are required.
+**The branch that used to be here is gone, and the case still earns its place.** Round 6's version
+asserted the survivor is the *proxy* row, because a JSONL survivor landed in an aggregate-less session.
+Under D7 the survivor is the taker and that is correct — both rows are in the same conversation session,
+which has an aggregate row — so the first bullet now guards the **identity** (that step 3 uses the
+ordinary merge and re-keys nothing) rather than a source branch. A test that only ever seeds
+proxy-vs-proxy still cannot see the difference, which is why both shapes are kept.
 
 **The JSONL half is the destructive one and needs its own case.** Every test above is proxy-half, and
 the half that deletes ~71k rows would otherwise ship on the strength of a printed count. Build it from
@@ -958,10 +1151,37 @@ on disk carrying those same lines. Run `rekey --yes`, and assert: the `jsonl:`-p
 rows are gone, the duplicate collapsed to **one** row keyed by the `message.id`, the `requestId` row
 survived, and the transcript file is still on disk — it is the re-ingest **source**, not how the
 pre-state arises (the half is re-derivable, which §6 leans on). Then a `--dry-run` on the same fixture
-deletes nothing. **And the precondition case:** seed a `jsonl:`-keyed row whose transcript file is
-**missing** (or shorter than the cursor the fixture records for it) and assert the half **refuses** —
-or skips and reports — rather than deleting the row. Without it the run deletes ~71k rows on the
-strength of a precondition nothing checks (§6).
+deletes nothing.
+
+- **The re-ingest re-prices, so assert a cost** (F10.7). Wire the fixture's tailer with a **price table**
+  (the way `newTailer` does, [ingest.go:78-98](../../internal/cli/ingest.go#L78-L98)) and a transcript
+  line that table prices, then assert the collapsed row's `cost_usd` / `api_equivalent_cost_usd` (or at
+  least its `cost_source`) equals the table's value after `rekey --yes`. D4 spends three bullets on the
+  fact that this half restates ~70k rows' cost against the price table in force *now*, and this is the
+  only assertion that distinguishes a re-ingest that re-prices from one that re-writes: a rekey that
+  builds its tailer without the price table blanks those columns while every other case here still
+  passes.
+- **The precondition is stated over the cursors, not over rows** (F10.5). The schema has no row→file
+  link (D4 step 0), so the check is over the recorded `jsonl:<path>` cursors whose paths the re-ingest
+  will walk: seed a `jsonl:`-keyed row **and its cursor**, make the transcript file **missing** (or
+  shorter than the recorded cursor) and assert the half **refuses** — or skips and reports — rather than
+  deleting the row. **And the root case:** seed a recorded cursor whose path is **outside** the walk root
+  and assert the run refuses, because `resetJSONLCursors` would not re-read that file and the delete
+  would remove a row nothing can rebuild. Without both, the run deletes ~71k rows on the strength of a
+  precondition nothing checks (§6).
+- **Bound the run's wall clock.** Pass 3 re-inserts ~70k rows, and once the recorder is wired (D7) each
+  row costs an `UpsertSession` **plus** a full aggregate scan of its session (§6's doubled-reconcile
+  risk). Have the case assert the run's wall clock stays under a stated bound, or at least **report** it,
+  so a quadratic blow-up is visible as a number rather than as "the test got slow".
+
+**Pass 2 gets its own case, because it is the one write path that sets `session_id` on an existing row.**
+Seed two `proxy:`-keyed rows whose `req_headers` carry `x-claude-code-session-id` but whose `session_id`
+is a minted `s_…` (each with its own `sessions` row), plus one proxy row whose headers **lack** the
+header. Run `rekey --yes`, and assert: the two rows' `session_id` is now the header value; the
+conversation session exists and its aggregate equals the post-run row set (the **upsert** case — nothing
+created it beforehand); the two old `s_…` `sessions` rows are **gone** (reconciled to empty, then
+removed) so `clens sessions` shows no ghosts; and the header-less row keeps its minted id and is counted
+in **L**. A `--dry-run` reports the K/L pair without writing.
 
 **Integration.** A JSONL line with no `requestId` and a proxy capture of the same request, ingested
 through the real paths, produce **one** row — the end-to-end statement of the whole story, and the one
@@ -971,8 +1191,16 @@ that fails today.
 `requestId` (tier 1) paired with a proxy capture whose body yields the same `message.id` but whose
 stored `resp_headers` hold **no** `request-id` (tier 2) must leave **two** rows: they key on different
 values and do not meet. That is D1's named exception — the proxy capture failed to record the header —
-asserted so it is visible rather than silent. The meeting case (both sides tier 2) is what the JSONL /
-consumer fixtures above already cover.
+asserted so it is visible rather than silent. **But the split alone is not enough (F10.4)**: it asserts
+the *exception*, and a suite that only ever exercises the exception cannot fail if the header tier
+silently stops *meeting* — which is the behaviour D1's own argument for that tier protects (demoting it
+would take the Anthropic case "from working to broken", D1). So the **meeting** case needs its own
+fixture, and it is the only shape that fails if the tier stops meeting: a proxy capture whose
+`resp_headers` carry `request-id: X` and whose body carries a **different** id, paired with a JSONL
+line whose `requestId` is `X`, must produce **one** row whose `request_id` is `X` — the header value,
+not the body id — and a later re-key must leave that row alone (the `proxy:`-prefix predicate, F9.12).
+The tier-2/tier-2 meeting (both sides on the body id) is what the JSONL / consumer fixtures above
+already cover.
 
 **Live acceptance (manual, recorded in the plan).** Four checks against the live database after the
 change. (1) **Premise check** — re-run the §2.3 comparison **by the method §2.3 states** (the
@@ -1007,10 +1235,13 @@ the expected handful of `source_mismatch` warnings (§6). (4) **The drawer is al
   (truncation or rotation) is re-read from offset 0
   ([internal/jsonlogs/jsonlogs.go:300-306](../../internal/jsonlogs/jsonlogs.go#L300-L306)), so the lost
   prefix's lines are gone and the rows derived from them are **not** re-creatable, and a **deleted**
-  transcript is the same failure worse. So before the delete the JSONL half verifies every
-  `jsonl:`-keyed row's file exists and its current size is not below the recorded cursor, and refuses
-  (or reports and skips) otherwise — a **checked precondition of the run**; §5 seeds a missing/short
-  file and asserts the refusal. And the command should be run with `clens serve` stopped, because
+  transcript is the same failure worse. So before the delete the JSONL half checks **every recorded
+  `jsonl:<path>` cursor whose path the re-ingest will walk** — the file exists and its current size is
+  not below the recorded cursor — and refuses (or reports and skips) otherwise, including when a
+  recorded cursor's path falls **outside** the walk root, where the delete would remove rows the walk
+  can never rebuild (D4 step 0). It is a **checked precondition of the run**, not a row→file mapping the
+  schema cannot supply; §5 seeds a missing/short file **and** a root-change and asserts both refusals.
+  And the command should be run with `clens serve` stopped, because
   a live tailer writing while cursors are zeroed is a race the command does not need to have. The
   selector's prefix `LIKE` **cannot use the UNIQUE index** — SQLite will not use it for a prefix `LIKE`
   under the default `BINARY` collation — so the delete scans all ~87k rows. That is fine for a one-off
@@ -1021,19 +1252,39 @@ the expected handful of `source_mismatch` warnings (§6). (4) **The drawer is al
   columns and backfills the remainder, so it is lossless for the *content* (`mergeEvents`; only
   `source_refs` is unioned), but this is the half where "the heuristic has to be right the first time"
   actually applies — and it is why the design has no heuristic in it.
-- **The collision helper can be written in a way that fails silently, and both plausible versions are
-  that way.** The first is calling `mergeEvents` with its arguments swapped, which re-keys nothing:
-  `mergeEvents` never assigns `RequestID`, so the old synthetic key is written straight back and the
-  taker's deletion leaves the message id held by nobody. The run reports success; a *second* run then
-  works, because the key is free by then — so the failure looks like the promised no-op and its own
-  correction looks like the first run. The second is reading "merge the two rows" as a content **union**:
-  `mergeEvents` picks a **winner** for the measurement columns (`merge.go:166-206`) and backfills the
-  rest per column, unioning only `source_refs`, so a union produces a row no live merge could produce —
-  and unlike the first, this one changes figures rather than keys, while still leaving every key and
-  session assertion in §5 green. Mitigations: D4's requirement list and named trap, restated as a
-  directive in br-GI-9-04, plus §5's assertions on the surviving row's `request_id` and on the
-  `source_mismatch` warning. Named here because these are the defects in this story that no CLI
-  observable would reveal.
+- **The collision path has two ways to be written that fail silently, and D7 removes the reason either
+  was ever plausible.** The first is a `mergeEvents` call with its arguments **swapped** (the proxy row
+  as `existing`), which re-keys nothing: `mergeEvents` never assigns `RequestID`, so the old synthetic
+  key is written straight back and the taker's deletion leaves the message id held by nobody. The run
+  reports success and a *second* run works, because the key is free by then — so the failure looks like
+  the promised no-op and its own correction looks like the first run. The second is reading "merge the
+  two rows" as a content **union**: `mergeEvents` picks a **winner** for the measurement columns
+  (`merge.go:166-206`) and backfills the rest per column, unioning only `source_refs`, so a union
+  produces a row no live merge could produce — and unlike the first, it changes figures rather than
+  keys, while leaving every key and session assertion in §5 green. Neither is reachable through D4's
+  mechanism (the taker as `existing`, one factored `mergeIntoExistingTx`), but both are one hand-written
+  line away, which is why **br-GI-9-04 still carries D4's named trap**, and why §5 asserts the surviving
+  row's `request_id`, the `source_mismatch` warning, the empty-mode derivation and the deleted row's
+  warnings. Named here because these are the defects in this story that no CLI observable would reveal.
+- **A `replay_of` reference can dangle after a delete.** `replay_of` is a TEXT reference to an events id
+  ([`proxy.go:219`](../../internal/proxy/proxy.go#L219)) and the delete removes rows, so a row whose
+  `replay_of` names a deleted row becomes a reference the replay lookup
+  ([`internal/api/replay.go:224`](../../internal/api/replay.go#L224), `EventFilter.ReplayOf`) can no
+  longer resolve — `clens show` prints a replay-of with no target, and no error is raised. **The count
+  must be measured on the live DB before the run** (`SELECT COUNT(*) FROM events WHERE replay_of <> ''`):
+  this plan's pass had no shell and could not run it, so the number is **unrecorded here and belongs in
+  this paragraph** once taken, and the `--dry-run` output should report it so the operator sees how many
+  lineages the run touches. If it is zero the limitation is named with the count and nothing else
+  changes; if it is non-zero the delete step **resolves** the dangle by clearing `replay_of` on the
+  affected rows in the same transaction (the row keeps `replay_edits`, so the replay is still
+  identifiable) rather than re-pointing it, which would claim a lineage the run cannot prove.
+- **Wiring the recorder doubles the reconcile cost on the JSONL path (D7).** `InsertEvent` already
+  reconciles the surviving session on a merge (`store.go:275`); `RecordCall`
+  ([`session.go:91-106`](../../internal/session/session.go#L91-L106)) adds an `UpsertSession` **plus a
+  second** `ReconcileSession` for **every** row the tailer writes. Pass 3 re-inserts ~70k rows, each
+  triggering a full aggregate scan of its session, so this doubles a cost that half already pays — and
+  unlike the unwired state, it now pays it on every ordinary `clens ingest` too. §5's re-ingest case
+  **bounds or reports the wall clock** so a quadratic blow-up is a number, not a mystery.
 - **A `message.id` collision would silently collapse two requests.** The real vector is not two vendors'
   UUID formats colliding; it is a *stable*, non-per-request id — an org id or a gateway id sitting at a
   top-level `id` — becoming a row key and collapsing unrelated rows. The guard (D2) reads the non-stream
@@ -1085,12 +1336,18 @@ the expected handful of `source_mismatch` warnings (§6). (4) **The drawer is al
   one) instead of resting on the base rate alone, and the live-acceptance run measures it.
 - **The Sessions view changes shape after the backfill.** On the **merge** path a row gains a second
   source and its **figures** — token totals, cost, `model_set`, `priced_count`, `warning_count` — move
-  inside the **proxy** session it already belonged to; no row changes session and no count moves (§2.6).
-  The merged rows are the 511 the proxy already stored under a synthetic key (§1) and whose body yields
-  an id — visible in their proxy session today, not rows that existed only as JSONL. Keep the one
-  exception distinct: D4's rekey **collision** is a different path that **deletes** a row, so it is the
-  one operation here that does move a session's count. Expected, not a defect, but
-  user-visible, so it belongs in the PR body and the refresh.
+  inside the session it already belonged to; no row changes session and no count moves (§2.6). The
+  merged rows are the 511 the proxy already stored under a synthetic key (§1) and whose body yields an
+  id — visible in their proxy session today, not rows that existed only as JSONL. What *does* move a
+  session's shape is D4 itself: Pass 2 **re-attributes** history and the rekey **collision** deletes a
+  row, so both are user-visible and belong in the PR body and the refresh.
+- **The story's most visible change is the Sessions view becoming the conversation.** Today `clens
+  sessions` is **proxy-only** and shows the proxy's **184** heuristic `s_…` sessions; after D7 those
+  collapse to the **3** real conversations the request headers already name (§2.6), a long conversation
+  **stops splitting at the inactivity gap**, and the **~3%** of requests that carry no
+  `x-claude-code-session-id` fall back to today's gap-window behaviour rather than being dropped.
+  `Resolver.Resolve` keeps its shape, so no caller changes. Say all four in the PR body and the
+  refresh — a reader watching `clens sessions` will otherwise read the collapse as data loss.
 - **`off` rows on an upstream that sends no `request-id` never merge** (D5) — which is this install. A
   user running `off` here gets the JSONL half's fix only.
 - **Retention may make part of the backfill moot.** If `retention_days` is configured, the oldest
@@ -1141,31 +1398,43 @@ whether or not the code is right, and reads as coverage while proving nothing.
 
 **As a security engineer.** No new input reaches a trust boundary: the message id comes from upstream
 response bytes already stored, and the only new write path is a CLI command operating on the local
-database. The rekey command *does* delete, which is why it takes purge's contract rather than a new
-one. No credential is involved, no header is newly captured (the request-id header is already read),
-and full bodies are neither newly exposed nor newly retained. The one thing to hold: the command must
-refuse without `--yes`, and `--dry-run` must not delete as a side effect of measuring.
+database. **The session change adds no new capture and no new retention either** (D7): the header it
+promotes is already stored verbatim on every proxy row — the consumer writes the whole header map, and
+`redactHeaders` neither lists `x-claude-code-session-id` nor mutates the original — so the change reads
+a value already on disk and uses it as a key, and the backfill's re-attribution (D4 Pass 2) rewrites
+`session_id` from those same stored headers. Nothing new is kept, nothing new is sent, and no credential
+is involved. The rekey command *does* delete, which is why it takes purge's contract rather than a new
+one, and no header is newly captured (the request-id header is already read). The one thing to hold: the
+command must refuse without `--yes`, and `--dry-run` must not delete as a side effect of measuring.
 
 ## 8. Out of scope
 
-- **Changing which session owns a merged row.** D3 pins today's rule — the row keeps the session it was
-  first written under, which with the proxy half running first (D4) is a **proxy** session — and Claude
-  Code's own conversation id, the ground truth, does not get it. Totals are correct either way, because
-  global aggregates do not care which session owns a row, but **as the proxy is currently written** the
-  Sessions view groups by the proxy's heuristic reconstruction instead of by the conversation. Letting
-  the JSONL session own the merged row means relaxing the never-rewrite-`session_id` invariant, which is
-  its own story — and a **much smaller story than it reads as**: the conversation id is not missing, it
-  is *discarded*. `x-claude-code-session-id` arrives in **1,364** proxy request headers with **3**
-  distinct values, all **3** real JSONL `sessionId`s, and **0** of them reach `events.session_id`
-  (§2.6). Storing the header as the session key is very nearly the whole of it. D3 states the rule so
-  that this is a decision rather than a drift; it does not do it here.
+**Two items that were out of scope in earlier rounds are now in scope, and this story ends them.** Both
+were deferred on the belief that they were larger than they are; measuring §2.6 showed the reason neither
+is, so they moved into D7 rather than staying here. They are listed first, struck as closed, so a reader
+of an earlier round can find where they went.
+
+- ~~**Changing which session owns a merged row.**~~ **Closed by D7, and narrowed to what was actually
+  deferred.** D3's **merge** rule is unchanged and still out of scope: a merge keeps the session the row
+  was first written under, `mergeEvents` never rewrites `session_id` (D5), and no merge moves a row
+  between sessions. What D7 does is upstream of the merge — the proxy writes the conversation's own id
+  (`x-claude-code-session-id`) instead of minting `s_…`, so the two writers produce the *same* id and
+  meet without any rewrite. The reason the deferred version read as small is that the id was never
+  missing, it was **discarded**: it arrives in **1,364** proxy request headers with **3** distinct values,
+  all **3** real JSONL `sessionId`s, and **0** of them reach `events.session_id` (§2.6). Storing the
+  header as the session key is very nearly the whole of it — so it is done here, and only the
+  never-rewrite invariant itself stays deferred.
+- ~~**`clens sessions` and the dashboard's Sessions tab are proxy-only today.**~~ **Closed by D7.** The
+  reason a JSONL session had no `sessions` row was that `SetSessionRecorder`
+  ([internal/jsonlogs/jsonlogs.go:143](../../internal/jsonlogs/jsonlogs.go#L143)) had **no caller**, not
+  that the JSONL side could not supply one (§2.6). Wiring it in the tailer gives every JSONL session an
+  aggregate, so a JSONL-only install stops showing an empty Sessions view; the dashboard's Sessions tab
+  reads the same table and follows for free. The cost of the wiring is a second reconcile per row and is
+  carried as a named risk in §6.
 - **Recovering an identity for `--body-policy off` rows.** The proxy did not look, so there is nothing
   to recover.
 - **Any read-time dedup view** (D5).
 - **Changing what either source captures**, including promoting `x-ds-trace-id`.
-- **`clens sessions` and the dashboard's Sessions tab are proxy-only today** — discovered while
-  measuring §2.6. Because JSONL sessions have no `sessions` row, a JSONL-only install shows nothing
-  there. Pre-existing and not owned by this story; recorded so it is not lost.
 - **The dashboard's filters.** No new column means no new filter; `source`/`billing_mode` filters on
   the Stats tab remain the separate, already-offered item.
 
@@ -1177,54 +1446,87 @@ refuse without `--yes`, and `--dry-run` must not delete as a side effect of meas
 | 02 | `consumer`: identity precedence in one function; the synthetic fallback moves here | 01 |
 | 03 | `proxy`: `captureState.requestID` deleted; `submit` passes the header value | 02 |
 | 04 | `jsonlogs`: `message.id` as the middle tier of `requestKey` | — |
-| 05 | `cli` + `store`: `clens rekey` — both halves, `--yes` / `--dry-run`, and the proxy half's collision helper, specified as a requirement list plus a named trap (§9's note, D4) | 02, 04 |
-| 06 | docs: reconcile test 11(b), the merge flow, the CLI table, the three other "only destructive command" claims, the purge `--dry-run --yes` misstatement, and add decision 008 | 01–05 |
+| 05 | `cli` + `store`: `clens rekey` — three passes, `--yes` / `--dry-run`, and the collision path as the factored `mergeIntoExistingTx` (a requirement list plus a named trap, §9's note, D4) | 02, 04, 08 |
+| 06 | docs: reconcile test 11(b), the merge flow, the CLI table, the three other "only destructive command" claims, the purge `--dry-run --yes` misstatement, the no-new-capture privacy statement, and add decisions 008 and 009 | 01–05, 08 |
 | 07 | live acceptance re-run and the recorded manual run (the §2/§6 decoded-body figures are marked **re-confirmable**, not independently reproduced) | 05 |
+| 08 | `parse` + `session` + `cli` + `store`: the conversation id the request already names — `x-claude-code-session-id` as a second source for `Meta.SessionHeader`, `Resolve` returns it, the tailer wires `SetSessionRecorder`, and pass 2 re-attributes history (D7) | 01 |
 
 **The beads exist now** (`.beads/GI-9/`), and this sketch's numbers are not theirs: **br-GI-9-01**
 (parse), **br-GI-9-02** (consumer + proxy — this sketch's 02 and 03, folded into one atomic change),
 **br-GI-9-03** (jsonlogs, this sketch's 04), **br-GI-9-04** (`clens rekey` — this sketch's bead 05),
 **br-GI-9-05** (docs) and **br-GI-9-06** (live acceptance). D4, §4 and §6 therefore refer to the
-destructive bead by its real id, **br-GI-9-04**.
+destructive bead by its real id, **br-GI-9-04**. **The session-attribution work (this sketch's bead 08)
+has no bead under `.beads/GI-9/`** — it is new to this plan by the human's ruling (D7) and is the one
+piece of §3 with nowhere to land yet; it needs its own bead, and §4's rows are its file list.
 
 **br-GI-9-04 is the largest and the only destructive one.** The forward-fix beads (br-GI-9-01…03) must
 land before it runs anywhere but a dry run. There is no store bead for the **merge path**: §2.6 and D3
 show it needs no change. The store methods br-GI-9-04 adds are the rekey scan, the re-key, and the
 collision path's helper.
 
-**br-GI-9-04 carries a requirement and a named risk rather than a procedure, deliberately.** The
-collision helper's *what* is settled above (proxy row survives; `request_id` is the target key; content
-follows the winner pick and per-column backfill **with the survivor's `total_prompt_tokens` re-derived
-from its own four prompt columns**; taker deleted; `source_mismatch` decided as `insertOrMerge` decides
-it; touched sessions reconciled — the full list is D4's) and the *how* is not, because five rounds of
-plan-level review each found a defect one level deeper in this one paragraph — which sessions, then who
-the taker is, then that `mergeEvents` never assigns `RequestID` at all. That last one is not a design
-error; it is a field-copy detail in a function the plan does not own, and it is below the resolution a
-document has. So the bead must state the requirement list **and** the trap explicitly:
+**br-GI-9-04 carries a requirement and a named risk rather than a procedure, deliberately.** After round
+10 the requirement is stated as **factoring, not restating**: `insertOrMerge`'s collision branch
+([`merge.go:112-131`](../../internal/store/merge.go#L112-L131)) becomes an unexported
+**`mergeIntoExistingTx`** called by **both** callers, so the *what* is now "there is one merge rule, and
+the rekey path uses it" — proxy row survives, the taker holds the target key, `total_prompt_tokens` is
+re-derived from the survivor's four prompt columns in the same write, `source_mismatch` is decided as
+`insertOrMerge` decides it, the deleted row's warnings are re-attached, the distinct sessions among the
+two rows are reconciled through `reconcileSessionTx` (the full list is D4's). The *how* is still not
+specified, because five rounds of plan-level review each found a defect one level deeper in this one
+paragraph — which sessions, then who the taker is, then that `mergeEvents` never assigns `RequestID` at
+all. Round 10 dissolved the last of those by removing the constraint they were compensating for, so the
+trap below is kept as a **warning against reintroducing** a hand-written merge, not as a description of
+the design:
 
-> **Do not build this by calling `mergeEvents` with the arguments swapped.** It compiles, it reads
-> correctly, and it silently does nothing on the ordinary case: `mergeEvents` never assigns
-> `RequestID` (`merged := *existing`, `merge.go:147`), so the swapped call returns the proxy row's old
-> synthetic key, `updateEventTx` writes that key back (it binds `request_id` first), and deleting the
-> taker then leaves no row holding the message id. It also takes the key and the session from the same
-> argument, so no single call can give the right key with the right session. **In the JSONL-taker case**
-> (the ordinary one) delete the taker first — it holds the `UNIQUE` key — then write the surviving row
-> with `request_id` set to the target; **in the proxy-taker case** the taker is the row that survives
-> and the re-keyed row is the one deleted, so the order is the reverse. Assert the survivor's
-> `request_id` in the test; that assertion is the one that catches this.
+> **Factor the helper; do not hand-write a merge, and do not call one with the arguments in the other
+> seat.** Call `mergeIntoExistingTx` with the proxy row as the `incoming`; the taker is `existing`
+> because it already holds the target key, and **nothing is re-keyed**. Both shapes below compile, read
+> correctly, and fail silently, so a hand-written version is a regression even when its assertions pass:
 >
-> **And do not union the content.** `mergeEvents` is a winner pick plus a per-column backfill: the six
-> token columns, the cost columns, `stop_reason`, `stop_category`, `service_tier`, `speed`,
-> `model_resolved` and `billing_mode` all come from **one** side (`merge.go:166-206`), `capture_complete`
-> is the OR (`:223`), the structurally-impossible columns are backfilled (`:229-326`), and
-> **`source_refs` is the only column that is actually unioned**. Summing or column-wise-merging the
-> token columns satisfies every other requirement and produces a row no live merge could produce, with
-> nothing in the CLI or in §5's aggregate bullets able to tell. Apply the same winner pick the live path
-> would have made.
+> - **The swapped call.** `mergeEvents` never assigns `RequestID` (`merged := *existing`,
+>   [`merge.go:147`](../../internal/store/merge.go#L147)), so a call that puts the proxy row in the
+>   `existing` seat returns the proxy row's **old synthetic key**, `updateEventTx` writes that key
+>   straight back (it binds `request_id` first), and deleting the taker then leaves no row holding the
+>   message id. The run reports success and a second run then "works" — the failure looks like the
+>   promised no-op and its own correction looks like the first run. With the taker as `existing` the
+>   message id is never in question, so this is unreachable *by construction*, which is the argument for
+>   factoring rather than describing. Assert the survivor's `request_id` in the test; that assertion is
+>   the one that catches a reintroduction.
+> - **The union.** "Merge the two rows" read as a content union produces a row no live merge could
+>   produce. `mergeEvents` is a **winner pick plus a per-column backfill**: the six token columns,
+>   `cost_usd` / `api_equivalent_cost_usd` / `cost_source`, `stop_reason` / `stop_category`,
+>   `service_tier`, `speed`, `model_resolved` and `billing_mode` all come from **one** side
+>   ([`merge.go:166-206`](../../internal/store/merge.go#L166-L206)), `capture_complete` is the OR
+>   (`:223`), the structurally-impossible columns are backfilled (`:229-326`), and **`source_refs` is
+>   the only column that is actually unioned**. The helper inherits that rule unchanged, so this is true
+>   by construction too; the warning stands against hand-writing it.
+>
+> **The winner pick is a three-part sequence, and the later parts are what a paraphrase drops.** In
+> order: **(1)** the complete-frame switch — a complete capture beats an incomplete one, and **two
+> complete captures give the pick to `incoming`**
+> ([`merge.go:167-180`](../../internal/store/merge.go#L167-L180)); **(2)** the never-observed-usage
+> override — an all-zero-usage row never takes the pick from a row that has some
+> ([`merge.go:196-206`](../../internal/store/merge.go#L196-L206)); **(3)** the empty-`billing_mode`
+> derivation — when the winner's mode is empty the label follows the winner's cost column
+> ([`merge.go:272-288`](../../internal/store/merge.go#L272-L288)). An implementer who stops after (1)
+> ships a row whose zeroed tokens read as a measurement; one who stops after (2) ships a row whose cost
+> column and mode column disagree. Because the helper **is** `mergeEvents` rather than a copy of it, all
+> three travel with it for free — the shortest statement of why the factoring is the requirement.
 
-The implementer's own cross-review (Phase 5.5) is where the sequencing gets validated, against the real
-`merge.go` rather than against a paragraph about it — and br-GI-9-04's diff is what it should be pointed
-at first.
+**§4 supersedes br-GI-9-04's own file list where the two disagree.** br-GI-9-04's note tells the
+implementer to add `rekey` to **both** hand-maintained `cli_test.go` tables; §4's `cli_test.go` row is the
+corrected instruction (the **credential-subcommand** table, not the carried-over one). Beads are written
+from this plan, not the reverse, so **§4 wins** and the bead's wording is corrected when it is rebuilt.
+
+**The session-attribution work (D7) has no bead under `.beads/GI-9/` yet.** It is new to this plan by the
+human's ruling and touches `internal/parse/meta.go`, `internal/session/session.go`, `internal/cli`
+(the tailer wiring) and `internal/store` (pass 2), so it needs its **own** bead before implementation —
+and it **must land before the backfill runs**, because D4's pass 2 assumes the forward rule D7 puts in
+place and pass 3's re-ingest writes ids the old resolver would mint differently.
+
+The implementer's own cross-review (Phase 5.5) is where the factoring gets validated, against the real
+`merge.go` rather than against a paragraph about it — the check is that `insertOrMerge` and the rekey path
+call **one** function, and that the function is `insertOrMerge`'s collision branch **moved**, not copied.
 
 ## Change History
 
@@ -1239,4 +1541,5 @@ at first.
 | 2026-09-20 | Round 6 revision (F6.1–F6.2). **F6.1 (MAJOR)** — D4's collision step named no **taker**, and the reachable one after D1 is a **JSONL** row, not another proxy row: `getEventByRequestIDTx` filters on `request_id` with no `source` (`merge.go:82-84`), the tailer keys on `message.id` once D1 lands, and D4's own ordering rule requires D1 to land **before** the backfill runs — so recent JSONL rows already hold the keys the proxy half claims. `mergeEvents` keeps `existing`, so the survivor would be a JSONL row in a JSONL session with no `sessions` row: exactly the harm D4's ordering argument exists to prevent, arriving through the half that argument assumed was safe. Step 3 now branches on the taker's source; when the taker is JSONL the **proxy** row survives, via `mergeEvents(proxyRow, jsonlTaker)` with the arguments swapped so the proxy row is `existing`. That is the live behaviour restored rather than a new rule — `insertOrMerge` hard-codes which argument is `existing`, which is why this is a `rekey`-only helper and the live merge path stays untouched. D3 gains the matching scoping: "a merged row always lands in a session with an aggregate" is a property of the **ordinary ordering**, not of `mergeEvents`, and D4 states the rule for the path that can violate it. The ordering section now says ordering is necessary but not sufficient. §5 gains the **JSONL-taker** collision as a required second shape — the proxy-vs-proxy fixture pins the reconcile, but it is the shape the measured data says cannot happen, and it cannot see this defect. **F6.2** — `docs/context/testing-and-quality.md:12` ("51 test files") added to §4, the third present-tense count of the same class. |
 | 2026-09-20 | Round 7 revision (F7.1–F7.4, F7.6; F7.5 folded in). **F7.1 (BLOCKER)** — the round-6 fix named a mechanism that does not work: `mergeEvents` **never assigns `RequestID`** (`merged := *existing`, `merge.go:147`), so `mergeEvents(proxyRow, jsonlTaker)` returns the proxy row's **old synthetic key**, `updateEventTx` binds `request_id` first and writes it straight back, and deleting the taker then leaves the message id held by nobody. Silent on the ordinary case — the run reports success, re-keys nothing, and *succeeds on a second run*, which is the opposite of D4's promised no-op. `mergeEvents` also takes the key **and** the session from one argument, so no single call expresses this operation at all. **D4's step 3 is now a requirement list with a named trap rather than a procedure**: proxy row survives, `request_id` is the target key, content unioned, taker deleted first (it holds the `UNIQUE` key, which is why write-then-delete is impossible), `source_mismatch` decided as `insertOrMerge` decides it, touched sessions reconciled — with the sequencing left to the implementer and bead 05's cross-review. **F7.2 (MAJOR)** — §5's JSONL-taker case now asserts the surviving row's `request_id` (the one assertion that catches F7.1), asserts it **before** the second run, and pins differing token columns so the aggregate bullet can fail; the second-run no-op moves after it. **F7.3** — "content is a wash either way" deleted as false: the winner pick is order-dependent, so tokens/cost/`billing_mode`/`stop_reason`/`model_resolved` follow the argument order; the direction is still right (it reproduces the live seat), the justification was not. **F7.4** — `source_mismatch` is attached by `insertOrMerge`, not `mergeEvents`, so a helper calling the latter merges a token-disagreeing collision silently while §6 tells the operator to expect those warnings; now part of the helper's contract. **F7.5** — the reconcile-set paragraph named the JSONL taker twice; folded to "the session of whichever row was deleted". **F7.6** — `data-privacy-and-compliance.md:111-113` says `--dry-run --yes` "reports and deletes in one pass", citing `purge.go:20` for the opposite of what it says; §4 now carries that correction alongside the destructive-command claim. §6 gains the F7.1 trap as a named risk — the only defect in this story no CLI observable would reveal. |
 | 2026-09-20 | Round 8 revision (F8.1–F8.5), and the **final word** on D4's collision path. **F8.2 (MAJOR, mechanism)** — the round-7 requirement list said "the content is the union of both rows", which is **not** the rule `mergeEvents` applies: it is a **winner pick plus a per-column backfill** (the six token columns, the cost columns, `stop_reason`/`stop_category`, `service_tier`, `speed`, `model_resolved`, `billing_mode` all follow one side; `capture_complete` is the OR; only `source_refs` is unioned). An implementer satisfying the stated rule writes the **inverse** of live behaviour, and no CLI observable and no §5 aggregate bullet distinguishes it — so the reform that removed the broken mechanism had left one of its obligations unstated. D4 now names the winner-pick rule explicitly, lists which halves do which, and notes that for two complete captures the pick is `winner = incoming` (`merge.go:168-169`). **F8.1 (MAJOR, mechanism)** — §4's `internal/store/store.go` row was never updated by round 7 and **still prescribed the exact call D4 forbids** ("calls the existing `mergeEvents` with the arguments swapped"); since §4 becomes beads, that was a live directive to ship the silent no-op. Rewritten. **F8.3** — the round-7 replacement clause was **inverted** (it said the measurement columns follow "whichever argument is `existing`"; for two complete captures they follow `incoming`); corrected against `merge.go:168-169`. **F8.4** — bead 05's directive stated the delete-first step as general when it holds only in the JSONL-taker arm (D4 has the taker surviving in the proxy-taker arm), and §6 cited "§9's bead 05" for a list that lives in D4. **F8.5** — §5 asserted no `source_mismatch` warning even though the helper owns that decision and §6 tells the operator to expect those warnings from the run; a bullet added. §6's named-risk entry now carries **both** silent-failure classes — the key one and the content one — since they are the two defects here that no CLI output would reveal. **Loop closed at 8 rounds / 59 findings, 0 rejected outright; the plan is not marked converged — the collision path is declared converged by human decision after F8.1/F8.2, with the residue carried as named bead-05 traps.** |
-| 2026-09-20 | Round 10 revision (round-9 findings F9.1–F9.19, plus one coordinator-added finding; plan v10). **F9.3/F9.4 (RESOLVED BY MEASUREMENT, applied as directives)** — the proxy stores no `request-id` in **either** direction (0 of 728 responses, **0 of ~1,400** request headers), and **2,807 of 2,807** transcript lines matching a stored proxy body id carry no `requestId`; so `requestId` is present **exactly when the request did not traverse this proxy**. §1 and §2.2 rewritten: the mixed session runs two models against **two endpoints**, and "through the one proxy" is named as the reading the census falsifies; §2.2 records both F9.4 checks as **run**. **F9.7** — D1 keeps the header tier **first** (it is the only tier that can key a body with no id, 65 of 728) and gains the **meeting condition** (the tier is a property of the upstream response, so both sources land on the same tier by construction), the **accepted exception** (a proxy capture with no headers stored stays on tier 2 while a tier-1 transcript does not merge — recorded, not fixed), and the 16,804-row status; §5 gains the tier-pairing fixture asserting the split. **F9.10–F9.13** — D4 keeps its requirement list and **gains** the derived-column obligation (`total_prompt_tokens` re-derived from the survivor's four prompt columns in the same write; §5 asserts it on the row), the third winner-pick rule (the never-observed-usage override, `merge.go:196-206`; §5 asserts an all-zero picked side), the synthetic predicate (`request_id LIKE 'proxy:%'`, with why the prefix rather than "the body yields a different id"; §5 asserts a header-keyed row is unchanged), and the decode limit (config `BodyCapBytes`, with the encoded-body failure mode; §5 asserts gzip re-keyed and an invalid/missing-encoding row **counted in M**). D4 states in the document that the sequencing and field-copy mechanics are **deliberately not specified further**, and why. **F9.12's** predicate and **F9.11's** override also reach §4's `store.go` row and §9's note. **Coordinator-added finding (F9.20)** — `x-claude-code-session-id` arrives in **1,364** proxy request headers with **3** distinct values, all 3 real JSONL `sessionId`s, and **0** reach `events.session_id`: the "0 of 184 overlap / only proxy sessions have an aggregate" facts are a consequence of the proxy **discarding** the true conversation id, not a property of the data, so §2.6, D3, D4 and §8 now say "**as the proxy is currently written**", and §8's split-out story is named as **much smaller than it reads as**, with the header named. **The rest** — §2.3's reproducibility method (population, decode, precedence, scan, the ad-hoc extractor caveat) and its counted residue (N/M/K) (F9.1, F9.2); D2's first-seen precedence with its two-`message_start` fixture and the §6/§5 restatement of what the `type` guard actually buys (F9.2, F9.8); §2.4's floor framing (F9.6); D2's sketch field renamed `RequestIDHeader` (F9.9); the 152-id drawer now a **measured** result — re-measured at **303** ids with **0** mismatches, all true absentees, and the discriminator's definition recorded — superseding this round's first attempt to hand the test to the live-acceptance bead (F9.5); §6's re-derivability turned into a **checked precondition** of the run with a §5 refusal case (F9.14); §4's `cli_test.go` row corrected (14 of 18, and `rekey` joins the credential table, not the carried-over one) (F9.15); §6's retry bullet corrected (`message.id` stability is unmeasured) with a §5 same-body-id case (F9.16); §5's dry-run asserts the **exact N/M pair** (F9.17); §6's "`mergeEvents` unions" replaced with the winner-pick/backfill rule (F9.18, also fixed in D4's JSONL-taker bullet and §9's note); D4's `--dry-run` "nothing else" relaxed to "the counts plus the re-pricing/re-derivability notes; no row-level output" (F9.19). **Bead naming** — the plan's §9 sketch numbers are mapped to the real beads under `.beads/GI-9/`, and the destructive bead is referred to as **br-GI-9-04** throughout (the coordinator's directive named it; the sketch had called it bead 05). **Addendum (same round-9 apply, folded into this row — no v11).** F9.5 was resolved by the coordinator's live-DB measurement: **303** proxy ids with no transcript counterpart, **0** interval+token matches under a **different** id, **303** true absentees, **92** proxy rows yielding no id — so §2.3 states the **result** (with the discriminator's definition) rather than naming a runner, §5's drawer check becomes a re-confirmation, and §6's drawer bullet cross-references it. The premise axis' three MAJORs now read as **RESOLVED**, not as caveats: F9.3/F9.4 as already applied and F9.5 by measurement. F9.1's method paragraph now carries the **query** and the **ratio's stability** — this plan's pass 511 of 663 = 77% against the coordinator's re-measure **947 of 1,203 = 79%** on a corpus **78% larger** — stated as **perishable absolutes over a stable relation**, and §5(1)'s acceptance target moves from a frozen count to that ratio. F9.2 stands as fixed (the first-seen precedence and the counted N/M/K residue). §2.4 now carries the two percentages (**≈32%** against **≈71%**) so the "bound, not agree" framing is explicit (F9.6). §2's preamble states plainly that the premise survived an adversarial round **and** an independent re-measurement with a **stricter extractor**, with the story's own defect's hiding place tested and empty. |
+| 2026-09-20 | Round 9 revision (round-9 findings F9.1–F9.19, plus one coordinator-added finding; plan v10). **F9.3/F9.4 (RESOLVED BY MEASUREMENT, applied as directives)** — the proxy stores no `request-id` in **either** direction (0 of 728 responses, **0 of ~1,400** request headers), and **2,807 of 2,807** transcript lines matching a stored proxy body id carry no `requestId`; so `requestId` is present **exactly when the request did not traverse this proxy**. §1 and §2.2 rewritten: the mixed session runs two models against **two endpoints**, and "through the one proxy" is named as the reading the census falsifies; §2.2 records both F9.4 checks as **run**. **F9.7** — D1 keeps the header tier **first** (it is the only tier that can key a body with no id, 65 of 728) and gains the **meeting condition** (the tier is a property of the upstream response, so both sources land on the same tier by construction), the **accepted exception** (a proxy capture with no headers stored stays on tier 2 while a tier-1 transcript does not merge — recorded, not fixed), and the 16,804-row status; §5 gains the tier-pairing fixture asserting the split. **F9.10–F9.13** — D4 keeps its requirement list and **gains** the derived-column obligation (`total_prompt_tokens` re-derived from the survivor's four prompt columns in the same write; §5 asserts it on the row), the third winner-pick rule (the never-observed-usage override, `merge.go:196-206`; §5 asserts an all-zero picked side), the synthetic predicate (`request_id LIKE 'proxy:%'`, with why the prefix rather than "the body yields a different id"; §5 asserts a header-keyed row is unchanged), and the decode limit (config `BodyCapBytes`, with the encoded-body failure mode; §5 asserts gzip re-keyed and an invalid/missing-encoding row **counted in M**). D4 states in the document that the sequencing and field-copy mechanics are **deliberately not specified further**, and why. **F9.12's** predicate and **F9.11's** override also reach §4's `store.go` row and §9's note. **Coordinator-added finding (F9.20)** — `x-claude-code-session-id` arrives in **1,364** proxy request headers with **3** distinct values, all 3 real JSONL `sessionId`s, and **0** reach `events.session_id`: the "0 of 184 overlap / only proxy sessions have an aggregate" facts are a consequence of the proxy **discarding** the true conversation id, not a property of the data, so §2.6, D3, D4 and §8 now say "**as the proxy is currently written**", and §8's split-out story is named as **much smaller than it reads as**, with the header named. **The rest** — §2.3's reproducibility method (population, decode, precedence, scan, the ad-hoc extractor caveat) and its counted residue (N/M/K) (F9.1, F9.2); D2's first-seen precedence with its two-`message_start` fixture and the §6/§5 restatement of what the `type` guard actually buys (F9.2, F9.8); §2.4's floor framing (F9.6); D2's sketch field renamed `RequestIDHeader` (F9.9); the 152-id drawer now a **measured** result — re-measured at **303** ids with **0** mismatches, all true absentees, and the discriminator's definition recorded — superseding this round's first attempt to hand the test to the live-acceptance bead (F9.5); §6's re-derivability turned into a **checked precondition** of the run with a §5 refusal case (F9.14); §4's `cli_test.go` row corrected (14 of 18, and `rekey` joins the credential table, not the carried-over one) (F9.15); §6's retry bullet corrected (`message.id` stability is unmeasured) with a §5 same-body-id case (F9.16); §5's dry-run asserts the **exact N/M pair** (F9.17); §6's "`mergeEvents` unions" replaced with the winner-pick/backfill rule (F9.18, also fixed in D4's JSONL-taker bullet and §9's note); D4's `--dry-run` "nothing else" relaxed to "the counts plus the re-pricing/re-derivability notes; no row-level output" (F9.19). **Bead naming** — the plan's §9 sketch numbers are mapped to the real beads under `.beads/GI-9/`, and the destructive bead is referred to as **br-GI-9-04** throughout (the coordinator's directive named it; the sketch had called it bead 05). **Addendum (same round-9 apply, folded into this row — no v11).** F9.5 was resolved by the coordinator's live-DB measurement: **303** proxy ids with no transcript counterpart, **0** interval+token matches under a **different** id, **303** true absentees, **92** proxy rows yielding no id — so §2.3 states the **result** (with the discriminator's definition) rather than naming a runner, §5's drawer check becomes a re-confirmation, and §6's drawer bullet cross-references it. The premise axis' three MAJORs now read as **RESOLVED**, not as caveats: F9.3/F9.4 as already applied and F9.5 by measurement. F9.1's method paragraph now carries the **query** and the **ratio's stability** — this plan's pass 511 of 663 = 77% against the coordinator's re-measure **947 of 1,203 = 79%** on a corpus **78% larger** — stated as **perishable absolutes over a stable relation**, and §5(1)'s acceptance target moves from a frozen count to that ratio. F9.2 stands as fixed (the first-seen precedence and the counted N/M/K residue). §2.4 now carries the two percentages (**≈32%** against **≈71%**) so the "bound, not agree" framing is explicit (F9.6). §2's preamble states plainly that the premise survived an adversarial round **and** an independent re-measurement with a **stricter extractor**, with the story's own defect's hiding place tested and empty. |
+| 2026-09-20 | Round 10 revision (round-10 findings F10.1–F10.12, plus the session-attribution design added by the human's ruling; plan v11). **Part 1 — the round-10 findings.** **F10.1 (MAJOR)** — §2.1/§2.2 read the measured `requestId` leg as a biconditional; it is **one-way**: a line carries a `requestId` when its response came from a header-sending upstream, and the requests that traverse this proxy do not, so presence and proxying are inverse **on this install**. Exactly three places changed (§2.1's heading, §2.2's "precisely when", §1's clause); no figure moved and §2.3's counterexample stays in the same paragraph. **F10.2** — the drawer's 303-id pass labelled as its own later, larger-corpus re-measure, not a complement of the 947-of-1,203 census. **F10.4** — §5 gains the **tier-1/tier-1 meeting fixture** (a proxy row keyed `request-id: X` plus a JSONL line whose `requestId` is `X` → one row keyed `X`), alongside the accepted-split fixture. **F10.5** — D4 step 0's precondition restated over the recorded `jsonl:<path>` cursors (there is no row→file link), the delete scoped to what the walk can reproduce, and the root-change case made a **refusal**; §6 and §5 follow. **F10.7** — §5 asserts a **cost** after `rekey --yes`, because the re-ingest re-prices. **F10.9** — D6's "moot" scoped to this install, with the load-bearing, unverified case on a `request-id`-sending upstream named. **F10.10** — §4's `testing-and-quality.md` row updated as one clause (the counts and the re-measurement parenthetical together). **F10.11** — §9's trap states the full winner-pick **sequence** (complete-frame switch, never-observed override, empty-mode derivation). **F10.12** — §9 records that §4 supersedes br-GI-9-04's two-tables wording. **F10.3/F10.6/F10.8/F10.11** folded into the rewritten D4/§9 rather than into the text they replace. **Part 2 — the session-attribution design (D7, new; the human's ruling).** The proxy already receives `x-claude-code-session-id` (**1,364** of ~1,400 request headers, **3** distinct values, all **3** real JSONL `sessionId`s) and stores it verbatim in every row's `req_headers`; what it does not do is promote it. D7 adds a second source for `Meta.SessionHeader` in `ExtractMeta` (`x-clens-session` still wins), makes `Resolve` return it as the id ahead of the `seen`-map, and **wires `SetSessionRecorder`** — it had **no caller**, which is why the JSONL half recorded no `sessions` rows, the real reason for §2.6's "0 of 207". Consequences: D4's step-3 source branch is **gone** (both rows share one session, so the taker is the survivor whichever side it is and **nothing is re-keyed**); the collision path calls `insertOrMerge`'s factored collision branch, now **`mergeIntoExistingTx`**, so there is **one** merge rule for both callers and F7.1/F8.2/F9.10 **dissolve** into warnings against a hand-written merge; the reconcile set is "the distinct sessions among the two rows", usually one and **never** claimed to be always one; D4's ordering argument is **dropped** (the sequence is kept for determinism and reporting only); a third pass (**re-attribution**) rewrites historical proxy rows' `session_id` from their own stored `req_headers` by direct `UPDATE` — the **one** write path that sets `session_id` on an existing row, with `mergeEvents` still never rewriting it (D3) — upserting the new session and removing the emptied `s_…` ones; §2.6, D3, D4 and §8 keep "as the proxy is currently written" where it still holds and drop it where D7 changes behaviour; §6, §7 and §8 record the **visible** change (**184** heuristic `s_…` sessions → the **3** real conversations, gap-splitting stops, the **~3%** without the header fall back) and the **no new capture, no new retention** statement; §4/§5 gain the parse, session, cli and store rows plus the fixtures, and §9 gains the missing bead (the session work has **no bead** under `.beads/GI-9/`). Two new risks recorded: the recorder wiring **doubles** the JSONL reconcile cost (§5 bounds or reports wall-clock), and a `replay_of` reference can **dangle** after a delete (its count is to be measured on the live DB — this pass had **no shell** and could not, so it is recorded as a measurement the run must take). **Change History** — the previous row was mis-titled "Round 10" and was the round-9 apply; renamed to **Round 9**, and this is the round-10 row. **11 rows total.** |
