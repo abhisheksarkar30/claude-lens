@@ -104,6 +104,27 @@ function cards(container, items) {
 
 const mono = (s) => '<code>' + esc(s) + '</code>';
 
+// --------------------------------------------------------- list/detail modes
+
+// Selecting a call shows the detail *instead of* the list it was clicked in:
+// the list is hidden exactly when its detail is shown. Deriving the mode from
+// the two `hidden` flags rather than a parallel boolean leaves nothing that can
+// drift from what is actually on screen.
+function setCallDetail(on) {
+  $('calls-list').hidden = on;
+  $('call-detail').hidden = !on;
+}
+
+function setSessionDetail(on) {
+  $('sessions-list').hidden = on;
+  $('session-detail').hidden = !on;
+}
+
+// Every view change and every drill-down takes the next generation. A detail
+// response whose generation is no longer current is dropped instead of
+// rendered: the fetch is not cancelled, only its result is.
+let detailSeq = 0;
+
 // -------------------------------------------------------------- view: calls
 
 const callState = { offset: 0, limit: 50 };
@@ -143,8 +164,13 @@ async function loadCalls() {
   $('calls-next').disabled = callState.offset + rows.length >= total;
 }
 
-async function showCall(id) {
-  const { body } = await api('/api/requests/' + id);
+async function showCall(id, seq) {
+  const { body } = await api('/api/requests/' + id); // may throw
+  // Stale by the time it landed: a later view change or drill-down has taken a
+  // newer generation, so these bodies are not what was asked for. Rendering
+  // them would put one call's request and response on screen under a click for
+  // a different one.
+  if (seq !== detailSeq) return;
   const e = body;
   const details = [
     ['request id', mono(e.RequestID)],
@@ -167,14 +193,27 @@ async function showCall(id) {
     '<li><strong>' + esc(w.Kind) + '</strong> <span class="sev-' + esc(w.Severity) + '">' +
     esc(w.Severity) + '</span> ' + esc(w.Detail) + '</li>').join('');
 
+  // Only now, once there is a detail to show: flipping the mode before the
+  // fetch resolves would blank the list for a request that may still fail.
+  setCallDetail(true);
   $('call-detail').innerHTML =
-    '<h2>Call ' + e.ID + '</h2><table class="kv">' + details + '</table>' +
+    '<p><button type="button" id="call-back">‹ all calls</button></p>' +
+    '<h2>Call ' + esc(e.ID) + '</h2><table class="kv">' + details + '</table>' +
     (warnings ? '<h3>Warnings</h3><ul>' + warnings + '</ul>' : '') +
     '<h3>Replay</h3><div class="row">' +
     '<label>set <input id="replay-set" placeholder="max_tokens=250"></label>' +
     '<button type="button" id="replay-go">Replay</button></div>' +
     '<p class="muted">Replay is off unless <code>clens serve --replay</code> is running. ' +
     'It re-sends this call and bills your account.</p>';
+
+  // Bound here rather than parked in index.html so the control exists only
+  // while a detail does -- the same shape as the replay button below. It
+  // re-fetches: on a drill-down that started from another tab this is the
+  // list's first load, so there is nothing already on screen to return to.
+  $('call-back').addEventListener('click', () => {
+    setCallDetail(false);
+    loadCalls();
+  });
 
   $('replay-go').addEventListener('click', async () => {
     const set = $('replay-set').value.trim();
@@ -188,6 +227,12 @@ async function showCall(id) {
       setStatus('replay failed: ' + err.message, true);
     }
   });
+
+  // Hiding a fifty-row list collapses the page under a scroll position that
+  // pointed into it, and the browser clamps to the new height -- landing at the
+  // *bottom* of the detail. scroll-margin-top (style.css) keeps the sticky
+  // header off the back control this scrolls to.
+  $('call-detail').scrollIntoView();
 }
 
 // ----------------------------------------------------------- view: sessions
@@ -215,8 +260,12 @@ async function loadSessions() {
   ], rows, 'no sessions resolved yet');
 }
 
-async function showSession(id) {
-  const { body } = await api('/api/sessions/' + id);
+async function showSession(id, seq) {
+  const { body } = await api('/api/sessions/' + id); // may throw
+  // Same generation rule as showCall, and here it can fire on its own: with no
+  // view switch the sessions list stays on screen until this resolves, so a
+  // second session click while the first is in flight is possible.
+  if (seq !== detailSeq) return;
   const calls = (body.calls || []).map((e) =>
     '<tr><td><a href="#" data-call="' + e.ID + '">' + e.ID + '</a></td><td>' +
     esc(fmtTime(e.StartedAt)) + '</td><td>' + esc(e.ModelResolved || e.ModelRequested) +
@@ -224,7 +273,10 @@ async function showSession(id) {
     '</td><td>' + fmtUSD(e.CostUSD) + '</td><td>' + fmtUSD(e.ApiEquivalentCostUSD) +
     '</td></tr>').join('');
 
-  $('session-detail').innerHTML = '<h2>Session ' + esc(body.ID) + '</h2>' +
+  setSessionDetail(true);
+  $('session-detail').innerHTML =
+    '<p><button type="button" id="session-back">‹ all sessions</button></p>' +
+    '<h2>Session ' + esc(body.ID) + '</h2>' +
     '<table class="kv"><tr><th>calls</th><td>' + fmtInt(body.RequestCount) + '</td></tr>' +
     '<tr><th>prompt</th><td>' + fmtInt(body.TotalPromptTokens) + '</td></tr>' +
     '<tr><th>output</th><td>' + fmtInt(body.OutputTokens) + '</td></tr>' +
@@ -233,6 +285,12 @@ async function showSession(id) {
     (calls ? '<h3>Calls</h3><table><thead><tr><th>id</th><th>time</th><th>model</th>' +
       '<th>prompt</th><th>output</th><th>api $</th><th>sub $</th></tr></thead><tbody>' +
       calls + '</tbody></table>' : '');
+
+  $('session-back').addEventListener('click', () => {
+    setSessionDetail(false);
+    loadSessions();
+  });
+  $('session-detail').scrollIntoView();
 }
 
 // ----------------------------------------------------------- view: warnings
@@ -614,7 +672,11 @@ const loaders = {
 
 let current = 'overview';
 
-async function show(view) {
+// reveal switches the tab and un-hides the section -- the half of show() that
+// does no fetching. The drill-down needs exactly this and nothing more: it is
+// about to render one call, and a list of fifty is a fetch nobody sees.
+function reveal(view) {
+  detailSeq++; // take a fresh generation: any detail fetch still in flight is now stale (D10)
   current = view;
   document.querySelectorAll('#tabs .tab').forEach((b) => {
     b.classList.toggle('active', b.dataset.view === view);
@@ -623,6 +685,17 @@ async function show(view) {
     s.hidden = s.id !== 'view-' + view;
   });
   setStatus('');
+}
+
+async function show(view) {
+  reveal(view);
+  // Both details close on ANY tab click, unconditionally. A reset guarded by the
+  // tab's own name would leave a detail open when the user leaves via Overview
+  // or Warnings -- and both of those render their own data-call links,
+  // so the next drill-down would reveal the previous call's request and response
+  // bodies under a click for a different call until the fetch resolved.
+  setCallDetail(false);
+  setSessionDetail(false);
   try {
     await loaders[view]();
   } catch (err) {
@@ -642,14 +715,38 @@ document.addEventListener('click', async (ev) => {
   const call = ev.target.closest('[data-call]');
   if (call) {
     ev.preventDefault();
-    await show('calls');
-    try { await showCall(call.dataset.call); } catch (err) { setStatus(err.message, true); }
+    // Reveal the Calls view without running its loader: the detail is what was
+    // asked for, and fetching fifty rows only to hide them is a fetch nobody
+    // sees. reveal() has just taken this drill-down's generation (D10), so a
+    // late response from an earlier drill-down cannot land in #call-detail.
+    reveal('calls');
+    const seq = detailSeq;
+    try {
+      await showCall(call.dataset.call, seq);
+    } catch (err) {
+      // Only report a failure that is still current. A stale rejection must not
+      // pull the user back to a view they have already left, and the fallback
+      // below would bump the generation and take a newer detail down with it.
+      if (seq === detailSeq) {
+        await show('calls');
+        setStatus(err.message, true);
+      }
+    }
     return;
   }
   const sess = ev.target.closest('[data-session]');
   if (sess) {
     ev.preventDefault();
-    try { await showSession(sess.dataset.session); } catch (err) { setStatus(err.message, true); }
+    // No view change here, so this drill-down takes its generation directly.
+    const seq = ++detailSeq;
+    try {
+      await showSession(sess.dataset.session, seq);
+    } catch (err) {
+      // Same symmetry as the [data-call] branch: only a failure that is still
+      // current writes the status line; a stale one must not overwrite a newer
+      // detail's.
+      if (seq === detailSeq) setStatus(err.message, true);
+    }
     return;
   }
   const kind = ev.target.closest('[data-kind]');

@@ -41,28 +41,37 @@
   </section>
 
   <section class="view" id="view-calls" hidden>
-    <div class="row">
-      <label>source <input id="f-source" placeholder="proxy | jsonl"></label>
-      <label>model <input id="f-model" placeholder="claude-sonnet-5"></label>
-      <label>billing <select id="f-billing">
-        <option value="">any</option>
-        <option value="api">api</option>
-        <option value="subscription">subscription</option>
-      </select></label>
-      <button type="button" id="f-apply">Filter</button>
+    <!-- #calls-list is what "the list" means structurally: the detail replaces
+         it, so anything that should hide in detail mode must live inside this
+         div. A container added after it would stay on screen beside the detail. -->
+    <div id="calls-list">
+      <div class="row">
+        <label>source <input id="f-source" placeholder="proxy | jsonl"></label>
+        <label>model <input id="f-model" placeholder="claude-sonnet-5"></label>
+        <label>billing <select id="f-billing">
+          <option value="">any</option>
+          <option value="api">api</option>
+          <option value="subscription">subscription</option>
+        </select></label>
+        <button type="button" id="f-apply">Filter</button>
+      </div>
+      <div id="calls-table"></div>
+      <div class="row pager">
+        <button type="button" id="calls-prev">‹ prev</button>
+        <span id="calls-range" class="muted"></span>
+        <button type="button" id="calls-next">next ›</button>
+      </div>
     </div>
-    <div id="calls-table"></div>
-    <div class="row pager">
-      <button type="button" id="calls-prev">‹ prev</button>
-      <span id="calls-range" class="muted"></span>
-      <button type="button" id="calls-next">next ›</button>
-    </div>
-    <div id="call-detail"></div>
+    <!-- hidden: a detail that started visible would flash an empty panel on
+         every load of this tab, before any click has chosen a call. -->
+    <div id="call-detail" hidden></div>
   </section>
 
   <section class="view" id="view-sessions" hidden>
-    <div id="sessions-table"></div>
-    <div id="session-detail"></div>
+    <div id="sessions-list">
+      <div id="sessions-table"></div>
+    </div>
+    <div id="session-detail" hidden></div>
   </section>
 
   <section class="view" id="view-warnings" hidden>
