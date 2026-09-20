@@ -249,8 +249,8 @@ the defaults are chosen to hold that:
 - **The bodies are stored, and that is the point.** Full request and response
   bodies are captured, and they are readable from the dashboard's call detail
   as well as from `clens show`. So the content — every prompt and every file the
-  agent read — is the asset this tool is protecting. `--body-policy truncated`
-  and `off` narrow that; the database file is the thing to protect.
+  agent read — is the asset this tool is protecting. `--body-policy off` narrows
+  that; the database file is the thing to protect.
 - **A transcript row's content is a reconstruction, not a capture.** The JSONL
   collector stores one assistant message's `content` in `transcript_content` /
   `transcript_role` — its own columns, never `req_body`, because a transcript

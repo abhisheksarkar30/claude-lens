@@ -18,8 +18,10 @@ an explicit policy to narrow it:
 | `--body-policy` | Behaviour |
 |---|---|
 | `full` (**default**) | body captured whole, up to `--body-cap-bytes` |
-| `truncated` | **accepted and inert** — no code path distinguishes it from `full` (see below) |
 | `off` | no body captured; the **call is still recorded** (br-GI-7-09) |
+
+There were three values, and the third was `truncated` — accepted by `Validate` and read nowhere, so
+it executed byte-identical code to `full`. It is now **rejected**, not aliased (see below).
 
 `events.capture_complete` records whether what was stored is the whole thing or was narrowed, so a
 reader can tell "this is everything" from "this is what we kept". It covers **both** bodies since
@@ -34,10 +36,13 @@ buys you and neither of which invalidates the decision itself:
 - **`off` did not mean "no bodies".** Until `br-GI-7-09` the proxy returned the bare `ReverseProxy`
   under `off`, so *no call row was written at all* — a strictly larger withholding than the flag, the
   banner, this file and the README all described. The code now matches the words.
-- **`truncated` is inert.** `config.Validate` accepts it and `internal/proxy`'s only policy branch is
-  `== "off"`, so it executes byte-identical code to `full`. Whether it was meant to mean *uncapped* is
-  not recorded anywhere; until that is answered, the `full` row above is the honest description of
-  both.
+- **`truncated` was inert, and is now gone.** `config.Validate` accepted it and `internal/proxy`'s only
+  policy branch is `== "off"`, so it executed byte-identical code to `full` — the value that reads as
+  *narrow it* stored the body whole. Whether it was ever meant to mean *uncapped* is not recorded
+  anywhere, and that is the reason it is rejected rather than aliased to `full`: on a flag whose whole
+  job is deciding what content reaches the database, the permissive default is the wrong side to
+  silently land on when the operator's intent was plainly the other one. A `config.toml` or script
+  still passing it now fails at startup with a message naming the two values that work.
 
 Credentials are kept out by a separate mechanism — redaction before the tee
 ([../security-and-permissions.md](../security-and-permissions.md)) — not by refusing to store

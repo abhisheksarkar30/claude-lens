@@ -30,14 +30,20 @@ are in [decisions/003](decisions/003-full-bodies-stored.md).
 
 ## The capture policy
 
-Three accepted settings on `--body-policy`, with `full` as the default. **Only two of them do
-anything** — see the `truncated` row:
+Two settings on `--body-policy`, with `full` as the default:
 
 | Policy | Behaviour |
 |---|---|
 | `full` (default) | the body is captured whole, up to the 256 KB cap |
-| `truncated` | **accepted and inert.** No code path distinguishes it from `full`; both are bounded by the cap and nothing else. See the note below. |
 | `off` | no body is captured, but the **call is still recorded**: method, path, status, redacted headers, TTFB and duration, with both body columns NULL (br-GI-7-09) |
+
+**There was a third value, `truncated`, and it is gone.** It was accepted and read nowhere — `full`
+and `truncated` executed byte-identical code, both bounded by `--body-cap-bytes`, because one cap
+leaves a second value nothing to control. The vocabulary is inherited from `deepseek-lens`, where the
+policy is likewise applied only for `off`. `Validate` now rejects it with a message naming the two
+values that work, so a script or a `config.toml` still passing it fails at startup instead of
+silently storing whole bodies an operator believed were narrowed. See
+[decisions/003](decisions/003-full-bodies-stored.md).
 
 `off` narrows what is *kept*, not what is *recorded*. That distinction is load-bearing and was not
 true before br-GI-7-09: the proxy used to return the bare `ReverseProxy` under `off`, installing no
@@ -61,14 +67,6 @@ which of the two was cut, so a surface that needs to say so infers it from the b
 the cap in force — an inference that is only as good as the cap not having changed since, which is
 why the flag is the authoritative half and the length comparison only names the body. The dashboard's
 transcript section carries the same length comparison for the third content column (br-GI-7-09).
-
-**A known gap, recorded rather than marked unverified** — because the *behaviour* is certain and only
-the intent is not: `truncated` being inert is a fact about the code. `config.Validate` accepts it and
-`internal/proxy`'s only policy branch is `== "off"`, so `full` and `truncated` execute byte-identical
-code. Whether the value was meant to do something is not recorded; `README.md`'s claim that it
-"narrow[s]" the capture is an overclaim until that is answered. Recorded as a known gap in
-`br-GI-7-09`, deliberately not fixed there — making the two differ means deciding whether `full`
-should mean *uncapped*, which is a design question about the default's blast radius.
 
 A second kind of content is stored, from a source that is not the wire: **`transcript_content` /
 `transcript_role`**, one assistant message's `content` from a Claude Code transcript

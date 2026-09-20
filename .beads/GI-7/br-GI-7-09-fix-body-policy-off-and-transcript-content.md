@@ -14,7 +14,9 @@
 > finding — `internal/jsonlogs` never reads `BodyPolicy`, so `transcript_content` is stored whole and
 > uncapped under `--body-policy off` — and the investigation that finding required turned up a larger
 > one underneath it. Both halves are recorded here because the second one decides what the first one
-> should do.
+> should do. A third question arrived while answering those two — *what does the policy mean?* — and
+> it turned up a value that meant nothing at all; that is decision 9, and it is here rather than in a
+> bead of its own because it is the same question the other two are answers to.
 
 ## Description
 
@@ -55,6 +57,10 @@ recorded' warning"* — the comment and the string it describes disagree, and th
 comment. The failure shape is the bad one: an operator sets `off` to keep latency and status
 observability while dropping content, and silently loses the records too. No test covers it —
 `serve_test.go` asserts the banner's *text* and nothing about capture.
+
+The README row above carries a second, unrelated defect — `truncated` in that sentence never narrowed
+anything either. Both halves of it are corrected under decision 9, which leaves the sentence with
+`off` alone.
 
 ### Half B — `internal/jsonlogs` never consults the policy at all
 
@@ -217,14 +223,20 @@ guard goes in `requestID`, not at its call sites, because both paths reach the s
 a body we did not keep is a constant, and this branch is already the fallback whose uniqueness comes
 from `started_at_ns` and the attempt counter.
 
-### What this bead does not fix
+**9. The third policy value is removed, not implemented.** Answering *"what does `--body-policy`
+mean?"* for half A turned up a value that meant nothing: `config.Validate` accepts `truncated` and
+`proxy.go`'s only policy branch is `== "off"`, so `full` and `truncated` executed byte-identical
+code, both bounded by `--body-cap-bytes`. Leaving it was the smaller diff and is what this bead
+originally recorded. It is rejected instead, because of what the value *reads* as: `truncated` says
+*narrow it* to an operator who set it precisely so the bodies would not be stored whole, and the
+thing it actually does is store them whole. Making the two genuinely differ is the alternative, and
+it is the worse one — with one cap already bounding the capture, `truncated` has nothing left to
+control, so implementing it would mean inventing a *second* cap or else redefining `full` as
+uncapped, which changes the blast radius of the default. A value that cannot be implemented
+coherently should not be accepted. It fails at startup, from `config.toml` or a flag alike, with a
+message naming `full` and `off`; the flag's own help text now advertises only those two.
 
-**`--body-policy truncated` is still a no-op.** `config.Validate` accepts it and `proxy.go`'s only
-policy branch is `== "off"`, so `truncated` and `full` execute byte-identical code, both bounded by
-`--body-cap-bytes`. This bead does not change that: making the two differ means deciding whether
-`full` should mean *uncapped*, which is a real design question about the default's blast radius on a
-256 KB-bounded capture, and the README's "`--body-policy truncated` … narrow[s] that" stays an
-overclaim until it is answered. Recorded here so it is not lost; out of scope.
+### What this bead does not fix
 
 **A request body upstream never reads in full** is still stored as a prefix with no marker — the
 pre-existing gap `br-GI-7-08` names in its own §"What this bead does not fix".
@@ -273,6 +285,9 @@ the context doc all say.
   above cannot quietly stop the warning the kind exists for.
 - `TestNoBufferingSSE` passes unchanged for `full`, and is extended to cover `off` — the gate on
   half A being free, on the policy that adds a second wrapper to the response body.
+- `Validate` accepts exactly `full` and `off`, and rejects `truncated` with a message naming those
+  two — asserted in **both** directions, since a negative-only assertion would have been green for
+  the value's entire inert life.
 - `go build ./...`, `go vet ./...`, `go test ./...` pass.
 
 ## Test Specifications
@@ -319,6 +334,13 @@ the context doc all say.
     disagreements, and nothing else in the suite would notice.
 - Unit Tests (`internal/web/assets_test.go`): the transcript section's cap comparison, as a
   source-shape assertion with `TestAssetsTheBodyRendererEscapes`'s stated ceiling unchanged.
+- Unit Tests (`internal/config/config_test.go`): `TestBodyPolicyAcceptsExactlyTheValuesThatDoSomething`
+  — decision 9. The positive half is the half that matters and the reason the test exists: `Validate`
+  accepting `full` and `off` is what the proxy's one policy branch depends on, and no prior test
+  asserted it. The negative half covers `truncated` and three shapes that were never advertised
+  (`sometimes`, `""`, `FULL`), and requires the `truncated` error to *name* the accepted values —
+  someone hitting it needs to be told what to set instead, and the old message advertised the value
+  being removed.
 - Integration Tests: none — no API or schema change. `transcript_content` is already nullable, so
   half B needs no migration; confirm no `user_version` bump is required.
 - E2E: none. The manual-run confirmation, if taken, is against a store copy on alternate ports, the
@@ -342,3 +364,7 @@ the context doc all say.
 - `internal/store/merge_test.go` (modify — that guard, in both orderings)
 - `internal/web/app.js` (modify — the transcript section's cap marker)
 - `internal/web/assets_test.go` (modify — the assertion for it, including that it is *called*)
+- `internal/config/config.go` (modify — decision 9: the `Validate` case and its reason, and the flag's
+  help text, which advertised `truncated`)
+- `internal/config/config_test.go` (modify — the accepted-set test, in both directions)
+- `README.md` (modify — decision 9; the sentence named only the two values that still work)

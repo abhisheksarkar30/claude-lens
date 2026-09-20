@@ -144,8 +144,8 @@ recoverable and the finding was recorded as `❓ UNVERIFIED` rather than asserte
 (`br-GI-7-09`, committed after this refresh ran — the paragraph above describes the tree as this
 refresh left it). Eleven of the module files were updated again for the fix, and **two joined the
 list that had come back clean**: `cost-and-quota.md` (`source_mismatch` now needs two *measurements*,
-which is what its own contract always said) and `build-and-run.md` (the flag table, where
-`truncated`'s inertness and `off`'s real behaviour both belong). `api-surface.md`,
+which is what its own contract always said) and `build-and-run.md` (the flag table, where the body
+policy's real behaviour belongs). `api-surface.md`,
 `decisions/000-index.md` and `decisions/007` were unaffected by the fix. Answering *"does the
 policy reach source B?"* required answering *"what does the policy mean?"*, and `off` turned out to
 mean **no rows at all**: the proxy returned the bare `ReverseProxy` before the closure that installs
@@ -156,9 +156,17 @@ sources. The bead also fixed a knock-on it created: a bodyless row is `CaptureCo
 every token column zero, which made the merge both *prefer* it over a row with real counts and raise
 `source_mismatch` at `SeverityError` claiming a disagreement that never happened.
 
-The class is the same one `CaptureComplete` belonged to, and it appeared three times in one story: a
+**One more value went the same way, after the fix above.** `--body-policy` had a third spelling,
+`truncated`, accepted by `Validate` and read by no code path — so `full` and `truncated` ran
+byte-identical code, and the value that reads as *narrow it* stored the body whole. It is now
+rejected at startup with a message naming `full` and `off`, rather than aliased to `full`.
+`data-privacy-and-compliance.md`, `build-and-run.md` and `decisions/003` moved with it; `README.md`
+is outside the generated tree. See `br-GI-7-09`'s decision log for why rejection beat aliasing.
+
+The class is the same one `CaptureComplete` belonged to, and it appeared four times in one story: a
 control that looks like it covers a path and does not. `CaptureComplete` was derived from one buffer
 of two (fixed in `br-GI-7-08`, found by the manual run); the body policy reached one source of two
-(fixed in `br-GI-7-09`, found by this refresh); and neither was visible to any test — the first
-because every fixture truncated a response, the second because the one test that read the banner
-checked its text and not its claim.
+(fixed in `br-GI-7-09`, found by this refresh); its third value reached nothing at all (fixed in the
+same bead); and none was visible to any test — the first because every fixture truncated a response,
+the second because the one test that read the banner checked its text and not its claim, the third
+because no test asserted the *accepted* set, only a rejected one.
