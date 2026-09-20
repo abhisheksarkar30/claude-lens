@@ -22,7 +22,8 @@ const eventWriteColumns = `
 	is_sidechain, session_id, project, git_branch, client_version, cli_entrypoint,
 	cost_usd, api_equivalent_cost_usd, cost_source,
 	prefix_hash, replay_of, replay_edits, capture_complete,
-	method, path, status, req_headers, resp_headers, req_body, resp_body`
+	method, path, status, req_headers, resp_headers, req_body, resp_body,
+	transcript_content, transcript_role`
 
 func eventWriteArgs(ev *Event) []any {
 	return []any{
@@ -37,6 +38,7 @@ func eventWriteArgs(ev *Event) []any {
 		nullableFloat(ev.CostUSD), nullableFloat(ev.ApiEquivalentCostUSD), ev.CostSource,
 		nullableString(ev.PrefixHash), ev.ReplayOf, ev.ReplayEdits, boolToInt(ev.CaptureComplete),
 		nullEmptyString(ev.Method), nullEmptyString(ev.Path), nullZeroInt(ev.Status), nullEmptyString(ev.ReqHeaders), nullEmptyString(ev.RespHeaders), ev.ReqBody, ev.RespBody,
+		ev.TranscriptContent, nullEmptyString(ev.TranscriptRole),
 	}
 }
 
@@ -264,6 +266,22 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	if len(existing.RespBody) == 0 {
 		merged.RespBody = incoming.RespBody
 	}
+	// The transcript columns are written by one side only -- internal/jsonlogs.
+	// A new column with no rule here would be silently dropped from the
+	// incoming side, and the common ordering is proxy-first: the capture is
+	// written live and the reconstruction arrives minutes later, so "no rule"
+	// means the content is discarded exactly when it finally shows up.
+	//
+	// These two are structurally transcript-only, so "a capture and a
+	// reconstruction disagree" is not reachable for them: a proxy row's value
+	// is always empty and only an empty existing cell is backfilled. The rule
+	// is the merge's general one -- the first-written side keeps its value --
+	// stated here so a future column written by both sides is a decision rather
+	// than an accident of the copy.
+	if len(existing.TranscriptContent) == 0 {
+		merged.TranscriptContent = incoming.TranscriptContent
+	}
+	merged.TranscriptRole = preferNonEmpty(existing.TranscriptRole, incoming.TranscriptRole)
 
 	return &merged, mismatch
 }

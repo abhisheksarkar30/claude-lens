@@ -1,6 +1,12 @@
--- Schema for the one claude-lens SQLite file. CREATE TABLE IF NOT EXISTS
--- only -- no migration framework in v1; the schema is created whole. Times
--- are Unix nanoseconds.
+-- Schema for the one claude-lens SQLite file. This file is the *current*
+-- shape, created whole on a fresh database; a database that already exists is
+-- brought forward by store.go's PRAGMA user_version runner, which owns every
+-- ALTER. Each piece of SQL has one home -- no PRAGMA and no ALTER here.
+--
+-- Every statement is IF NOT EXISTS, so Open can run this unconditionally: the
+-- exec is a no-op against an existing database and repairs a partial one. It
+-- is deliberately not atomic, and the runner's stamp ordering accounts for
+-- that. Times are Unix nanoseconds.
 
 CREATE TABLE IF NOT EXISTS events (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,7 +55,14 @@ CREATE TABLE IF NOT EXISTS events (
     req_headers             TEXT,
     resp_headers            TEXT,
     req_body                BLOB,
-    resp_body               BLOB
+    resp_body               BLOB,
+    -- Transcript-only, and deliberately not req_body: a transcript excerpt is
+    -- a reconstruction of intent, not the request that produced it, and
+    -- writing one into req_body would make it indistinguishable from a
+    -- capture inside a column the cross-source merge already has precedence
+    -- rules for.
+    transcript_content      BLOB,
+    transcript_role         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);

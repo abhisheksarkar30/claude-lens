@@ -71,11 +71,116 @@ func Open(dbPath string) (*Store, error) {
 	}
 	db.SetMaxOpenConns(1)
 
+	// Order matters, and this is the part that is easy to get wrong. The probe
+	// decides only whether to stamp; the stamp goes down *before* the exec.
+	//
+	// A fresh file gets the current version first, then the schema. The exec is
+	// not atomic -- it is a sequence of statements -- so it can die part-way
+	// through. Stamped first, the version is already current when the process
+	// dies, so the next boot's runner applies nothing and the always-run exec
+	// repairs the missing tables. Seeded *after* a successful exec instead, the
+	// version would still be 0 at a mid-file crash; the next boot would see
+	// `events` present (so not fresh, so no stamp), heal the missing tables,
+	// then read 0 and apply migration 1 -- ALTER TABLE ADD COLUMN against a
+	// table schema.sql had just created with that column. That is a
+	// "duplicate column name" error out of Open on every boot thereafter, with
+	// no recovery but deleting the database.
+	//
+	// Stamping early is safe the other way too: if the stamp landed but the
+	// first CREATE TABLE did not, the next boot's probe still reads `events`
+	// absent, so it re-seeds and re-runs the exec.
+	fresh, err := eventsTableAbsent(db)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if fresh {
+		if _, err := db.Exec(fmt.Sprintf("PRAGMA user_version = %d", schemaVersion)); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("store: stamp a fresh schema: %w", err)
+		}
+	}
+
+	// Unconditional, every open. Against an existing database it is a no-op --
+	// every statement is IF NOT EXISTS -- and against a partial one it is the
+	// repair. Skipping it when `events` exists would strand every other missing
+	// table behind "no such table" on every boot.
 	if _, err := db.Exec(schemaSQL); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store: create schema: %w", err)
 	}
+
+	// Before Open returns, so no caller can observe a database that has the
+	// schema but not its migrations.
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+// schemaVersion is the current PRAGMA user_version. It must equal
+// len(migrations): migrations[n] upgrades version n to n+1.
+const schemaVersion = 1
+
+// migrations holds one entry per schema change, oldest first. Each runs in its
+// own transaction with the version bump inside it, so a failure part-way leaves
+// the version where it was and the next Open retries rather than skipping.
+//
+// This is the repo's first migration mechanism. It exists because schema.sql is
+// CREATE TABLE IF NOT EXISTS throughout and can never add a column to a
+// database that already exists -- GI-1 recorded "Migrations: none in v1" as a
+// decision, not an omission, and this is the first change to need one.
+var migrations = []string{
+	// 0 -> 1: transcript content gets its own columns rather than sharing the
+	// wire-capture ones. Nullable and additive, so there is no table rewrite.
+	`ALTER TABLE events ADD COLUMN transcript_content BLOB;
+	 ALTER TABLE events ADD COLUMN transcript_role TEXT;`,
+}
+
+// eventsTableAbsent reports whether this database has no events table yet,
+// which is what distinguishes a fresh file from an existing one.
+func eventsTableAbsent(db *sql.DB) (bool, error) {
+	var n int
+	err := db.QueryRow(
+		`SELECT count(*) FROM sqlite_master WHERE type='table' AND name='events'`).Scan(&n)
+	if err != nil {
+		return false, fmt.Errorf("store: probe for the events table: %w", err)
+	}
+	return n == 0, nil
+}
+
+// migrate brings db up to schemaVersion.
+func migrate(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		return fmt.Errorf("store: read user_version: %w", err)
+	}
+	if version > schemaVersion {
+		return fmt.Errorf("store: database is at schema version %d but this binary knows %d: "+
+			"it was written by a newer clens", version, schemaVersion)
+	}
+	for v := version; v < schemaVersion; v++ {
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("store: migrate %d->%d: %w", v, v+1, err)
+		}
+		if _, err := tx.Exec(migrations[v]); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("store: migrate %d->%d: %w", v, v+1, err)
+		}
+		// Inside the transaction: a version that moved without its migration
+		// landing would strand the change forever, and a migration that landed
+		// without the version moving would fail on the next boot.
+		if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", v+1)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("store: stamp %d->%d: %w", v, v+1, err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("store: migrate %d->%d: %w", v, v+1, err)
+		}
+	}
+	return nil
 }
 
 // Close closes the underlying connection.
@@ -1077,12 +1182,16 @@ var eventColumnNames = []string{
 	"cost_usd", "api_equivalent_cost_usd", "cost_source",
 	"prefix_hash", "replay_of", "replay_edits", "capture_complete",
 	"method", "path", "status", "req_headers", "resp_headers", "req_body", "resp_body",
+	"transcript_content", "transcript_role",
 }
 
 // summaryOmittedColumns are the header/body blobs the list path never reads.
 // This is the one place the projection names them: adding a column to the
 // blob set is a one-line change here, and the list keeps excluding it.
-var summaryOmittedColumns = []string{"req_headers", "resp_headers", "req_body", "resp_body"}
+var summaryOmittedColumns = []string{
+	"req_headers", "resp_headers", "req_body", "resp_body",
+	"transcript_content", "transcript_role",
+}
 
 var (
 	eventSelectColumns   = selectFrom(eventColumnNames)
@@ -1183,9 +1292,14 @@ func scanEvent(row rowScanner) (*Event, error) {
 	var ev Event
 	var v eventScanVals
 	var reqHeaders, respHeaders sql.NullString
-	var reqBody, respBody []byte
+	var reqBody, respBody, transcriptContent []byte
+	var transcriptRole sql.NullString
 
-	if err := row.Scan(v.dest(&ev.EventSummary, &reqHeaders, &respHeaders, &reqBody, &respBody)...); err != nil {
+	// The extras follow eventColumnNames' tail order: the four blobs, then the
+	// two transcript columns.
+	if err := row.Scan(v.dest(&ev.EventSummary,
+		&reqHeaders, &respHeaders, &reqBody, &respBody,
+		&transcriptContent, &transcriptRole)...); err != nil {
 		return nil, err
 	}
 	v.apply(&ev.EventSummary)
@@ -1193,6 +1307,8 @@ func scanEvent(row rowScanner) (*Event, error) {
 	ev.RespHeaders = respHeaders.String
 	ev.ReqBody = reqBody
 	ev.RespBody = respBody
+	ev.TranscriptContent = transcriptContent
+	ev.TranscriptRole = transcriptRole.String
 	return &ev, nil
 }
 

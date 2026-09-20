@@ -97,6 +97,16 @@ type Event struct {
 	RespHeaders string // redacted header JSON
 	ReqBody     []byte
 	RespBody    []byte
+
+	// Transcript-only, empty for a source="proxy" row. A transcript excerpt is
+	// a reconstruction of intent, not a wire capture: one assistant message,
+	// not the request that produced it, and it excludes the system prompt, the
+	// tool schemas, and everything the proxy sees. The columns are named for
+	// that so a reader cannot mistake one for a capture.
+	//
+	// A transcript carries no headers at all -- not redacted, absent.
+	TranscriptContent []byte
+	TranscriptRole    string
 }
 
 // Warning is one analyzer finding attached to an event. (event_id, kind) is

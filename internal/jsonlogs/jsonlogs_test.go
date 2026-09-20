@@ -608,3 +608,68 @@ func (plainPricer) Compute(string, parse.Usage, string, string, time.Time) (*flo
 	usd := 1.0
 	return &usd, "shipped"
 }
+
+// T8 (the jsonlogs half): the transcript's own content is the one thing a
+// transcript holds that the proxy cannot observe, so it is stored -- in its own
+// columns, never in req_body. req_body belongs to the wire capture, and the
+// cross-source merge already has precedence rules for that column, so writing a
+// reconstruction into it would make the two indistinguishable.
+func TestPollStoresTranscriptContentInItsOwnColumns(t *testing.T) {
+	const content = `[{"type":"text","text":"the answer"},{"type":"tool_use","id":"t1","name":"Read","input":{}}]`
+
+	root := t.TempDir()
+	path := filepath.Join(root, "log.jsonl")
+	writeLine(t, path,
+		`{"type":"assistant","sessionId":"s1","requestId":"req_content","message":{"role":"assistant","model":"m","content":`+
+			content+`,"usage":{"input_tokens":1,"output_tokens":1}}}`)
+	// A second assistant line with no content field at all: Message is present,
+	// so the row still exists, but the columns must stay empty rather than
+	// holding a faked empty array. internal/api renders that as "no
+	// reconstruction", which is a different statement from "reconstructed, and
+	// it was empty".
+	appendLine(t, path,
+		`{"type":"assistant","sessionId":"s1","requestId":"req_nocontent","message":{"role":"assistant","model":"m","usage":{"input_tokens":1,"output_tokens":1}}}`)
+
+	st := newTestStore(t)
+	ctx := context.Background()
+	if _, err := New(root, st).Poll(ctx); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	rows, err := st.ListEventsFull(ctx, store.EventFilter{})
+	if err != nil {
+		t.Fatalf("ListEventsFull: %v", err)
+	}
+	byRequest := map[string]*store.Event{}
+	for _, r := range rows {
+		byRequest[r.RequestID] = r
+	}
+
+	got, ok := byRequest["req_content"]
+	if !ok {
+		t.Fatalf("no row for req_content; got %d rows", len(rows))
+	}
+	if string(got.TranscriptContent) != content {
+		t.Errorf("TranscriptContent = %q, want %q", got.TranscriptContent, content)
+	}
+	if got.TranscriptRole != "assistant" {
+		t.Errorf("TranscriptRole = %q, want assistant", got.TranscriptRole)
+	}
+	if len(got.ReqBody) != 0 {
+		t.Errorf("ReqBody = %q, want empty -- a reconstruction is not a capture", got.ReqBody)
+	}
+	if len(got.RespBody) != 0 {
+		t.Errorf("RespBody = %q, want empty", got.RespBody)
+	}
+
+	empty, ok := byRequest["req_nocontent"]
+	if !ok {
+		t.Fatalf("no row for req_nocontent; got %d rows", len(rows))
+	}
+	if len(empty.TranscriptContent) != 0 {
+		t.Errorf("TranscriptContent = %q for a line with no content, want empty", empty.TranscriptContent)
+	}
+	if empty.TranscriptRole != "assistant" {
+		t.Errorf("TranscriptRole = %q, want assistant -- the role is the transcript's own", empty.TranscriptRole)
+	}
+}

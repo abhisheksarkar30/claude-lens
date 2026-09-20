@@ -704,3 +704,122 @@ func TestMergeKeepsExistingAccountAndAuthKind(t *testing.T) {
 		t.Errorf("AuthKind = %q, want oauth (preferNonEmpty, even though the incoming side won the costs)", got.AuthKind)
 	}
 }
+
+// TestMergeFillsTranscriptColumnsBothWays (T8) covers the ordering the design
+// as first written dropped: the proxy captures live and the transcript
+// reconstruction lands minutes later, so proxy-first is the common case and a
+// new column with no merge rule is discarded exactly when it finally shows up.
+// Both orderings must leave the row carrying the reconstruction, because the
+// proxy side structurally cannot supply it -- a capture has no `message.content`
+// to reconstruct from.
+func TestMergeFillsTranscriptColumnsBothWays(t *testing.T) {
+	const content = `[{"type":"text","text":"the transcript's own content"}]`
+
+	// proxyFirst writes the capture, then the reconstruction.
+	proxyFirst := func(t *testing.T) {
+		st := newTestStore(t)
+		ctx := context.Background()
+
+		proxy := fullEvent("req-t8-proxy-first")
+		proxy.Source, proxy.FirstSource = "proxy", "proxy"
+		if _, _, err := st.InsertEvent(ctx, proxy); err != nil {
+			t.Fatalf("InsertEvent proxy: %v", err)
+		}
+
+		jsonl := fullEvent("req-t8-proxy-first")
+		jsonl.Source, jsonl.FirstSource = "jsonl", "jsonl"
+		jsonl.TranscriptContent = []byte(content)
+		jsonl.TranscriptRole = "assistant"
+		id, _, err := st.InsertEvent(ctx, jsonl)
+		if err != nil {
+			t.Fatalf("InsertEvent jsonl (merge): %v", err)
+		}
+
+		got, err := st.GetEvent(ctx, id)
+		if err != nil {
+			t.Fatalf("GetEvent: %v", err)
+		}
+		if string(got.TranscriptContent) != content {
+			t.Errorf("TranscriptContent = %q, want the reconstruction to survive a proxy-first merge", got.TranscriptContent)
+		}
+		if got.TranscriptRole != "assistant" {
+			t.Errorf("TranscriptRole = %q, want assistant", got.TranscriptRole)
+		}
+		// The capture's own columns are untouched by the merge: the
+		// reconstruction goes in its own columns by design.
+		if string(got.ReqBody) != string(proxy.ReqBody) {
+			t.Errorf("ReqBody = %q, want the capture's own %q", got.ReqBody, proxy.ReqBody)
+		}
+	}
+
+	// jsonlFirst writes the reconstruction, then the capture arrives.
+	jsonlFirst := func(t *testing.T) {
+		st := newTestStore(t)
+		ctx := context.Background()
+
+		jsonl := fullEvent("req-t8-jsonl-first")
+		jsonl.Source, jsonl.FirstSource = "jsonl", "jsonl"
+		jsonl.TranscriptContent = []byte(content)
+		jsonl.TranscriptRole = "assistant"
+		if _, _, err := st.InsertEvent(ctx, jsonl); err != nil {
+			t.Fatalf("InsertEvent jsonl: %v", err)
+		}
+
+		proxy := fullEvent("req-t8-jsonl-first")
+		proxy.Source, proxy.FirstSource = "proxy", "proxy"
+		id, _, err := st.InsertEvent(ctx, proxy)
+		if err != nil {
+			t.Fatalf("InsertEvent proxy (merge): %v", err)
+		}
+
+		got, err := st.GetEvent(ctx, id)
+		if err != nil {
+			t.Fatalf("GetEvent: %v", err)
+		}
+		if string(got.TranscriptContent) != content {
+			t.Errorf("TranscriptContent = %q, want the reconstruction to survive a jsonl-first merge", got.TranscriptContent)
+		}
+		if got.TranscriptRole != "assistant" {
+			t.Errorf("TranscriptRole = %q, want assistant", got.TranscriptRole)
+		}
+		if string(got.ReqBody) != string(proxy.ReqBody) {
+			t.Errorf("ReqBody = %q, want the capture's own %q", got.ReqBody, proxy.ReqBody)
+		}
+	}
+
+	t.Run("proxy first", proxyFirst)
+	t.Run("jsonl first", jsonlFirst)
+
+	// The both-sides-populated case: a second jsonl row for the same request
+	// (a re-read after a truncated cursor, say) must not overwrite the content
+	// already stored -- first-written wins, the merge's general rule.
+	t.Run("existing reconstruction is not overwritten", func(t *testing.T) {
+		st := newTestStore(t)
+		ctx := context.Background()
+
+		first := fullEvent("req-t8-keep")
+		first.Source, first.FirstSource = "jsonl", "jsonl"
+		first.TranscriptContent = []byte(content)
+		first.TranscriptRole = "assistant"
+		if _, _, err := st.InsertEvent(ctx, first); err != nil {
+			t.Fatalf("InsertEvent first: %v", err)
+		}
+
+		second := fullEvent("req-t8-keep")
+		second.Source, second.FirstSource = "jsonl", "jsonl"
+		second.TranscriptContent = []byte(`[{"type":"text","text":"a later, different read"}]`)
+		second.TranscriptRole = "assistant"
+		id, _, err := st.InsertEvent(ctx, second)
+		if err != nil {
+			t.Fatalf("InsertEvent second: %v", err)
+		}
+
+		got, err := st.GetEvent(ctx, id)
+		if err != nil {
+			t.Fatalf("GetEvent: %v", err)
+		}
+		if string(got.TranscriptContent) != content {
+			t.Errorf("TranscriptContent = %q, want the first-written %q", got.TranscriptContent, content)
+		}
+	})
+}

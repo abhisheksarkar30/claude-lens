@@ -403,6 +403,16 @@ func (t *Tailer) buildEvent(l *line, f walkedFile) (*store.Event, parse.Meta, pa
 		CaptureComplete:    true,
 	}}
 
+	// The transcript's own content, in its own columns. Only assistant lines
+	// carry Message at all, so a non-assistant line stores nothing -- NULL,
+	// which means "no transcript reconstruction", never a faked empty string.
+	// req_body is deliberately left alone: this is a reconstruction, not a
+	// capture, and the merge has precedence rules for that column.
+	if l.Message != nil {
+		ev.TranscriptContent = l.Message.Content
+		ev.TranscriptRole = l.Message.Role
+	}
+
 	if t.pricer != nil {
 		usd, costSource := t.pricer.Compute(ev.ModelResolved, usage, "", "", ev.StartedAt)
 		ev.CostSource = costSource
