@@ -473,8 +473,11 @@ checking the *source* of the row it is merging into, so any path where a JSONL r
 produced a JSONL survivor — a row in a session with no aggregate, invisible to `clens sessions` and the
 dashboard's Sessions tab. The live merge could not do that because the proxy row always got there first,
 and D4's rekey collision could — which is why round 6 gave D4 a branch on the taker's source. **Under
-D7 that harm is gone at the root**: both rows are in the same conversation session, that session has an
-aggregate row, and neither source is privileged. D4's source branch is deleted with the rest of the
+D7 that harm is gone at the root**: the two rows of an ordinary merge are the same conversation — the
+proxy row carries the id the JSONL row already does — so the survivor's session is a real conversation
+and neither source is privileged. (D4's rekey collision is the exception, and D4 states it: its deleted
+row is a *historical* proxy row that keeps its minted `s_…`, so that reconcile is always a set of two.)
+D4's source branch is deleted with the rest of the
 swapped-call design (D4), and no later path needs to check a survivor's source either.
 
 Two consequences the design depends on, both stated so a later change is a decision rather than a
@@ -488,7 +491,8 @@ drift:
   session alone. Do not "consolidate" the two session columns into the incoming row's. This is a
   statement about the **merge** path. D4's rekey collision is a different path — it deletes a row as
   well as merging one — and there the set to reconcile is the **distinct sessions among the two
-  rows**, usually one under D7; D4 states it.
+  rows**, which for a collision is **always two** (the survivor's conversation session and the deleted
+  historical row's minted `s_…`); D4 states it and why.
 - **No merge can vacate a session.** The incoming INSERT fails on the unique constraint *before* the
   incoming event ever holds a row, so there is no second row to remove and no session left holding
   totals for a row it no longer has. This was this plan's own first answer, and it was wrong; §2.6
@@ -517,9 +521,12 @@ rows need no re-read. Each row is processed in its **own transaction**:
    reconcile the distinct sessions among the two rows — through `reconcileSessionTx`, the tx-taking
    form (§4) — and then **remove the old `sessions` row once re-deriving shows it empty**, or `clens
    sessions` shows a ghost session with no rows: the same clause pass 2 step 3 carries, and the same
-   reason. The merge takes the deleted proxy row out of its own minted `s_…`; where that session is
-   not the survivor's — the historical proxy row whose `req_headers` lacked the header, the **L**
-   population — nothing later removes it (pass 2 iterates `source='proxy'` rows, pass 3 touches only
+   reason. The merge takes the deleted proxy row out of its own minted `s_…`, and that session is
+   **never** the survivor's: the deleted row is a *historical* proxy row carrying a minted `s_…` (the
+   population argument below — pass 1's predicate selects only pre-D7 rows, and pre-D7 `Resolve` minted
+   unconditionally), while the taker sits in the conversation session the request names or in a
+   *different* minted one. So nothing later removes it (pass 2 iterates `source='proxy'` rows, pass 3
+   touches only
    `jsonl:`-keyed rows, and a second run is a no-op), while `reconcileSessionTx` only `UPDATE`s and
    never deletes a `sessions` row ([`store.go:684-767`](../../internal/store/store.go#L684-L767)) and
    `ListSessions` takes no `request_count` filter
@@ -555,9 +562,12 @@ no-op" true — the row is gone, so nothing is left for a second pass to find.
 
 **Whichever source the taker is, the survivor is the taker, and under D7 that is correct.** Round 6
 gave step 3 a branch on the taker's source because a JSONL survivor landed in a session with no
-aggregate row. **D7 deletes the premise**: both rows are in the same conversation session, that session
-has an aggregate row, and the survivor's session is right whichever side it is. So step 3 needs no
-branch, and **nothing is re-keyed** — the taker already holds the key the proxy row is claiming; the
+aggregate row. **D7 deletes the premise**: the survivor's session is the conversation the request
+names — the id the proxy row itself now adopts (D7) and the JSONL row already carries — so the survivor
+is right whichever side it is, and that session's aggregate is materialised by pass 2's upsert and by
+pass 3's re-ingest (D7's wiring), not assumed to exist. **The deleted row is a different matter and is
+not the survivor**: it is a *historical* proxy row holding a minted `s_…`, so the reconcile is the
+**set of two** and step 3 must also remove that emptied session (above). So step 3 needs no branch, and **nothing is re-keyed** — the taker already holds the key the proxy row is claiming; the
 proxy row is the `incoming` seat, and the merge never writes it — which is why the caller deletes it
 rather than writing it.
 
@@ -695,11 +705,19 @@ the empty-`billing_mode` derivation (F10.3). §5 pins the override with a fixtur
 carries all-zero usage while the other side does not, asserting the figures follow the **observed**
 side.
 
-**The reconcile set is the distinct sessions among the two rows — usually one, and not always.** Under
-D7 a proxy row and a JSONL row for the same request carry the same conversation id, so the ordinary
-collision shares one session and one `reconcileSessionTx` call covers it. **Do not claim it is always
-one**: a historical proxy row whose `req_headers` lacked `x-claude-code-session-id` keeps its minted
-`s_…` (pass 2 below), so the two rows can still differ and the set is then two.
+**The reconcile set is the distinct sessions among the two rows — and for a pass-1 collision it is
+always two.** The deleted row is a *historical* proxy row: pass 1's predicate (`request_id LIKE
+'proxy:%'` **and** the body yields an id) selects **only pre-D7 rows**, because a post-D7 row keyed
+`proxy:…` is by construction one whose body yields no id (D2's precedence would have keyed it by the
+body id), and before D7 `Resolve` minted **unconditionally** — the only header that ever reached it was
+`x-clens-session`, and it never became the id ([`session.go:58`](../../internal/session/session.go#L58),
+[`:80-84`](../../internal/session/session.go#L80-L84),
+[`meta.go:38-40`](../../internal/parse/meta.go#L38-L40)). So that row's session is always a minted
+`s_…`. The taker holds the **target key** (a body id), which no pre-D1 row can hold — most often it is
+the **JSONL** row, whose `session_id` is the transcript's own conversation id
+([`jsonlogs.go:381-386`](../../internal/jsonlogs/jsonlogs.go#L381-L386)) — and a minted `s_…` never
+equals a conversation id. **Do not claim the set is one**: it is the survivor's conversation session
+**and** the deleted row's minted `s_…`, on every run.
 
 **Both sessions can move, so re-derive the set rather than one.** The absorbed `incoming` row is deleted
 outright — removing a row leaves its session's totals high — while `mergeEvents` copies the **winner's**
@@ -826,14 +844,15 @@ falls short **only** on the duplicate-collapse problem above: a re-keyed-but-not
 surplus. Naming it is what makes "one command, three passes" an argued decision rather than an
 unexplained asymmetry.
 
-**Ordering: pass 1, then pass 2, then pass 3 — fixed, and now fixed only for determinism and
-reporting.** The sequence no longer decides anything: under D7 both rows of every collision carry the
-same conversation session, so either order yields the same row, the same key and the same session. The
-reason the ordering *was* argued for — proxy half first so the survivor keeps a session with a
-materialised aggregate — is dead with the asymmetry that made a JSONL session aggregate-less (§2.6,
-D7), and it is **dropped rather than re-justified**: there is no surviving reason. The sequence is kept
-because a fixed, stated order makes the run's output reproducible and its report readable, not because
-the outcome depends on it.
+**Ordering: pass 1, then pass 2, then pass 3 — fixed for the reconcile set and for determinism.** The
+sequence decides nothing about the *end state*: the survivor is the taker, and its row, key and session
+are the taker's whichever order runs. It **does** decide the reconcile *set*: pass 1 runs before pass 2,
+so the row pass 1 deletes has not been re-attributed and still carries its minted `s_…`, which is why
+that collision's set is always the two sessions D4 names rather than one. The reason the ordering *was*
+argued for — proxy half first so the survivor keeps a session with a materialised aggregate — is dead
+with the asymmetry that made a JSONL session aggregate-less (§2.6, D7), and it is **dropped rather than
+re-justified**: there is no surviving reason. The fixed sequence is kept because a stated order makes
+the run's output reproducible and its report readable.
 
 *Rejected alternative — have `rekey` upsert the survivor session.* This is now **accepted, and is what
 pass 2 does**: the conversation session is upserted so a re-attributed row has somewhere to land. What
@@ -1001,8 +1020,9 @@ Change (2) is what makes the proxy's `session_id` the same value the JSONL side 
 
 **Consequences, each stated as a consequence rather than a preference.**
 
-- **D4 step 3's source branch is gone.** Both rows are in the same session, so the survivor's session is
-  correct whichever source the taker is.
+- **D4 step 3's source branch is gone.** The survivor is the taker, and its session is the conversation
+  the request names whichever source it is, so no branch is needed; the collision's *two* sessions (the
+  deleted historical row's minted `s_…` and the survivor's conversation) are reconciled as a **set** (D4).
 - **The session-scoped analyzer's row set is the rows that carry a request body** (F11.4). D7 turns a
   "session" from one gap-window burst of proxy rows into the whole conversation, so `SessionEvents`
   ([`store.go:325-330`](../../internal/store/store.go#L325-L330)) would return proxy rows and JSONL rows
@@ -1016,14 +1036,15 @@ Change (2) is what makes the proxy's `session_id` the same value the JSONL side 
   because the session is now the whole conversation rather than one gap-window it hands the rule **more**
   proxy rows than it sees today — strictly better, not a narrowing. The pass's cost is a separate
   question, recorded in §6 rather than fixed here.
-- **The reconcile set collapses to one session in the ordinary case** — and it is the *distinct* sessions
-  among the two rows, **not always one**: a proxy row whose headers lacked the id keeps its minted
-  `s_…`, so the two rows can still differ (D4).
+- **The reconcile set is the *distinct* sessions among the two rows, and for a collision it is always
+  two** — the survivor's conversation session and the deleted historical proxy row's minted `s_…` (D4):
+  pass 1's population is pre-D7 rows that keep their minted id, and the taker holds a key no pre-D1 row
+  could hold, so the two sessions never coincide.
 - **D4's ordering argument is dropped, not re-justified.** Its stated reason — "a JSONL session has no
   aggregate row to hold the row" — is dead under (2)+(3): JSONL sessions now have aggregate rows, and
-  both rows share one session, so either order yields the same row, the same key and the same session.
-  The fixed sequence is kept **for determinism and reporting**, and D4 says plainly that the reason it
-  was argued for no longer holds.
+  the survivor (the taker) is right whichever order runs. The order no longer decides the **end state**;
+  D4 states that it still decides the reconcile **set**. The fixed sequence is kept **for determinism
+  and reporting**, and D4 says plainly that the reason it was argued for no longer holds.
 - **F7.1, F8.2 and F9.10 dissolve** — each was a consequence of the swapped call D7 makes unnecessary.
   D4 keeps them only as a warning against reintroducing a swapped call or a hand-written merge.
 - **§8's first bullet and §2.6's asymmetry paragraph** described the disjoint-session state as a
@@ -1231,11 +1252,15 @@ have deleted; a second run is a no-op, and a run with neither flag refuses.
 **The collision has two shapes, and the second one is the load-bearing case.** The proxy-vs-proxy
 fixture above pins the reconcile, and it is also the shape the measured data says cannot happen (no body
 id is shared by two proxy rows, §6). The shape that *will* happen is a **JSONL taker**: a proxy row
-whose body id is already held by a `jsonl`-sourced row. Seed that — one `proxy:`-keyed row with a body
-carrying a `message.id`, and one `jsonl`-sourced row carrying that same id, **both in the same
-conversation session** (D7) — and assert:
+whose body id is already held by a `jsonl`-sourced row. Both shapes have **two** sessions, because the
+row a pass-1 collision deletes is always a *historical* proxy row carrying a minted `s_…` (D4): the
+proxy-vs-proxy fixture seeds that directly, and the JSONL-taker fixture **gets the same two-session
+seeding** rather than the shared session an earlier draft gave it — one `proxy:`-keyed row in its **own
+minted session** (its own `sessions` row) with a body carrying a `message.id`, and one `jsonl`-sourced
+row carrying that same id in the **conversation session** (D7). Seed that, and assert:
 
-- the surviving row is the **taker's** row: `id` unchanged, `session_id` the shared conversation id, and
+- the surviving row is the **taker's** row: `id` unchanged, `session_id` the JSONL seat's conversation
+  id (not the proxy row's minted `s_…`), and
   `source_refs` holds **both** sources — asserted **order-agnostically** (as a set, `{proxy, jsonl}`), or
   as the seat's order `["jsonl","proxy"]`, because on this path the survivor is the JSONL **taker** and
   `unionStrings` seeds the union from the `existing` seat first ([`merge.go:148`](../../internal/store/merge.go#L148),
@@ -1265,11 +1290,14 @@ conversation session** (D7) — and assert:
   `jsonl:`-prefixed ids, the empty one — stays green
   without this bullet and leaves this reference dangling, which §6 calls a silent failure no CLI
   observable reveals;
-- **one** reconcile covers the collision, because both rows share the conversation session (D7) — so
-  the deleted row's session *is* the survivor's, asserted on that session's post-merge aggregate. The
-  **two-session** variant is the proxy-vs-proxy fixture above (a hand-seeded proxy row whose
-  `req_headers` lack the header, i.e. the **L** population), which keeps its two-session pinning and is
-  why the reconcile is stated as a **set** rather than "one";
+- **two** reconciles cover the collision, because the two rows sit in **two** sessions — the survivor's
+  conversation session and the deleted proxy row's minted `s_…` (D4). Assert the **survivor's**
+  session's post-merge aggregate **and** that the minted `s_…` session is **reconciled to empty and then
+  removed** (F15.1's clause, applied to the shape that actually happens): a one-reconcile implementation
+  passes the survivor assertion while leaving the emptied `s_…` holding the absorbed row's figures, a
+  ghost in `clens sessions`. The proxy-vs-proxy fixture above is the type that cannot happen, and it
+  carries the same two-session pinning for the same reason — which is why the reconcile is stated as a
+  **set**;
 - **pin the token columns so the aggregate assertion can fail**: both sides `capture_complete` with
   **different** token columns, so the winner pick actually moves figures. Without the difference the
   reconcile is a no-op and the bullet passes either way — the same pinning the proxy-vs-proxy fixture
@@ -1305,9 +1333,10 @@ conversation session** (D7) — and assert:
 
 **The branch that used to be here is gone, and the case still earns its place.** Round 6's version
 asserted the survivor is the *proxy* row, because a JSONL survivor landed in an aggregate-less session.
-Under D7 the survivor is the taker and that is correct — both rows are in the same conversation session,
-which has an aggregate row — so the first bullet now guards the **identity** (that step 3 uses the
-ordinary merge and re-keys nothing) rather than a source branch. A test that only ever seeds
+Under D7 the survivor is the taker and that is correct — the survivor's session is the conversation the
+request names, whose aggregate pass 2's upsert and pass 3's re-ingest materialise (D4) — so the first
+bullet now guards the **identity** (that step 3 uses the ordinary merge and re-keys nothing) rather than
+a source branch. A test that only ever seeds
 proxy-vs-proxy still cannot see the difference, which is why both shapes are kept.
 
 **The JSONL half is the destructive one and needs its own case.** Every test above is proxy-half, and
@@ -1791,10 +1820,24 @@ below is a **warning against reintroducing** a hand-written merge, not a descrip
 > derivation ([`merge.go:272-288`](../../internal/store/merge.go#L272-L288)) — D4's sub-rules, which a
 > paraphrase drops and a stop after (1) or (2) ships as a defect.
 
-**§4 supersedes br-GI-9-04's own file list where the two disagree.** br-GI-9-04's note tells the
-implementer to add `rekey` to **both** hand-maintained `cli_test.go` tables; §4's `cli_test.go` row is the
-corrected instruction (the **credential-subcommand** table, not the carried-over one). Beads are written
-from this plan, not the reverse, so **§4 wins** and the bead's wording is corrected when it is rebuilt.
+**§4 and D4/D7 supersede br-GI-9-04 where the bead disagrees** — three items, each corrected when the
+bead is rebuilt:
+
+- br-GI-9-04's note tells the implementer to add `rekey` to **both** hand-maintained `cli_test.go`
+  tables; §4's `cli_test.go` row is the corrected instruction (the **credential-subcommand** table, not
+  the carried-over one).
+- br-GI-9-04's **ordering section** (`:31-47`) still carries the **pre-D7** design — "the ordering rule …
+  must not be flattened", "step 3 branches on the taker's source", and "only proxy sessions have [a
+  materialized aggregate]". D7 deletes that premise: the survivor is the **taker**, there is **no
+  taker-source branch**, and the ordering no longer decides the end state (D4). Superseded by D4/D7.
+- br-GI-9-04's helper contract (`:102`) requires "the surviving row is the **proxy row's `id` and
+  `session_id`**". That is **unimplementable through `mergeEvents`** — `merged := *existing` never
+  assigns `RequestID` and the id and the session come from the same seat — and it is exactly the
+  **swapped call** this section forbids. The survivor is the **taker's** row, by its `id` and
+  `session_id`; the requirement is superseded by D4.
+
+Beads are written from this plan, not the reverse, so **the plan wins** and the bead's wording is
+corrected when it is rebuilt.
 
 **The session-attribution work (D7) has no bead under `.beads/GI-9/` yet.** It is new to this plan by the
 human's ruling and touches `internal/parse/meta.go`, `internal/session/session.go`, `internal/cli`
@@ -1827,3 +1870,4 @@ call **one** function, and that the function is `insertOrMerge`'s collision bran
 | 2026-09-21 | Round 14 revision (round-14 findings F14.1–F14.11; **plan v15**). **MAJOR-free round** (0 BLOCKER / 0 MAJOR / 11 MINOR), the first clean round in this loop — the apply is deliberately small and does not re-grow the collision path's requirement list. **F14.1** — §6 still **fused the two mechanisms' consequences** (the third copy of the round-13 F13.10 residual): for the **load-by-`incoming.RequestID`** shape the key is **not** orphaned — the taker keeps its own key and the loss is permanent — so the fused "held by nobody either way … a second run works" was false for it. §6 now **splits** the two, matching D4 `:561-569` and §9 `:1678-1687` (both already correct); the sweep confirmed those are the only other copies, and §5's swapped-signature line is the swapped call's own. **F14.9 (AMBIGUITY, resolved as a settled rule)** — D4 `:716-717` put the overlong-header row "alongside N and M", contradicting `:839-842` and §5 `:1314`, which put it in **L**; the plan's own definitions resolve it to **L** (N/M are pass 1's body-id populations, and pass 2 treats the overlong header as absent, so the row keeps its minted `s_…`), and **all three sites now say L**. **F14.10 (AMBIGUITY, resolved)** — D4 `:543-545` read literally ("never holds a row of its own") said there was nothing to delete; reworded to "the proxy row is the `incoming` **seat**, and the merge never writes it — which is why the caller deletes it", matching the design (the row **is** inserted, then deleted). **F14.5 (the gate's blind spot)** — §5's precondition case could not fail on "checked before pass 1": a jsonl-only fixture is invisible to passes 1–2, so the fixture now seeds a **pass-1-eligible `proxy:` row** and asserts its `request_id` is **still** `proxy:…` after the refusal. **F14.7 (the gate's other blind spot)** — D4 promised a "race case" in §5 that does not exist; replaced with the accurate position: the residual mid-run race is **not §5-testable** and is **recorded, not mitigated** (§6). **F14.2** — §4's `cli_test.go` row gains its seven `newTailer` call sites (D7's resolver parameter is a compile break at the row's own file); **F14.3** — §4's `ingest.go` row now says **`runIngest` builds** the resolver (`ingest.go:38` holds the `*store.Store`; `st` cannot supply it), and the `refresh.go` row's "`session.New` exists only at `serve.go:89`" is narrowed to **non-test** (`consumer_test.go:454` also constructs one); **F14.4** — §4's `consumer.go` row names the replacement for the deleted `fallbackSeqCounter` — a package-level `*uint64` — with the reason carried; **F14.6** — F13.6's settled requirement gains its §5 case (the `replay_of` **re-point** to the survivor, plus the dry-run's **dangle** count, not the referrer count); **F14.8** — F13.4's settled rule gains its §5 pin (the survivor's `started_at` / `source` / `first_source` are the **taker seat's**, asserted on a fixture whose seats differ so it can fail); **F14.11 (SCOPE, recorded, no design change)** — §5's live acceptance cannot gate §2's absolute figures or §2.6's arithmetic (only the §2.3 ratio is re-derived); recorded so the PR body and the acceptance run are the only gates on those numbers, deliberately. **15 rows total.** |
 | 2026-09-21 | Round 15 revision (round-15 findings F15.1–F15.4; **plan v16**). **One MAJOR, three MINOR** (0 BLOCKER / 1 MAJOR / 3 MINOR), so the convergence streak resets to 0 — the MAJOR is a **missing requirement**, not a design decision, so it is applied rather than deferred. **F15.1 (MAJOR, applied)** — the collision path carried only "reconcile the distinct sessions", while its sibling pass 2 step 3 says reconcile **and then remove the old `sessions` row once re-deriving shows it empty**, or `clens sessions` shows a ghost. The merge takes the deleted proxy row out of its own minted `s_…`, and where that session is not the survivor's (the historical proxy row whose `req_headers` lacked the header, the **L** population) nothing later removes it — `reconcileSessionTx` only `UPDATE`s (`store.go:684-767`), `ListSessions` takes no `request_count` filter (`store.go:783-799`), so the ghost is user-visible in both `clens sessions` and `/api/sessions`. D4's pass-1 step 3 and §4's `store.go` row now carry pass 2's clause with its reason, and the mitigation is stated: `clens purge` already leaves zero-row `sessions` rows (`store.go:828-834`, `:861-867` delete `events` only), so this is consistency with pass 2, **not a new invariant** — but a command whose sibling pass forbids the artifact must not leave it. §5's proxy-vs-proxy fixture is **restated**: it asserted each session's post-run aggregate, which pins the ghost and would go red for the correct implementation — it now asserts the **survivor's** aggregate and that the **deleted row's** session is **gone** (reconciled to empty, then removed). **F15.2 (MINOR, applied)** — §6 binds the `replay_of` re-point to **both** delete sites, but §5's only case sat at pass 3's, and D4's collision contract and §4's row never named it, so an implementation resolving the reverse lookup only over pass 3's `jsonl:` id set stayed green while the collision left a dangling reference. The collision-site obligation is added to D4's pass-1 step 3 and §4's row, and a §5 bullet in the JSONL-taker collision fixture seeds a row whose `replay_of` names the absorbed proxy row's id and asserts it names the survivor afterward. **F15.3 (MINOR, applied as a wording fix)** — §5's wall-clock case could carry no assertion ("or at least **report** it"), and the wiring it bounds can only make the run **faster** where it is absent, so no wall-clock bound can fail on that absence; the case is now stated plainly as a **reported measurement** (seconds against N), the flakiness reason is given, and §6's "bounds **or reports**" becomes "**reports**", so the two sites agree on what the case does — the wiring's *existence* stays gated by §5's tailer-wiring case (`:1122-1126`). **F15.4 (MINOR, AMBIGUITY, resolved)** — pass 2 read `x-claude-code-session-id` only, while D7 change 1 settles that `x-clens-session` **wins** when both are present (`:930-935`, asserted at `:1085-1087`), so a historical row carrying the override was re-attributed to the conversation id where the live path would store the override. Resolved in the plan, not deferred: pass 2 now mirrors the live **precedence** as well as the live **length** rule (F12.7), for the same reason — it exists to reproduce what the live path stores — stated in D4's pass 2 step 1 and §4's row, with a §5 case seeding a headers-carry-both row that asserts the override wins. **16 rows total.** |
 | 2026-09-21 | Round 16 revision (round-16 findings F16.1–F16.2; **plan v17**). **One MAJOR, one NIT** (0 BLOCKER / 1 MAJOR / 0 MINOR / 1 NIT), so the convergence streak resets to 0. **F16.1 (MAJOR, two limbs, applied as a narrowing)** — pass 3's `replay_of` arm is **unreachable**, and `replay_of` can only name a **body-carrying** row: the reference is written only from the replay route's `ReplayMeta.Of` (`proxy.go:133-136`, `:252` → `consumer.go:430`), and that route refuses an original with no stored body (`internal/api/replay.go:86-88`); `internal/jsonlogs` assigns no `ReqBody`/`RespBody` and a merge cannot put one on a `jsonl:`-keyed row (the taker's key must equal the incoming's and no proxy key is `jsonl:`-prefixed). So **pass 3's `request_id LIKE 'jsonl:%'` delete can never dangle a reference**, and the collision path is the run's **only** delete site that can. The claim is **narrowed, not re-designed**: §6's "the run has two delete sites" becomes "the collision path is the only delete site that can dangle a reference", with the reachability argument stated; §4's `store.go` row is narrowed the same way; D4's pass-1 step 3 (`:530-534`) stops telling the collision site to mirror pass 3 and stands as the exemplar itself; the F15.2 rationale (`:1258-1265`) stops calling pass 3's `jsonl:` id set "the natural way to write it" and names it the empty set it is; and §5's pass-3 bullet is replaced with the **negative form** — seed a replay row naming a surviving `proxy:`-keyed row and assert pass 3 leaves its `replay_of` **untouched** — keeping the `--dry-run` dangle-count assertion. Limb (b) (the asserted target's id is unknowable inside step 1's transaction) **dissolves** with the arm: the collision site's target is the survivor, which exists at commit time. **The reviewer's alternative — keeping the arm and moving the re-point after the re-ingest — is rejected** in the changelog: it would re-grow pass 3's procedure against the standing structural instruction that D4's collision path and the backfill stay requirement lists with named traps, and it arms a site with no referrers. **F16.2 (NIT, applied)** — the wall-clock bullet's cross-reference `(:1122-1126)` pointed at the `internal/analyze` interleaving fixture; corrected to the tailer-wiring case `(:1145-1149)`. **17 rows total.** |
+| 2026-09-21 | Round 17 revision (round-17 findings F17.1–F17.3; **plan v18**). **One MAJOR, two MINOR** (0 BLOCKER / 1 MAJOR / 2 MINOR), so the convergence streak stays 0 — the MAJOR is a **stated rule that is false against the code**, not a design change, so it is corrected rather than deferred. **F17.1 (MAJOR, applied as a restatement)** — the plan claimed a pass-1 collision's two rows "share one session" and that the reconcile set is "usually one". They can never share: pass 1's predicate (`request_id LIKE 'proxy:%'` **and** a body id) selects only **pre-D7** rows (a post-D7 `proxy:`-keyed row is by construction one whose body yields no id, D2's precedence), and pre-D7 `Resolve` minted **unconditionally** — the only header that reached it was `x-clens-session`, which never became the id (`session.go:58`, `:80-84`; `meta.go:38-40`); the taker holds the target key, which no pre-D1 row can, so it is a post-D1 row — most often the **JSONL** row, whose `session_id` is the transcript conversation id (`jsonlogs.go:381-386`) — and a minted `s_…` never equals a conversation id. The reconcile set is therefore **always two**: the survivor's conversation session and the deleted row's minted one. The requirement text ("the distinct sessions among the two rows") is left alone; the false **claim**, the ordering rationale, the §3 consequences, D4's pass-1 step 3 (the "where that session is not the survivor's — the **L** population" qualifier becomes unconditional), D4's "D7 deletes the premise" and §2.6's guarantee paragraph are corrected, and **§5's JSONL-taker fixture is re-seeded**: the proxy row now sits in its **own minted session** (its own `sessions` row) and the case asserts the survivor's conversation aggregate **and** that the minted `s_…` is reconciled to empty and removed (F15.1's clause on the shape that actually happens). The two shapes' session seeding was **inverted** — the reachable JSONL-taker case got one session, the unreachable proxy-vs-proxy case got the two-session pinning — and is now fixed; the proxy-vs-proxy fixture is kept as it was. **F17.2 (MINOR, applied)** — D4's premise "that session **has an aggregate row**" is not the state pass 1 meets: today the `sessions` table holds only the 184 proxy-minted ids, D7 wires rows only for later ingests, and pass 2's own text says the conversation session "may not exist yet" and must be upserted (`:752-759`). Reworded to what pass 1 actually meets — the survivor's session is the one the merged row belongs to, materialised by pass 2's upsert and pass 3's re-ingest — with no branch restored. **F17.3 (MINOR, applied)** — §9's supersession of br-GI-9-04 was scoped only to the two-tables wording, but the bead still carries the **pre-D7** design: its ordering section (`:31-47`, "step 3 branches on the taker's source", "only proxy sessions have [a materialized aggregate]") and its helper contract (`:102`, "the surviving row is the proxy row's `id` and `session_id`", unimplementable through `mergeEvents` — `merged := *existing` never assigns `RequestID` — i.e. §9's forbidden swapped call). §9's rebuild note now names both as **superseded by D4/D7**; the bead file is **not** edited (`.beads/` is outside the plan's write boundary), the correction living in §9. **18 rows total.** |
