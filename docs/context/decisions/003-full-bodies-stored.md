@@ -22,7 +22,9 @@ an explicit policy to narrow it:
 | `off` | no body captured |
 
 `events.capture_complete` records whether what was stored is the whole thing or was narrowed, so a
-reader can tell "this is everything" from "this is what we kept".
+reader can tell "this is everything" from "this is what we kept". It covers **both** bodies since
+`br-GI-7-08`; before that it was derived from the response buffer alone, so a request body cut at the
+cap was stored as a prefix with the row still reporting a whole capture.
 
 Credentials are kept out by a separate mechanism — redaction before the tee
 ([../security-and-permissions.md](../security-and-permissions.md)) — not by refusing to store

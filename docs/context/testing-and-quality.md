@@ -9,9 +9,10 @@
 | Unit + integration | Go's stdlib `testing` only — no assertion library, no mocking framework | `*_test.go` beside the code | [go.mod](../../go.mod) has no test dependency |
 | End-to-end | none — no suite; one recorded manual run instead | [docs/acceptance.md](../acceptance.md) | the doc states which half could not be run |
 
-**50 test files, 13,010 lines** against 13,895 lines of non-test Go (re-measured at
-`GI-5-call-detail-drilldown`; the file count is unchanged since GI#3 because both stories added
-tests to existing files rather than new ones). Real components are used
+**51 test files, 14,563 lines** against 14,655 lines of non-test Go (re-measured at
+`GI-7-header-and-body-visibility`, which took the count 50 → 51 on one new file —
+[internal/api/mode_test.go](../../internal/api/mode_test.go); everything else it added went into
+existing test files). Real components are used
 rather than mocked: tests open a real temp SQLite store, run a real `httptest.Server` upstream, and
 drive the real `ServeMux`.
 
@@ -26,15 +27,20 @@ Named for the invariant, not the function — that convention is documented in
 | Bytes pass through unchanged | `TestByteIdentityNonStreaming` | [internal/proxy/proxy_test.go:95](../../internal/proxy/proxy_test.go#L95) |
 | A broken observer never breaks the session | `TestFailOpenOnUpstreamFailure` | [internal/proxy/proxy_test.go:139](../../internal/proxy/proxy_test.go#L139) |
 | Credentials are redacted before the tee | redact tests | [internal/proxy/redact_test.go](../../internal/proxy/redact_test.go) |
-| **The two billing models are never summed** | `TestBillingModeInvariants`, `TestSessionCostSplit` | [internal/store/store_test.go:180](../../internal/store/store_test.go#L180) |
-| **`input_tokens` is the uncached remainder** | `TestDerivedPromptTotal` | [internal/store/store_test.go:152](../../internal/store/store_test.go#L152) |
+| **The two billing models are never summed** | `TestBillingModeInvariants`, `TestSessionCostSplit` | [internal/store/store_test.go:179](../../internal/store/store_test.go#L179) |
+| **`input_tokens` is the uncached remainder** | `TestDerivedPromptTotal` | [internal/store/store_test.go:151](../../internal/store/store_test.go#L151) |
 | The merge is idempotent and re-derives the session | [internal/store/merge_test.go](../../internal/store/merge_test.go) | |
 | A slow SSE subscriber is dropped, not blocking | `TestBrokerDropsSlowSubscriberRatherThanBlocking` | [internal/api/broker_test.go:41](../../internal/api/broker_test.go#L41) |
 | Writes are idempotent (upsert) | `TestAdminUpsertIdempotent`, `TestIngestStateUpsert`, `TestWarningUpsertIdempotent` | [internal/store/store_test.go](../../internal/store/store_test.go) |
-| Readers proceed during a write batch | `TestConcurrentReadersDuringWriteBatch` | [internal/store/store_test.go:582](../../internal/store/store_test.go#L582) |
+| Readers proceed during a write batch | `TestConcurrentReadersDuringWriteBatch` | [internal/store/store_test.go:623](../../internal/store/store_test.go#L623) |
 | Every warning kind has one spelling, and the README agrees | `internal/analyze/readme_test.go` parses the README's table and compares it to `AllKinds()` | [internal/analyze/readme_test.go](../../internal/analyze/readme_test.go) |
 | Every shipped model has a minimum-cacheable-prefix entry | `TestMinimumCacheablePrefixCoversShippedModels` | [internal/analyze/analyze_test.go](../../internal/analyze/analyze_test.go) |
 | Containment import rules | three guards — see [security-and-permissions.md](security-and-permissions.md) | `internal/{api,proxy}/importguard_test.go`, `internal/cli/serve_test.go` |
+| **The list routes carry no body columns** | `TestListRouteOmitsBodies`, `TestSessionRouteOmitsBodies` — both share `assertNoBodyColumns`, which names all six omitted keys *and* bounds the response at 64 KB, against a 50-row fixture storing 1 MB per blob. The size bound is what makes it non-vacuous | [internal/api/api_test.go](../../internal/api/api_test.go) |
+| **`CaptureComplete` covers both bodies** | `TestCaptureCompleteCoversBothBodies` — request over the cap, request exactly at it, request under it, response over it, and both over it | [internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go) |
+| The migration runner's four paths | `TestMigrateFreshDatabase`, `TestMigrateExistingDatabase`, `TestMigrateHealsAPartialDatabase`, `TestMigrateDoesNotReAddColumnsOnAPartialNewSchema` — see [decisions/007](decisions/007-schema-migrations-by-user-version.md) | [internal/store/store_test.go](../../internal/store/store_test.go) |
+| The browser's completeness integers | `TestDetailPinsCompletenessWireValue` — all four spellings on the wire, not the typed constants every other test compares | [internal/api/api_test.go](../../internal/api/api_test.go) |
+| The body renderer escapes, and its markers select in order | `TestAssetsTheBodyRendererEscapes` — source-shape only; its ceiling is stated in the test | [internal/web/assets_test.go](../../internal/web/assets_test.go) |
 
 ### The one test that is a design gate
 

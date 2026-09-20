@@ -40,6 +40,12 @@ sequenceDiagram
 - **`InsertEvent` returns `(id, sessionID, error)`, and `sessionID` may not be `ev.SessionID`.**
   On a `request_id` merge it is the *existing* row's session. Every session-scoped call keys off
   the returned value — see flow 2.
+- **`CaptureComplete` covers both teed buffers.** The flag is submitted as
+  `!respBuf.truncated && !reqBuf.truncated`; deriving it from the response alone let a request body
+  cut at the read cap be stored as a prefix on a row still reporting a whole capture (br-GI-7-08,
+  found by the GI#7 manual run rather than by a test — every fixture in that story truncated a
+  response). A migration that changes this flag changes what `analyze`'s `stream_incomplete` rule
+  fires on and which row the merge prefers; see flow 2.
 
 ## 2. Cross-source merge — the one `UPDATE` on `events`
 
@@ -74,11 +80,19 @@ sequenceDiagram
 - **The merge and the session re-derivation are one transaction.** A merge rewrites a row's token
   columns, so an incremental fold would drift from the sum it is supposed to equal. `sessions` is
   therefore *recomputed*, not incremented, on this path.
-- **`first_source` and `session_id` are never rewritten** ([internal/store/merge.go:181](../../internal/store/merge.go#L181)).
+- **`first_source` and `session_id` are never rewritten** ([internal/store/merge.go:192](../../internal/store/merge.go#L181)).
   Consequence: the surviving row can belong to the **incoming event's** session or the **existing**
   one — which is why `insertOrMerge` returns the session id and every caller uses *that*.
   Reconciling `ev.SessionID` instead creates a session row owning no events and leaves the real
   session out of the analysis. This was an implementation-cross-review finding, fixed in `8650b9a`.
+- **The winner is "the more complete record", and both bodies count.** Since br-GI-7-08
+  `CaptureComplete` is also false when only the *request* body was cut at the cap, so a
+  request-truncated proxy row no longer wins the token pick against a wholly-captured `jsonl` row for
+  the same request. The disagreement is not lost — a differing pair still raises `source_mismatch` —
+  and with one body known to be a prefix, the whole record is the safer one to quote.
+  `TestMergePrefersTheWhollyCapturedRowOverATruncatedRequest` pins it, and its write order is
+  load-bearing: with the `jsonl` row second both orderings pick it and the test would pass either
+  way.
 - **`billing_mode` moves with the winning cost columns** — it is *not* `preferNonEmpty` like its
   neighbours. This is the one column a merge is expected to contradict: the JSONL tailer resolves it
   per row by model prefix, so re-ingesting a DeepSeek call flips it `subscription` → `api`. Keeping

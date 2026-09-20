@@ -3,10 +3,32 @@
 # Storage schema
 
 One SQLite file, `~/.clens/lens.db`, created whole from
-[internal/store/schema.sql](../../internal/store/schema.sql) — no migration framework in v1
-(`CREATE TABLE IF NOT EXISTS` only). Times are Unix nanoseconds.
+[internal/store/schema.sql](../../internal/store/schema.sql), and brought forward on an existing
+file by the `PRAGMA user_version` runner in [internal/store/store.go](../../internal/store/store.go).
+Times are Unix nanoseconds.
 
-*(This file fills the `data-model` role for this repo: one schema file, no ORM, no migrations.)*
+*(This file fills the `data-model` role for this repo: one schema file, no ORM, and — since GI#7 —
+one migration runner. See [decisions/007](decisions/007-schema-migrations-by-user-version.md).)*
+
+## How the schema gets applied
+
+| Piece | Owner | What it does |
+|---|---|---|
+| `schema.sql` | [internal/store/schema.sql](../../internal/store/schema.sql) | the **current** shape, written whole. Every statement is `IF NOT EXISTS`, and `Open` execs it **unconditionally** on every boot — a no-op on an existing database, and a repair for a partial one. Deliberately *not* atomic. |
+| `schemaVersion` + `migrations` | [internal/store/store.go](../../internal/store/store.go) | `schemaVersion` is the current `PRAGMA user_version`; `migrations[n]` upgrades version `n` to `n+1`, each in its own transaction with the version bump **inside** it. |
+| `eventsTableAbsent` probe | same | decides only whether to **stamp** a fresh database. |
+
+`Open`'s order is load-bearing: probe → (if fresh) `PRAGMA user_version = schemaVersion` **before**
+the schema exec → unconditional exec → run the migrations the version still calls for. Stamping an
+empty file first is what makes the exec and the migration not double-apply: a database that gets the
+columns from `schema.sql` must not also get them from an `ALTER`. Without the stamp, a first exec
+that died mid-file would leave `user_version = 0` on a table that already has the columns, and every
+subsequent boot would fail with `duplicate column name` and no recovery but deleting the file.
+`TestMigrateFreshDatabase`, `TestMigrateExistingDatabase`, `TestMigrateHealsAPartialDatabase` and
+`TestMigrateDoesNotReAddColumnsOnAPartialNewSchema` pin the four paths.
+
+A version *ahead* of the binary is refused, not guessed at: `migrate` errors rather than opening a
+database written by a newer `clens`.
 
 The schema is the enforcement point for two invariants, which is why it is worth reading before
 changing a column: see [architecture.md](architecture.md) and [cost-and-quota.md](cost-and-quota.md).
@@ -17,7 +39,7 @@ changing a column: see [architecture.md](architecture.md) and [cost-and-quota.md
 
 | Table | Purpose | Key fields | Constraints / indexes | Evidence |
 |---|---|---|---|---|
-| `events` | one row per captured call: identity, tokens, cost, and the proxy-only request/response columns | `id`, `request_id`, `source`, `first_source`, `session_id`, `total_prompt_tokens`, `cost_usd`, `api_equivalent_cost_usd`, `cost_source`, `req_body`/`resp_body` | `request_id` **UNIQUE** (this is what makes the merge possible); indexes on `session_id`, `started_at`, `cost_source` | [schema.sql](../../internal/store/schema.sql) |
+| `events` | one row per captured call: identity, tokens, cost, the proxy-only request/response columns, and the transcript-only reconstruction columns | `id`, `request_id`, `source`, `first_source`, `session_id`, `total_prompt_tokens`, `cost_usd`, `api_equivalent_cost_usd`, `cost_source`, `req_body`/`resp_body`/`req_headers`/`resp_headers`, `transcript_content`/`transcript_role` (47 columns) | `request_id` **UNIQUE** (this is what makes the merge possible); indexes on `session_id`, `started_at`, `cost_source` | [schema.sql](../../internal/store/schema.sql) |
 | `sessions` | the per-session fold: summed tokens, priced/unpriced counts, warning count | `id` PK, `prefix_hash`, `first_seen`/`last_seen`, every token column, `priced_count`, `unpriced_count`, `model_set`, `warning_count`, both cost columns | no FK — the link to `events` is by `session_id` value only | [schema.sql](../../internal/store/schema.sql) |
 | `warnings` | one row per (event, kind) | `event_id`, `kind`, `severity`, `detail`, `path` | `UNIQUE(event_id, kind)`; `REFERENCES events(id) ON DELETE CASCADE` | [schema.sql](../../internal/store/schema.sql) |
 
@@ -70,8 +92,13 @@ These are `TEXT` columns, not SQL enums — the valid vocabulary lives in Go and
 | `quota_snapshots.status` | the endpoint's own reported status, stored verbatim | [internal/snapshot](../../internal/snapshot/) |
 | `ingest_state.status` | per-collector outcome; `error` carries the message | [internal/ingest](../../internal/ingest/) |
 
-`events.capture_complete` is a flag rather than an enum: it says whether the captured body is the
-whole thing or was narrowed by the policy and the 256 KB cap.
+`events.capture_complete` is a flag rather than an enum: it says whether the capture is whole, or was
+narrowed by the policy and the 256 KB cap, or ended without a `message_stop` event. **Both bodies
+count** — a request body cut at the cap clears it just as a response body does (br-GI-7-08). The row
+does *not* record which of the two was cut or which cause applied; a reader that needs to say so
+identifies it by comparing each stored body's length against the cap the process was configured with,
+which the dashboard does and `clens show` does not. `internal/analyze`'s `stream_incomplete` rule
+fires on this flag and therefore states the disjunction rather than naming `message_stop`.
 
 ## Token columns
 
@@ -102,7 +129,8 @@ from the losing side
 ([internal/store/merge.go](../../internal/store/merge.go), `TestMergeDerivesBillingModeFromWinningCostColumn`).
 Note the aggregates key on the value: `SUM(CASE WHEN billing_mode = 'api' THEN cost_usd END)` and
 its `'subscription'` mirror, so a row whose mode is `''` matches neither and is absent from **both**
-totals ([internal/store/store.go:500-501](../../internal/store/store.go#L500-L501)).
+totals ([internal/store/store.go:686](../../internal/store/store.go#L686) and its two siblings at
+`:1372` and `:1437`).
 
 `cost_source` labels how the figure was arrived at: `shipped` (from the bundled table),
 `provisional` (bundled but unverified), `user` (an override), `approximate:<reason>` (a rate

@@ -34,19 +34,19 @@ Three non-stdlib modules and no more: `modernc.org/sqlite` (pure Go, no cgo),
 | [workflows.md](workflows.md) | to understand a flow end to end before changing it | conditional — trigger: flows spanning more than one package |
 | [security-and-permissions.md](security-and-permissions.md) | **before touching credentials, redaction, listeners, or an import edge** | conditional — trigger: `internal/secret`, the redactor, the Origin guard |
 | [data-privacy-and-compliance.md](data-privacy-and-compliance.md) | before changing what is captured, or how long it is kept | conditional — trigger: the body policy, the cap, retention, `clens purge` |
-| [testing-and-quality.md](testing-and-quality.md) | before writing a test, or wondering what CI gates on | conditional — trigger: 50 test files |
+| [testing-and-quality.md](testing-and-quality.md) | before writing a test, or wondering what CI gates on | conditional — trigger: 51 test files |
 | [infra-and-deploy.md](infra-and-deploy.md) | before touching a workflow, a hook, or branch policy | conditional — trigger: `.github/workflows/` |
 | [integrations-and-external-services.md](integrations-and-external-services.md) | before changing a collector or adding a dependency | conditional — trigger: four external endpoints, three Go modules |
-| [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 838 lines of hand-written JS under a hard no-build-step rule |
-| [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — six genuine forks, each with a rejected alternative a change could reintroduce |
+| [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 1003 lines of hand-written JS under a hard no-build-step rule |
+| [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — seven genuine forks, each with a rejected alternative a change could reintroduce |
 
 ## Grounding rules for agents
 
 These docs are a map, not the territory — and **the code wins on conflict**.
 
 1. **Discover, don't assume.** Every claim here cites a file (and often a symbol or line). Follow the
-   link before planning against it. Five statements are marked as not established by cited code —
-   two `⚠️ ASSUMPTION` (about intent) and three `❓ UNVERIFIED` (facts needing evidence), each in
+   link before planning against it. Six statements are marked as not established by cited code —
+   two `⚠️ ASSUMPTION` (about intent) and four `❓ UNVERIFIED` (facts needing evidence), each in
    the module that owns it and each naming what would confirm it. Grep for the markers to find them.
 2. **Verify the slice you are about to touch.** Treat a claim about the exact file, endpoint, schema
    shape, or permission you are about to change as a hypothesis until you have opened the source.
@@ -107,3 +107,41 @@ GI#5 — said the token is compared "after every `await`". It is not. In the `[d
 same token, because `show` bumps the generation itself. The plan's D10 already records that ceiling;
 the doc did not, and an overclaim in a doc whose whole job is telling an agent which guard is
 load-bearing is exactly the failure this tree exists to prevent. Corrected in place.
+
+**2026-09-20 — REFRESH, scoped to `GI-7-header-and-body-visibility`** (beads `br-GI-7-01` … `-08`;
+plan `docs/planning/GI-7-header-and-body-visibility.md` v8). **No module was added or retired.**
+`decisions/` gained its **first ADR since the initial generation** — [007](decisions/007-schema-migrations-by-user-version.md),
+`PRAGMA user_version` migrations — which is why the decision count above moved six → seven and the
+`decisions/` hint changed. 007 is also the first record here whose status is *supersedes a GI-1
+decision* rather than a standalone fork, so [000](decisions/000-index.md) now says which kind it is.
+
+**Twelve module files changed and one was created — this index makes fourteen:**
+`storage-schema.md` (a new *How the schema gets applied* section; the `events` row now names the
+transcript columns and 47 total), `api-surface.md` (the `/api/mode` route; the list projection and
+why it is a *type*; the three detail fields and `Completeness`'s integer spellings; and every
+`api.go` line reference re-pointed — the route block moved down 18 lines, which no diff of *this*
+file would ever show), `dashboard.md`
+(the badge, the body/header renderers, the re-measured line counts, and a warning about `funcBody`'s
+CRLF assumption), `glossary.md` (`EventSummary`/`Event`, `Completeness`, the transcript columns, the
+cap, the badge), `workflows.md` §1 and §2 (`CaptureComplete` covers both teed buffers; the merge's
+new preference), `data-privacy-and-compliance.md`, `security-and-permissions.md` (a new *Untrusted
+rendering* section), `cli-and-tooling.md` (`show`'s capture and read-path markers), `architecture.md`
+and `decisions/003` (both carried the "no migrations" claim), `testing-and-quality.md` (five
+invariant rows and the size figures, re-measured — this story took the test-file count 50 → 51),
+`decisions/000-index.md`, and the new `decisions/007-…md`. **Everything else came
+back *no changes needed*** — `conventions.md`, `build-and-run.md`, `cost-and-quota.md`,
+`infra-and-deploy.md`, `integrations-and-external-services.md`, and `decisions/001`, `-002`, `-004`,
+`-005`, `-006`.
+
+**This refresh found a control that silently does not reach a path it appears to cover, and it is
+flagged rather than fixed.** `--body-policy` and `--body-cap-bytes` govern what the *proxy* keeps —
+`BodyPolicy` is read at exactly one call site — while `internal/jsonlogs` never consults it. So the
+story's own new feature, transcript content in `transcript_content`/`transcript_role`, is stored
+whole and uncapped even under `--body-policy off`. Neither the plan nor `br-GI-7-06` mentions the
+policy, which makes it look like an oversight rather than a decision; the behaviour is certain from
+the code, the intent is not, so it is recorded as `❓ UNVERIFIED` in
+[data-privacy-and-compliance.md](data-privacy-and-compliance.md) rather than asserted either way.
+The same class of gap turned up twice in this one story: `CaptureComplete` was derived from the
+response buffer alone, so a request body cut at the read cap was stored as a prefix on a row still
+reporting a whole capture. That one the story's manual run caught and it was fixed in `br-GI-7-08`;
+this one no test or run would have caught, because nothing in the story's scope asked the question.

@@ -38,10 +38,36 @@ Three settings on `--body-policy`, with `full` as the default:
 | `truncated` | the body is narrowed before storage |
 | `off` | no body is captured |
 
-`--body-cap-bytes` (default `262144`, i.e. 256 KB) bounds the capture independently of the policy.
-`events.capture_complete` records whether what was stored is the whole thing or was narrowed —
-so a reader can tell "this is everything" from "this is what we kept", which is the difference
-between an absent field and a truncated one.
+`--body-cap-bytes` (default `262144`, i.e. 256 KB) bounds the capture independently of the policy,
+**per body**. `events.capture_complete` records whether what was stored is the whole thing or was
+narrowed — so a reader can tell "this is everything" from "this is what we kept", which is the
+difference between an absent field and a truncated one. It covers **both** bodies: a request body cut
+at the cap clears it exactly as a response body does (br-GI-7-08). What the row does *not* record is
+which of the two was cut, so a surface that needs to say so infers it from the body's length against
+the cap in force — an inference that is only as good as the cap not having changed since, which is
+why the flag is the authoritative half and the length comparison only names the body.
+
+A second kind of content is stored, from a source that is not the wire: **`transcript_content` /
+`transcript_role`**, one assistant message's `content` from a Claude Code transcript
+([internal/jsonlogs](../../internal/jsonlogs/)). It is a *reconstruction* of intent rather than a
+capture — no system prompt, no tool schemas, nothing the proxy would have seen — which is why it
+lives in its own columns and is labelled as such in the UI rather than being written into `req_body`.
+It is the same class of data (a prompt and the files the agent read), so it is covered by the same
+protections: the same file, the same file permissions, the same retention and `clens purge`.
+
+The two capture controls above **do not reach it**, and whether that is intended is not recorded
+anywhere: `BodyPolicy` is read in exactly one place —
+[internal/proxy/proxy.go:59](../../internal/proxy/proxy.go#L59) — and `internal/jsonlogs` never
+consults it, so an install running `--body-policy off` still stores a transcript line's `content`
+whole and uncapped. Neither GI#7's plan nor `br-GI-7-06` mentions the policy, so this reads as an
+oversight rather than a choice: the bead set out to store transcript content and never asked what
+the existing content controls should do about it.
+
+> ❓ UNVERIFIED: whether the omission is deliberate. The behaviour is not in doubt — the code is
+> explicit — only the intent. Evidence that would settle it: a decision in the plan, a bead that
+> says so, or a test asserting the policy reaches source B.
+
+Before assuming the cap bounds what is in the database, check both sources.
 
 A body that is **not captured** is `NULL`, never an empty string, and the cost model applies the
 same principle to a cost it cannot compute: see [cost-and-quota.md](cost-and-quota.md).

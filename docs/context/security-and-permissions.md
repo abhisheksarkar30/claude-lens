@@ -143,6 +143,26 @@ A route that must write a credential reaches it through an **injected function-v
 (`SetCredentialWriter` → `secret.Save`), so there is no import edge a future handler could reach one
 back through. An unwired seam answers `503`, never an empty result.
 
+## Untrusted rendering (the dashboard)
+
+The dashboard builds HTML by string concatenation and assigns `innerHTML`, so escaping is a manual,
+load-bearing control rather than a framework's. Two inputs are attacker-influenced in the ordinary
+course of the tool's job, and both arrive from a **remote** endpoint rather than from the user:
+
+| Input | Where it is rendered | Control |
+|---|---|---|
+| response and request **bodies** | the call detail's `<details>` sections | `esc()` inside one top-level `bodySection` — a body is arbitrary bytes, so this is the surface that matters most |
+| stored **header** blobs | the same detail's `kv` tables | `esc()` per key and value in `headerRows` |
+
+The design rule is **one renderer per untrusted class**, so the escaping has one place to review
+rather than one per call site. A second call site is not a style question here: this page also holds
+a replay button that spends money, so an injected `<script>` is not merely a defaced dashboard.
+
+`internal/web/assets_test.go` guards it — `TestAssetsTheBodyRendererEscapes` fails if `esc(` leaves
+the renderer, and its doc states the ceiling plainly: with no JS runtime in this toolchain the test
+proves the escaping **call is present in the source**, not that the rendered pixels are safe. A
+change to body rendering should be re-checked by hand in a browser; the test cannot do it for you.
+
 ## Network posture
 
 **Nothing is fetched from the network by the dashboard.** No CDN, no webfont, no analytics — the

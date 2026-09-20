@@ -23,7 +23,7 @@ cost model.
 | Layer | Choice | Version | Evidence |
 |---|---|---|---|
 | Language | Go | 1.24.1 | [go.mod](../../go.mod) |
-| HTTP | stdlib `net/http` only | — | [internal/api/api.go:167](../../internal/api/api.go#L167) (`http.ServeMux`, Go 1.22 method patterns) |
+| HTTP | stdlib `net/http` only | — | [internal/api/api.go:184](../../internal/api/api.go#L184) (`http.ServeMux`, Go 1.22 method patterns) |
 | Storage | SQLite via `modernc.org/sqlite` (pure Go, no cgo) | v1.46.1 | [internal/store/store.go:22](../../internal/store/store.go#L22) (blank import) |
 | Decompression | `klauspost/compress/zstd`, `andybalholm/brotli` | v1.17.11, v1.1.1 | [internal/decode/decode.go](../../internal/decode/decode.go) |
 | Dashboard assets | `go:embed`-ed HTML/CSS/JS, no build step | — | [internal/web/embed.go](../../internal/web/embed.go) |
@@ -197,7 +197,7 @@ impact is tabulated in [integrations-and-external-services.md](integrations-and-
 ## Where to look next
 
 - [internal/api/api.go:1](../../internal/api/api.go#L1) — the package doc: the route table and the seam rules.
-- [internal/store/schema.sql](../../internal/store/schema.sql) — every table, one file, no migrations. See [storage-schema.md](storage-schema.md).
+- [internal/store/schema.sql](../../internal/store/schema.sql) — every table, one file, plus the `PRAGMA user_version` migration runner in [internal/store/store.go](../../internal/store/store.go). See [storage-schema.md](storage-schema.md).
 - [internal/analyze/kinds.go](../../internal/analyze/kinds.go) — the one spelling of every warning kind.
 - [decisions/](decisions/000-index.md) — the architectural forks, and why the rejected side lost.
 - `CLAUDE.md` §Architecture essentials — the invariants in their shortest form.
