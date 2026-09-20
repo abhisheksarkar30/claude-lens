@@ -96,7 +96,7 @@ func TestAssetsTheFourNewTabsHaveTheirMountPoints(t *testing.T) {
 // TestAssetsChartsAreInlineSVG: the charts are built as SVG markup strings in
 // app.js -- no charting library, no image file, no canvas. The positive half
 // (each chart really emits an <svg>) matters as much as the negative half: a
-// chart function that quietly returns '' is a blank panel with no error.
+// chart function that quietly returns ” is a blank panel with no error.
 func TestAssetsChartsAreInlineSVG(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
@@ -355,6 +355,14 @@ func clickBranch(js, anchor string) (pre, catch string, ok bool) {
 // declaration per block with unindented closing braces, which is what makes
 // this two-line scan enough; it is a test helper, not a parser.
 func funcBody(js, name string) (string, bool) {
+	// Normalized to LF before slicing. app.js is LF in the repository, but a
+	// Windows checkout with core.autocrlf=true hands this function CRLF -- and
+	// then the "\n}\n" terminator below never matches, so the slice silently
+	// runs to the end of the file and every caller's assertions are made
+	// against that tail instead of one function. They do not fail; they pass
+	// vacuously, which is worse. Normalizing here fixes all callers at once
+	// rather than asking each one to remember.
+	js = strings.ReplaceAll(js, "\r\n", "\n")
 	start := strings.Index(js, "function "+name+"(")
 	if start < 0 {
 		return "", false
@@ -394,5 +402,94 @@ func TestAssetsTheBadgeIsInTheHeader(t *testing.T) {
 	}
 	if !strings.Contains(readAsset(t, "app.js"), "$('proxy-mode')") {
 		t.Error("app.js never looks up the proxy-mode badge")
+	}
+}
+
+// TestAssetsTheBodyRendererEscapes (br-GI-7-04, T6) is a source-shape
+// assertion, not a behavioural one.
+//
+// The ceiling, stated rather than implied: there is no JS runtime in this
+// toolchain and no dependency here is a JS engine -- this file is regex and
+// text over the embedded bytes -- so what follows proves the escaping *call is
+// present in the source*, not that the rendered pixels are safe. That is the
+// strongest guarantee the no-build-step, no-browser-automation posture allows.
+//
+// It is worth having anyway, because the thing it guards is the story's one
+// real vulnerability: bodies are arbitrary bytes from a remote endpoint going
+// into innerHTML, on a page that also holds a replay button that spends money.
+// A body containing </script> or <img onerror=...> is a live injection path,
+// and "every body goes through one esc()" is only true while it stays true.
+func TestAssetsTheBodyRendererEscapes(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body, ok := funcBody(js, "bodySection")
+	if !ok {
+		t.Fatal("app.js has no top-level bodySection: the body renderer must be one function so esc() has one home")
+	}
+	// The vacuity guard, first: a rename that defeats the extraction would
+	// otherwise leave every assertion below passing on an empty string.
+	if strings.TrimSpace(body) == "" {
+		t.Fatal("bodySection sliced out empty -- the extraction is broken, not the renderer")
+	}
+	if !strings.Contains(body, "bytesB64") {
+		t.Fatalf("the bodySection slice does not mention its body parameter, so it is not the renderer:\n%s", body)
+	}
+	if !strings.Contains(body, "esc(") {
+		t.Error("bodySection never calls esc(): a body goes into innerHTML unescaped")
+	}
+
+	// The read-path markers, and the order they are selected in. An unwired cap
+	// has to be checked before the completeness is consulted, or a body that
+	// decodes fine gets labelled "would not decompress" merely because nobody
+	// wired the cap -- the missing cap is not evidence about the bytes. This is
+	// positional rather than symbolic because the defect is exactly an
+	// ordering one, and no assertion on the strings alone can see it.
+	read, ok := funcBody(js, "readPathMarker")
+	if !ok {
+		t.Fatal("app.js has no top-level readPathMarker")
+	}
+	if strings.TrimSpace(read) == "" {
+		t.Fatal("readPathMarker sliced out empty -- the extraction is broken")
+	}
+	for _, want := range []string{
+		"response shown raw — read cap not configured",
+		"response truncated at the read cap of ",
+		"response decoded only partially — its tail was corrupt",
+		"response shown undecoded — it would not decompress",
+	} {
+		if !strings.Contains(read, want) {
+			t.Errorf("readPathMarker is missing the marker %q", want)
+		}
+	}
+	capAt := strings.Index(read, "BodyCapBytes")
+	completenessAt := strings.Index(read, "RespBodyCompleteness")
+	if capAt < 0 || completenessAt < 0 {
+		t.Fatalf("readPathMarker does not read both BodyCapBytes and RespBodyCompleteness:\n%s", read)
+	}
+	if capAt > completenessAt {
+		t.Error("readPathMarker consults RespBodyCompleteness before BodyCapBytes, so an unwired cap can manufacture the 'would not decompress' state")
+	}
+
+	// The capture-incomplete marker, which is the CLI's own wording the plan
+	// pins (show.go). CaptureComplete is false for either cause, so the line
+	// must not claim the cap unconditionally.
+	capture, ok := funcBody(js, "captureMarker")
+	if !ok {
+		t.Fatal("app.js has no top-level captureMarker")
+	}
+	if !strings.Contains(capture, "incomplete (truncated, or the stream ended early)") {
+		t.Error("captureMarker does not carry the CLI's own wording for an incomplete capture")
+	}
+
+	// Both transcript states. Both are asserted because both are reachable on
+	// the same row type and a single label would silently reclassify the other:
+	// a row with content is a reconstruction, a row without is an absence.
+	for _, want := range []string{
+		"not captured — transcript source",
+		"reconstructed from transcript — not a wire capture",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js is missing the transcript state %q", want)
+		}
 	}
 }

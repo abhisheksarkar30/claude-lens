@@ -104,6 +104,107 @@ function cards(container, items) {
 
 const mono = (s) => '<code>' + esc(s) + '</code>';
 
+// ------------------------------------------------------------------- bodies
+
+// decode.Completeness crosses the wire as its integer value: the type has a
+// String() for the server's own logs but no MarshalJSON, so encoding/json
+// writes 0/1/2/3. Named here so the marker branches below read as the states
+// they are rather than as magic numbers.
+const COMPLETE = 0;
+const TRUNCATED_AT_CAP = 1;
+const PARTIAL_CORRUPT = 2;
+const NOT_DECODED = 3;
+
+// wireBytes turns the base64 encoding/json uses for a Go []byte into the bytes
+// themselves. A body is arbitrary bytes, not necessarily text -- a compressed
+// stream that would not decompress is stored raw -- so the byte count comes
+// from the decoded length and the text decode is told to substitute rather
+// than throw.
+function wireBytes(b64) {
+  if (!b64) return new Uint8Array(0);
+  let bin;
+  try { bin = atob(b64); } catch (e) { return new Uint8Array(0); }
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+// bodySection renders one body: collapsed by default, byte count in the
+// summary, marker line above it so an incomplete body is never mistaken for a
+// whole one.
+//
+// This is the single place a body reaches innerHTML, which is the point. Bodies
+// are arbitrary bytes from a remote endpoint landing in a page that also holds
+// a replay button that spends money, so it is the story's one real injection
+// surface and it has one esc() to review rather than one per call site. label
+// and marker are literals from this file -- never wire data -- so esc() wraps
+// the one thing that is.
+function bodySection(label, bytesB64, marker) {
+  const bytes = wireBytes(bytesB64);
+  const head = marker ? '<p class="body-marker">' + marker + '</p>' : '';
+  return head + '<details class="body"><summary>' + label + ' — ' + fmtInt(bytes.length) +
+    ' bytes</summary>' +
+    '<pre class="body-text">' + esc(new TextDecoder('utf-8').decode(bytes)) + '</pre></details>';
+}
+
+// headerRows renders a stored header blob as kv rows. Redaction ran before the
+// row was written, so "[redacted]" is the redactor's own output and is shown as
+// such: hiding it would make a redacted credential look like an absent one,
+// which is a different claim. A blob that will not parse is labelled, never
+// silently rendered as an empty table.
+function headerRows(label, blob) {
+  const heading = '<h3>' + esc(label) + '</h3>';
+  if (!blob) return heading + '<p class="muted">no headers stored on this row</p>';
+  let h;
+  try { h = JSON.parse(blob); } catch (e) {
+    return heading + '<p class="muted">stored headers are not parseable</p>';
+  }
+  const rows = Object.keys(h).sort().map((k) =>
+    '<tr><th>' + esc(k) + '</th><td>' + esc((h[k] || []).join(', ')) + '</td></tr>').join('');
+  return rows ? heading + '<table class="kv">' + rows + '</table>'
+    : heading + '<p class="muted">no headers stored on this row</p>';
+}
+
+// readPathMarker says how the response body on screen relates to the bytes that
+// were stored, or '' when it is the whole thing and needs no caveat.
+//
+// BodyCapBytes is checked FIRST, before RespBodyCompleteness is consulted. With
+// the cap unwired the server never decoded at all and reports Complete by
+// construction, so ordering it second would mostly work -- and would then
+// render "would not decompress" for a body that decompresses fine the moment a
+// stale completeness rode along on an unwired response. A missing cap is not
+// evidence about the bytes.
+function readPathMarker(e) {
+  if (!e.BodyCapBytes) return 'response shown raw — read cap not configured';
+  if (e.RespBodyCompleteness === TRUNCATED_AT_CAP) {
+    return 'response truncated at the read cap of ' + fmtInt(e.BodyCapBytes) + ' bytes';
+  }
+  if (e.RespBodyCompleteness === PARTIAL_CORRUPT) {
+    return 'response decoded only partially — its tail was corrupt';
+  }
+  if (e.RespBodyCompleteness === NOT_DECODED) {
+    return 'response shown undecoded — it would not decompress';
+  }
+  return '';
+}
+
+// captureMarker reports a capture the proxy could not finish, in the CLI's own
+// wording. CaptureComplete is false for either cause -- a body cut at the cap,
+// or a stream that ended without message_stop -- so the line names the cap only
+// in the one case where it is knowably the cause, and says so plainly when the
+// row does not record which of the two it was. Claiming the cap unconditionally
+// would be a second, quieter defect in the thing that exists to report the
+// first.
+function captureMarker(e) {
+  if (e.CaptureComplete) return '';
+  const n = wireBytes(e.RespBody).length;
+  if (e.BodyCapBytes && n === e.BodyCapBytes) {
+    return 'incomplete (truncated, or the stream ended early) — the stored body is exactly the ' +
+      fmtInt(e.BodyCapBytes) + '-byte read cap, so the cap is the cause on this row';
+  }
+  return 'incomplete (truncated, or the stream ended early) — the row does not record which cause';
+}
+
 // --------------------------------------------------------- list/detail modes
 
 // Selecting a call shows the detail *instead of* the list it was clicked in:
@@ -193,12 +294,33 @@ async function showCall(id, seq) {
     '<li><strong>' + esc(w.Kind) + '</strong> <span class="sev-' + esc(w.Severity) + '">' +
     esc(w.Severity) + '</span> ' + esc(w.Detail) + '</li>').join('');
 
+  // A transcript row has no *wire* bodies because transcripts have none, not
+  // because capture failed -- and it carries no headers at all, so it gets no
+  // header tables, the same distinction sources.go draws for collector health.
+  // Its content, when br-GI-7-06 filled the row, is one assistant message: a
+  // reconstruction of intent, not the request that produced it, so it is
+  // labelled as neither half of the exchange. The two transcript states are
+  // separate because absent content means "written before that bead, or from a
+  // non-assistant line" -- a different claim from "reconstructed, and empty".
+  const sections = e.Source === 'jsonl'
+    ? (e.TranscriptContent
+      ? bodySection('reconstructed from transcript — not a wire capture', e.TranscriptContent, '')
+      : '<p class="muted">not captured — transcript source</p>')
+    : headerRows('Request headers', e.ReqHeaders) +
+      headerRows('Response headers', e.RespHeaders) +
+      bodySection('Request body', e.ReqBody, '') +
+      bodySection('Response body', e.RespBodyDecoded, readPathMarker(e));
+
+  const capture = captureMarker(e);
+
   // Only now, once there is a detail to show: flipping the mode before the
   // fetch resolves would blank the list for a request that may still fail.
   setCallDetail(true);
   $('call-detail').innerHTML =
     '<p><button type="button" id="call-back">‹ all calls</button></p>' +
     '<h2>Call ' + esc(e.ID) + '</h2><table class="kv">' + details + '</table>' +
+    (capture ? '<p class="body-marker">' + capture + '</p>' : '') +
+    sections +
     (warnings ? '<h3>Warnings</h3><ul>' + warnings + '</ul>' : '') +
     '<h3>Replay</h3><div class="row">' +
     '<label>set <input id="replay-set" placeholder="max_tokens=250"></label>' +
