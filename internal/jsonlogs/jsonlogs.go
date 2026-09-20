@@ -114,6 +114,18 @@ type Tailer struct {
 	apiPrefixes    []string
 	apiAccount     string
 	apiBillingMode string
+
+	// bodyPolicy/bodyCapBytes govern transcript_content, the same way
+	// config.BodyPolicy/BodyCapBytes govern the proxy's req_body/resp_body.
+	// br-GI-7-06 added the columns and never asked what the existing content
+	// controls should do about them, so under --body-policy off this collector
+	// used to store a transcript line's content whole and uncapped.
+	//
+	// bodyCapBytes <= 0 means no cap, which is the unwired default: a caller
+	// that forgets the seam stores content whole rather than silently
+	// truncating every transcript to zero bytes.
+	bodyPolicy   string
+	bodyCapBytes int
 }
 
 // New returns a Tailer walking root, writing to st. Every optional seam
@@ -122,13 +134,34 @@ type Tailer struct {
 // Claude Code's own transcripts are written by the subscription client in
 // the common case.
 func New(root string, st Store) *Tailer {
-	return &Tailer{root: root, st: st, billingMode: "subscription"}
+	// bodyPolicy seeds "full" for the same reason billingMode seeds
+	// "subscription": the zero value of a policy is not a policy, and a
+	// tailer built without the seam should capture, not silently stop.
+	return &Tailer{root: root, st: st, billingMode: "subscription", bodyPolicy: "full"}
 }
 
 func (t *Tailer) SetSessionRecorder(r SessionRecorder) { t.recorder = r }
 func (t *Tailer) SetAnalyzers(analyzers ...Analyzer)   { t.analyzers = analyzers }
 func (t *Tailer) SetSessionRule(r SessionRule)         { t.sessionRule = r }
 func (t *Tailer) SetPriceTable(p PriceComputer)        { t.pricer = p }
+
+// SetBodyPolicy applies the proxy's body policy to this collector's
+// transcript_content column. It mirrors SetPriceTable and SetAccount: config
+// stays out of this package, and the one caller that knows the operator's
+// settings is the one that wires it.
+//
+// capBytes <= 0 means no cap. "off" stores no content at all -- the column
+// stays NULL, which is the same meaning a non-assistant line's empty
+// transcript_content already carries.
+func (t *Tailer) SetBodyPolicy(policy string, capBytes int) {
+	t.bodyPolicy = policy
+	t.bodyCapBytes = capBytes
+}
+
+// BodyPolicy reports the policy and cap this tailer was wired with.
+func (t *Tailer) BodyPolicy() (policy string, capBytes int) {
+	return t.bodyPolicy, t.bodyCapBytes
+}
 
 // SetAccount fixes the account/billing_mode every row from this tailer
 // gets. It assigns unconditionally, so a caller that passes a zero Account
@@ -408,8 +441,17 @@ func (t *Tailer) buildEvent(l *line, f walkedFile) (*store.Event, parse.Meta, pa
 	// which means "no transcript reconstruction", never a faked empty string.
 	// req_body is deliberately left alone: this is a reconstruction, not a
 	// capture, and the merge has precedence rules for that column.
-	if l.Message != nil {
-		ev.TranscriptContent = l.Message.Content
+	//
+	// The body policy bounds it, the way it bounds the proxy's two bodies, and
+	// "off" stores none of it -- an install that asked for no content should
+	// not get a transcript line's content whole and uncapped (br-GI-7-09).
+	// CaptureComplete is deliberately NOT cleared when the content is capped:
+	// that flag is about the two *teed* bodies, and a jsonl row that lost the
+	// merge token pick over a column the merge never reads for tokens would be
+	// a claim about a capture this row never made. The truncation is visible
+	// the way a body's is -- stored length against BodyCapBytes on the wire.
+	if l.Message != nil && t.bodyPolicy != "off" {
+		ev.TranscriptContent = capContent(l.Message.Content, t.bodyCapBytes)
 		ev.TranscriptRole = l.Message.Role
 	}
 
@@ -425,6 +467,18 @@ func (t *Tailer) buildEvent(l *line, f walkedFile) (*store.Event, parse.Meta, pa
 	}
 
 	return ev, meta, usage
+}
+
+// capContent narrows a transcript line's content to at most capBytes, the way
+// the proxy's boundedBuffer narrows a body. A non-positive cap means no cap:
+// the proxy cannot express that state (config.Validate rejects a zero
+// BodyCapBytes), but this tailer can be built without the seam, and
+// "unconfigured" must not read as "truncate everything to nothing".
+func capContent(content []byte, capBytes int) []byte {
+	if capBytes <= 0 || len(content) <= capBytes {
+		return content
+	}
+	return content[:capBytes]
 }
 
 func parseTimestamp(s string) time.Time {

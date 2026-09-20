@@ -614,6 +614,41 @@ func TestNewTailerGuardKeepsTheSeededBillingMode(t *testing.T) {
 	}
 }
 
+// TestNewTailerWiresTheBodyPolicy is br-GI-7-09's wiring half, read back through
+// the Tailer's BodyPolicy() accessor.
+//
+// The seam is the whole point: internal/jsonlogs deliberately does not import
+// internal/config, so the policy can only arrive from this one helper. Deleting
+// the wiring line leaves the tailer on its seeded "full" default, which is
+// exactly the state the bead was written about -- an install running
+// --body-policy off still storing transcript content whole. Asserting the
+// tailer's *own* behaviour would pass either way; only reading back what
+// newTailer wired can fail.
+func TestNewTailerWiresTheBodyPolicy(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+
+	cfg := config.Default()
+	cfg.BodyPolicy = "off"
+	cfg.BodyCapBytes = 4096
+
+	policy, capBytes := newTailer(cfg, t.TempDir(), st).BodyPolicy()
+	if policy != "off" || capBytes != 4096 {
+		t.Errorf("BodyPolicy() = (%q, %d), want (off, 4096) -- newTailer did not wire the configured policy",
+			policy, capBytes)
+	}
+
+	// And it is the configured value, not a constant: a second, different
+	// config must come back different, or the assertion above would pass on a
+	// hard-coded "off".
+	cfg.BodyPolicy = "full"
+	cfg.BodyCapBytes = 1024
+	policy, capBytes = newTailer(cfg, t.TempDir(), st).BodyPolicy()
+	if policy != "full" || capBytes != 1024 {
+		t.Errorf("BodyPolicy() = (%q, %d), want (full, 1024)", policy, capBytes)
+	}
+}
+
 // T14: newTailer consumes resolvedAPIPrefixes rather than a hand-rolled list,
 // in both directions. Read through the ModelBilling() accessor beside
 // Account(). Dropping the resolver from newTailer -- so that the shipped

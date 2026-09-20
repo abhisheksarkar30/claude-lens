@@ -37,7 +37,18 @@ func captureOne(t *testing.T, sk *sink.Sink) *sink.CapturedCall {
 // last SSE event until released, the client must see the first event
 // before the last one is written — proof the proxy never buffers the
 // stream to inspect it.
+//
+// Both policies, because they are two different wrappers on the response body
+// now: the tee under "full", and a bare pass-through closer under "off". The
+// off path is the one br-GI-7-09 added to the hot path, so the gate has to
+// cover it or the new wrapper is the only one on the stream without proof.
 func TestNoBufferingSSE(t *testing.T) {
+	for _, policy := range []string{"full", "off"} {
+		t.Run(policy, func(t *testing.T) { testNoBufferingSSE(t, policy) })
+	}
+}
+
+func testNoBufferingSSE(t *testing.T, policy string) {
 	release := make(chan struct{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -51,8 +62,10 @@ func TestNoBufferingSSE(t *testing.T) {
 	}))
 	defer upstream.Close()
 
+	cfg := testConfig(upstream.URL)
+	cfg.BodyPolicy = policy
 	sk := sink.New(16)
-	h, err := New(testConfig(upstream.URL), sk)
+	h, err := New(cfg, sk)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,6 +219,96 @@ func TestBodyCapTruncation(t *testing.T) {
 // the request. Every other fixture in that story truncates a response, which
 // is why none of them could reach it.
 //
+// TestCaptureRecordsUnderPolicyOff is the assertion that fails at the *sink*
+// under the defect it was written for, not inside a handler: `New` used to
+// return the bare ReverseProxy when BodyPolicy was "off", before the closure
+// that injects captureState existed, so no row reached the sink at all and
+// nothing downstream could notice -- the row was simply absent.
+//
+// The banner at cli/serve.go promises "calls are recorded without their
+// bodies". This is that promise, in the only place it can be checked: a row
+// must arrive, must carry the metadata, and must carry no bodies.
+func TestCaptureRecordsUnderPolicyOff(t *testing.T) {
+	const reqBody = `{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}]}`
+	const respBody = `{"id":"msg_1","usage":{"input_tokens":5,"output_tokens":2}}`
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Request-Id", "req_off_policy")
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(respBody))
+	}))
+	defer upstream.Close()
+
+	cfg := testConfig(upstream.URL)
+	cfg.BodyPolicy = "off"
+	sk := sink.New(16)
+	h, err := New(cfg, sk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxySrv := httptest.NewServer(h)
+	defer proxySrv.Close()
+
+	req, err := http.NewRequest(http.MethodPost, proxySrv.URL+"/v1/messages",
+		strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-ant-secret-value")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The pass-through wrapper must not alter what the client sees: it exists
+	// only so onClose can fire, and this is the assertion that fails if it is
+	// ever given a buffer.
+	got, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != respBody {
+		t.Fatalf("client received %q under policy off, want %q", got, respBody)
+	}
+
+	// captureOne fails the test on the 2s timeout, which is exactly the
+	// off-policy failure mode: no row, ever.
+	call := captureOne(t, sk)
+
+	if call.ReqBody != nil || call.RespBody != nil {
+		t.Errorf("bodies captured under policy off: ReqBody=%q RespBody=%q, want both nil",
+			call.ReqBody, call.RespBody)
+	}
+	if call.Status != http.StatusOK {
+		t.Errorf("Status = %d, want 200", call.Status)
+	}
+	// True because nothing was *narrowed*: an absent body is the policy's
+	// doing, not a cap's or a stream's. False here would fire
+	// stream_incomplete on every 200 and cost every off-policy row the merge
+	// token pick, neither of which has anything to do with a body.
+	if !call.CaptureComplete {
+		t.Error("CaptureComplete = false under policy off, want true (nothing was truncated)")
+	}
+	// The metadata half is the whole point of keeping the row: method, path,
+	// status, timing and headers must all survive the narrowed capture.
+	if call.Method != http.MethodPost || call.Path != "/v1/messages" || call.TTFB <= 0 {
+		t.Errorf("metadata lost: method=%q path=%q ttfb=%v", call.Method, call.Path, call.TTFB)
+	}
+	if call.ReqHeaders.Get("Content-Type") != "application/json" {
+		t.Errorf("req headers lost under policy off: %v", call.ReqHeaders)
+	}
+	if call.RespHeaders.Get("Request-Id") != "req_off_policy" {
+		t.Errorf("resp headers lost under policy off: %v", call.RespHeaders)
+	}
+	// Redaction is unconditional, and the off path is the one an operator
+	// chose *because* they care about what is stored: a route around it here
+	// would leak the credential the policy was set to protect.
+	if got := call.ReqHeaders.Get("Authorization"); strings.Contains(got, "sk-ant-secret-value") {
+		t.Errorf("Authorization not redacted under policy off: %q", got)
+	}
+}
+
 // All the cases are one table on purpose. The regression this guards is as
 // much "the response half stopped being checked" as "the request half is not",
 // and a request-only test would let the first through.

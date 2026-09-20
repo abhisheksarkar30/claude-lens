@@ -96,7 +96,8 @@ func TestAssetsTheFourNewTabsHaveTheirMountPoints(t *testing.T) {
 // TestAssetsChartsAreInlineSVG: the charts are built as SVG markup strings in
 // app.js -- no charting library, no image file, no canvas. The positive half
 // (each chart really emits an <svg>) matters as much as the negative half: a
-// chart function that quietly returns '' is a blank panel with no error.
+// chart function that quietly returns an empty string is a blank panel with
+// no error.
 func TestAssetsChartsAreInlineSVG(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
@@ -500,5 +501,33 @@ func TestAssetsTheBodyRendererEscapes(t *testing.T) {
 		if !strings.Contains(js, want) {
 			t.Errorf("app.js is missing the transcript state %q", want)
 		}
+	}
+
+	// The third content column needs the third marker (br-GI-7-09).
+	// transcript_content is bounded by the same cap the bodies are, so without
+	// this a reconstruction cut at the cap renders identically to a whole one --
+	// the defect this story exists to close, on the column the bodies' marker
+	// does not reach.
+	tcap, ok := funcBody(js, "transcriptCapMarker")
+	if !ok {
+		t.Fatal("app.js has no top-level transcriptCapMarker: capped transcript content is unmarked")
+	}
+	if strings.TrimSpace(tcap) == "" {
+		t.Fatal("transcriptCapMarker sliced out empty -- the extraction is broken")
+	}
+	if !strings.Contains(tcap, "BodyCapBytes") || !strings.Contains(tcap, "TranscriptContent") {
+		t.Error("transcriptCapMarker does not compare the stored transcript against the read cap")
+	}
+	// The negative half, which is the half that matters: the marker must not be
+	// driven by CaptureComplete. That flag is about the two teed bodies, and a
+	// jsonl row whose content was capped has truncated no capture -- wiring the
+	// two together would label every capped reconstruction as a broken capture.
+	if strings.Contains(tcap, "CaptureComplete") {
+		t.Error("transcriptCapMarker keys off CaptureComplete: a capped transcript is not a truncated capture")
+	}
+	// ...and the same reasoning the bodies' marker follows: an unwired cap is
+	// not evidence about the bytes, so it is checked before any comparison.
+	if strings.Index(tcap, "BodyCapBytes") > strings.Index(tcap, "TranscriptContent") {
+		t.Error("transcriptCapMarker compares TranscriptContent before checking BodyCapBytes is wired")
 	}
 }

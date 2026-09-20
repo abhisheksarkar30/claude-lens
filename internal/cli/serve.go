@@ -406,8 +406,14 @@ func credentialState(name string) api.Credential {
 }
 
 // printBanner prints the copy-pasteable ANTHROPIC_BASE_URL line, the dashboard
-// URL, and -- when body capture is off -- the standing "nothing is being
-// recorded" warning.
+// URL, and -- when body capture is off -- the standing warning that calls are
+// recorded without their bodies. It says "without their bodies" and not
+// "nothing is being recorded" because that is what the code does: since
+// br-GI-7-09 the proxy still writes a row under "off", carrying method, path,
+// status, timing and redacted headers, with both body columns NULL. Before
+// that fix this comment and the string below disagreed, and the code matched
+// the comment -- an operator setting the most private policy lost the records
+// too.
 func printBanner(w io.Writer, cfg *config.Config) {
 	fmt.Fprintln(w, "claude-lens is running.")
 	fmt.Fprintf(w, "  export ANTHROPIC_BASE_URL=http://%s\n", cfg.ProxyAddr)

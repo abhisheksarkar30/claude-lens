@@ -673,3 +673,89 @@ func TestPollStoresTranscriptContentInItsOwnColumns(t *testing.T) {
 		t.Errorf("TranscriptRole = %q, want assistant -- the role is the transcript's own", empty.TranscriptRole)
 	}
 }
+
+// TestTranscriptContentObeysTheBodyPolicy is br-GI-7-09's half of the content
+// contract, and it is a table because the three cases are one decision seen from
+// three sides: the policy narrows *content*, and CaptureComplete is not the
+// column that records it.
+//
+// The bead exists because br-GI-7-06 added this column and never asked what
+// --body-policy should do about it, so an install running `off` stored a
+// transcript line's content whole and uncapped. Every row here is the same
+// fixture under a different wiring, so a regression in the wiring cannot hide
+// behind a different fixture.
+func TestTranscriptContentObeysTheBodyPolicy(t *testing.T) {
+	const content = `[{"type":"text","text":"a reconstruction longer than eight bytes"}]`
+	const line = `{"type":"assistant","sessionId":"s1","requestId":"req_policy",` +
+		`"message":{"role":"assistant","model":"m","content":` + content +
+		`,"usage":{"input_tokens":1,"output_tokens":1}}}`
+
+	tests := []struct {
+		name         string
+		policy       string
+		capBytes     int
+		wantContent  string
+		wantComplete bool
+		why          string
+	}{
+		{
+			name: "off stores no content", policy: "off", capBytes: 262144,
+			wantContent: "", wantComplete: true,
+			why: "the column stays NULL, the same meaning a non-assistant line already carries",
+		},
+		{
+			name: "full caps at the configured size", policy: "full", capBytes: 8,
+			wantContent: content[:8], wantComplete: true,
+			why: "a capped *reconstruction* is not a truncated *capture*",
+		},
+		{
+			name: "an unwired cap means no cap", policy: "full", capBytes: 0,
+			wantContent: content, wantComplete: true,
+			why: "a caller that forgets the seam must not truncate every transcript to zero bytes",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "log.jsonl")
+			writeLine(t, path, line)
+
+			st := newTestStore(t)
+			ctx := context.Background()
+			tr := New(root, st)
+			tr.SetBodyPolicy(tt.policy, tt.capBytes)
+			if _, err := tr.Poll(ctx); err != nil {
+				t.Fatalf("Poll: %v", err)
+			}
+
+			rows, err := st.ListEventsFull(ctx, store.EventFilter{})
+			if err != nil {
+				t.Fatalf("ListEventsFull: %v", err)
+			}
+			if len(rows) != 1 {
+				t.Fatalf("got %d rows, want 1", len(rows))
+			}
+			got := rows[0]
+
+			if string(got.TranscriptContent) != tt.wantContent {
+				t.Errorf("TranscriptContent = %q, want %q (%s)",
+					got.TranscriptContent, tt.wantContent, tt.why)
+			}
+			// The assertion that fails if someone later wires the flag to the
+			// cap. CaptureComplete describes the two *teed* bodies: a jsonl row
+			// whose content was narrowed has truncated no capture, and a false
+			// here would cost it the merge token pick over a column the merge
+			// never reads for tokens.
+			if got.CaptureComplete != tt.wantComplete {
+				t.Errorf("CaptureComplete = %v, want %v (%s)",
+					got.CaptureComplete, tt.wantComplete, tt.why)
+			}
+			// The role is never narrowed: it is one word, it is the
+			// transcript's own, and it is what makes the content legible.
+			if tt.policy != "off" && got.TranscriptRole != "assistant" {
+				t.Errorf("TranscriptRole = %q, want assistant", got.TranscriptRole)
+			}
+		})
+	}
+}

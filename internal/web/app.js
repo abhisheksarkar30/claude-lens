@@ -223,6 +223,26 @@ function captureMarker(e) {
     ' exactly the ' + fmtInt(e.BodyCapBytes) + '-byte read cap, so the cap is the cause on this row';
 }
 
+// transcriptCapMarker is captureMarker's counterpart for the third content
+// column. transcript_content is bounded by the same --body-cap-bytes the two
+// bodies are (br-GI-7-09), and without this a reconstruction cut at the cap
+// would render identically to a whole one -- the "a truncated capture and a
+// complete one look identical" defect this story exists to close, reintroduced
+// on the column the bodies' marker does not cover.
+//
+// It is deliberately NOT driven by CaptureComplete: that flag is about the two
+// teed bodies, and a capped transcript has not truncated any capture. Length
+// against the cap is the only signal there is, and it is the same one the
+// bodies use -- with the same caveat, that a content exactly the cap's length
+// might be a coincidence, which is why the wording says the cap is the cause
+// "on this row" rather than asserting it always is.
+function transcriptCapMarker(e) {
+  if (!e.BodyCapBytes) return '';
+  if (wireBytes(e.TranscriptContent).length !== e.BodyCapBytes) return '';
+  return 'reconstruction capped at the ' + fmtInt(e.BodyCapBytes) +
+    '-byte read cap — the transcript line carried more than this';
+}
+
 // --------------------------------------------------------- list/detail modes
 
 // Selecting a call shows the detail *instead of* the list it was clicked in:
@@ -318,11 +338,14 @@ async function showCall(id, seq) {
   // Its content, when br-GI-7-06 filled the row, is one assistant message: a
   // reconstruction of intent, not the request that produced it, so it is
   // labelled as neither half of the exchange. The two transcript states are
-  // separate because absent content means "written before that bead, or from a
-  // non-assistant line" -- a different claim from "reconstructed, and empty".
+  // separate because absent content means one of three things -- written before
+  // that bead, a non-assistant line, or br-GI-7-09's --body-policy off -- which
+  // is a different claim from "reconstructed, and empty". The row does not
+  // record which, so the copy names none of them.
   const sections = e.Source === 'jsonl'
     ? (e.TranscriptContent
-      ? bodySection('reconstructed from transcript — not a wire capture', e.TranscriptContent, '')
+      ? bodySection('reconstructed from transcript — not a wire capture', e.TranscriptContent,
+        transcriptCapMarker(e))
       : '<p class="muted">not captured — transcript source</p>')
     : headerRows('Request headers', e.ReqHeaders) +
       headerRows('Response headers', e.RespHeaders) +
