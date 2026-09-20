@@ -58,14 +58,14 @@ func runShow(args []string, w io.Writer) error {
 		{"session", displayOrDash(ev.SessionID)},
 		{"project", displayOrDash(ev.Project)},
 		{"branch", displayOrDash(ev.GitBranch)},
-		{"model", displayModel(ev)},
-		{"status", statusCell(ev)},
+		{"model", displayModel(&ev.EventSummary)},
+		{"status", statusCell(&ev.EventSummary)},
 		{"stop", displayOrDash(ev.StopCategory)},
 		{"billing", ev.BillingMode},
 		{"account", displayOrDash(ev.Account)},
 		{"service", displayOrDash(ev.ServiceTier)},
 		{"speed", displayOrDash(ev.Speed)},
-		{"tokens", tokenLine(ev)},
+		{"tokens", tokenLine(&ev.EventSummary)},
 		{"cost", costCell(ev.CostUSD, ev.ApiEquivalentCostUSD) + costNote(ev.CostSource)},
 	}
 	if ev.ReplayOf != "" {
@@ -113,7 +113,7 @@ func runShow(args []string, w io.Writer) error {
 
 // tokenLine spells out every token class, because the classes are priced
 // separately (invariant 4): a reader who only sees in/out cannot check a cost.
-func tokenLine(ev *store.Event) string {
+func tokenLine(ev *store.EventSummary) string {
 	return fmt.Sprintf(
 		"prompt=%s (in=%s cache-w5m=%s cache-w1h=%s cache-r=%s) out=%s thinking=%s",
 		humanTokens(ev.TotalPromptTokens), humanTokens(ev.InputTokens),

@@ -46,7 +46,12 @@ import (
 // an interface, not a concrete type).
 type Store interface {
 	GetEvent(ctx context.Context, id int64) (*store.Event, error)
-	ListEvents(ctx context.Context, f store.EventFilter) ([]*store.Event, error)
+	ListEvents(ctx context.Context, f store.EventFilter) ([]*store.EventSummary, error)
+
+	// ListEventsFull is the replay poll's read: replay.OutcomeOf takes a whole
+	// row, so the poll -- one row per interval, not fifty per tab switch --
+	// names the full-width read explicitly.
+	ListEventsFull(ctx context.Context, f store.EventFilter) ([]*store.Event, error)
 	CountEvents(ctx context.Context, f store.EventFilter) (int, error)
 	EventWarnings(ctx context.Context, eventID int64) ([]store.Warning, error)
 	ListWarnings(ctx context.Context, f store.WarningFilter) ([]store.Warning, error)
@@ -55,7 +60,7 @@ type Store interface {
 	GetSession(ctx context.Context, id string) (*store.Session, error)
 	ListSessions(ctx context.Context, limit, offset int) ([]*store.Session, error)
 	CountSessions(ctx context.Context) (int, error)
-	SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error)
+	SessionEventsSummary(ctx context.Context, sessionID string) ([]*store.EventSummary, error)
 	StatsSummary(ctx context.Context, f store.EventFilter) (store.StatsSummary, error)
 	StatsByModel(ctx context.Context, f store.EventFilter) ([]store.ModelStats, error)
 	StatsByPeriod(ctx context.Context, f store.EventFilter, granularity string) ([]store.PeriodStats, error)
@@ -137,7 +142,9 @@ func (a *api) SetIngestTrigger(fn func(ctx context.Context) error) { a.ingestTri
 // SetSourceHealth wires GET /api/sources to fn, which reads per-collector
 // health out of internal/ingest. Leaving it unset is supported: the route
 // answers 503 rather than an empty list.
-func (a *api) SetSourceHealth(fn func(ctx context.Context) ([]SourceHealth, error)) { a.sourceHealth = fn }
+func (a *api) SetSourceHealth(fn func(ctx context.Context) ([]SourceHealth, error)) {
+	a.sourceHealth = fn
+}
 
 // SetAccounts wires GET /api/accounts (and the subscription half of
 // GET /api/quota) to fn, which reads the configured accounts out of
@@ -533,10 +540,12 @@ func (a *api) listSessions(w http.ResponseWriter, r *http.Request) {
 // cost totals, invariant 5) plus its calls and their combined warnings.
 type sessionDetail struct {
 	*store.Session
-	// Calls is chronological: store.SessionEvents already returns
+	// Calls is chronological: store.SessionEventsSummary already returns
 	// oldest-first (bounded by the session resolver's own gap window), so
-	// unlike deepseek-lens's getSession this needs no reversal.
-	Calls []*store.Event `json:"calls"`
+	// unlike deepseek-lens's getSession this needs no reversal. Summary rows,
+	// not full ones: this route renders a call list, and a session's rows can
+	// run to fifty 1 MB bodies the list never shows.
+	Calls []*store.EventSummary `json:"calls"`
 	// Warnings is the union of every warning raised across the session's
 	// calls, one entry per occurrence.
 	Warnings []store.Warning `json:"warnings"`
@@ -554,7 +563,7 @@ func (a *api) getSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	calls, err := a.store.SessionEvents(r.Context(), id)
+	calls, err := a.store.SessionEventsSummary(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

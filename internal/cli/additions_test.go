@@ -159,15 +159,14 @@ func TestModelsMarksUnpricedDistinctly(t *testing.T) {
 	home := withHome(t)
 	st := openTestStore(t, home)
 	ctx := context.Background()
-	_, _, err := st.InsertEvent(ctx, &store.Event{
+	_, _, err := st.InsertEvent(ctx, &store.Event{EventSummary: store.EventSummary{
 		RequestID:      "req_unpriced",
 		Source:         "proxy",
 		FirstSource:    "proxy",
 		BillingMode:    "api",
 		ModelRequested: "claude-unknown-model",
 		ModelResolved:  "claude-unknown-model",
-		CostSource:     "unpriced",
-	})
+		CostSource:     "unpriced"}})
 	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}

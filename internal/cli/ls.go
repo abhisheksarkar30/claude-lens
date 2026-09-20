@@ -40,19 +40,24 @@ func runLs(args []string, w io.Writer) error {
 		return fmt.Errorf("ls: %w", err)
 	}
 	ctx := context.Background()
-	events, err := st.ListEvents(ctx, store.EventFilter{
+	filter := store.EventFilter{
 		Model:       model,
 		Source:      source,
 		BillingMode: billing,
 		SessionID:   session,
 		Since:       sinceAt,
 		Limit:       limit,
-	})
-	if err != nil {
-		return fmt.Errorf("ls: %w", err)
 	}
 
+	// --json encodes each whole row, so it names the full-width read; dropping
+	// to the summary would silently delete the four header/body keys from a
+	// machine-readable contract. The table below renders scalars only and
+	// takes the cheaper projection.
 	if asJSON {
+		events, err := st.ListEventsFull(ctx, filter)
+		if err != nil {
+			return fmt.Errorf("ls: %w", err)
+		}
 		enc := json.NewEncoder(w)
 		for _, ev := range events {
 			if err := enc.Encode(ev); err != nil {
@@ -60,6 +65,11 @@ func runLs(args []string, w io.Writer) error {
 			}
 		}
 		return nil
+	}
+
+	events, err := st.ListEvents(ctx, filter)
+	if err != nil {
+		return fmt.Errorf("ls: %w", err)
 	}
 
 	now := time.Now()
@@ -102,7 +112,7 @@ func runLs(args []string, w io.Writer) error {
 // stop category for a jsonl row, which never made an HTTP call of its own.
 // A 4xx/5xx is prefixed with "!" so a failure is visible in a column of
 // numbers without reading each one.
-func statusCell(ev *store.Event) string {
+func statusCell(ev *store.EventSummary) string {
 	if ev.Source == "proxy" && ev.Status != 0 {
 		s := strconv.Itoa(ev.Status)
 		if ev.Status >= 400 {

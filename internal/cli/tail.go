@@ -81,7 +81,7 @@ func runTail(ctx context.Context, args []string, w io.Writer, interval time.Dura
 // printNew writes every event newer than since, oldest-first, and returns the
 // highest id in the page. ListEvents is newest-first, so the loop walks the
 // page backwards to keep the output in arrival order.
-func printNew(w io.Writer, events []*store.Event, since int64) int64 {
+func printNew(w io.Writer, events []*store.EventSummary, since int64) int64 {
 	var highest int64
 	for i := len(events) - 1; i >= 0; i-- {
 		ev := events[i]

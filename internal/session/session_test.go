@@ -89,15 +89,14 @@ func TestRecordCallFoldsIntoSessionTotals(t *testing.T) {
 	ctx := context.Background()
 
 	sessionID := r.Resolve(hashMeta("abc"), time.Unix(1700000000, 0))
-	ev := &store.Event{
+	ev := &store.Event{EventSummary: store.EventSummary{
 		RequestID:   "req-1",
 		Source:      "proxy",
 		FirstSource: "proxy",
 		StartedAt:   time.Unix(1700000000, 0),
 		SessionID:   sessionID,
 		InputTokens: 42,
-		PrefixHash:  strPtr("abc"),
-	}
+		PrefixHash:  strPtr("abc")}}
 	if _, _, err := st.InsertEvent(ctx, ev); err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}

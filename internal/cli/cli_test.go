@@ -41,7 +41,7 @@ func seedEvent(t *testing.T, st *store.Store, ev *store.Event) int64 {
 // apiRow and subRow are the two billing shapes the split tests need. The
 // figures are deliberately far apart so a merged total would be obvious.
 func apiRow(requestID string, cost float64) *store.Event {
-	return &store.Event{
+	return &store.Event{EventSummary: store.EventSummary{
 		RequestID:      requestID,
 		Source:         "proxy",
 		BillingMode:    "api",
@@ -54,9 +54,7 @@ func apiRow(requestID string, cost float64) *store.Event {
 		CostSource:     "shipped",
 		Status:         200,
 		Method:         "POST",
-		Path:           "/v1/messages",
-		ReqBody:        []byte(`{"model":"claude-sonnet-5","max_tokens":1024}`),
-	}
+		Path:           "/v1/messages"}, ReqBody: []byte(`{"model":"claude-sonnet-5","max_tokens":1024}`)}
 }
 
 func subRow(requestID string, equivalent float64) *store.Event {
@@ -652,5 +650,52 @@ func TestNewTailerWiresResolvedAPIPrefixes(t *testing.T) {
 	}
 	if account != "payg" || mode != "api" {
 		t.Errorf("ModelBilling = (%q, %q), want (payg, api)", account, mode)
+	}
+}
+
+// TestLsJSONKeepsBodyFields (T3, br-GI-7-01): `ls --json` is a
+// machine-readable contract that encodes each whole row, so its read must name
+// ListEventsFull explicitly. On the summary projection the four header/body
+// keys would vanish from the output with no error and no test failure -- the
+// exact class of silent contract change this bead exists to prevent.
+//
+// It decodes into store.Event rather than into a map, which also pins that
+// moving the scalar block into an embedded EventSummary left the wire keys
+// alone.
+func TestLsJSONKeepsBodyFields(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+	ev := apiRow("req_bodies", 1.0)
+	ev.ReqHeaders = `{"authorization":["[redacted]"]}`
+	ev.RespHeaders = `{"content-type":["application/json"]}`
+	ev.ReqBody = []byte(`{"model":"claude-sonnet-5"}`)
+	ev.RespBody = []byte(`{"type":"message"}`)
+	seedEvent(t, st, ev)
+
+	var buf bytes.Buffer
+	if err := runLs([]string{"--json"}, &buf); err != nil {
+		t.Fatalf("runLs --json: %v", err)
+	}
+	lines := nonEmptyLines(buf.String())
+	if len(lines) != 1 {
+		t.Fatalf("ls --json wrote %d lines, want 1:\n%s", len(lines), buf.String())
+	}
+	var got store.Event
+	if err := json.Unmarshal([]byte(lines[0]), &got); err != nil {
+		t.Fatalf("ls --json line is not a stored event: %v\n%s", err, lines[0])
+	}
+
+	for _, c := range []struct {
+		name      string
+		got, want string
+	}{
+		{"ReqHeaders", got.ReqHeaders, ev.ReqHeaders},
+		{"RespHeaders", got.RespHeaders, ev.RespHeaders},
+		{"ReqBody", string(got.ReqBody), string(ev.ReqBody)},
+		{"RespBody", string(got.RespBody), string(ev.RespBody)},
+	} {
+		if c.got != c.want {
+			t.Errorf("ls --json %s = %q, want %q", c.name, c.got, c.want)
+		}
 	}
 }

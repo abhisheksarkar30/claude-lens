@@ -23,7 +23,7 @@ func f64(v float64) *float64 { return &v }
 
 func insertAPIEvent(t *testing.T, st *store.Store, requestID, model string, startedAt time.Time, costUSD float64) int64 {
 	t.Helper()
-	id, _, err := st.InsertEvent(context.Background(), &store.Event{
+	id, _, err := st.InsertEvent(context.Background(), &store.Event{EventSummary: store.EventSummary{
 		RequestID:       requestID,
 		Source:          "proxy",
 		FirstSource:     "proxy",
@@ -33,8 +33,7 @@ func insertAPIEvent(t *testing.T, st *store.Store, requestID, model string, star
 		ModelResolved:   model,
 		CostUSD:         f64(costUSD),
 		CostSource:      "shipped",
-		CaptureComplete: true,
-	})
+		CaptureComplete: true}})
 	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
@@ -116,7 +115,7 @@ func TestReconcileComputedAndBilledNeverSummed(t *testing.T) {
 // ever compared and cost_drift can never fire.
 func TestReconcileSubscriptionOnlyNoDriftPossible(t *testing.T) {
 	st := newTestStore(t)
-	_, _, err := st.InsertEvent(context.Background(), &store.Event{
+	_, _, err := st.InsertEvent(context.Background(), &store.Event{EventSummary: store.EventSummary{
 		RequestID:            "req1",
 		Source:               "jsonl",
 		FirstSource:          "jsonl",
@@ -126,8 +125,7 @@ func TestReconcileSubscriptionOnlyNoDriftPossible(t *testing.T) {
 		ModelResolved:        "claude-sonnet-5",
 		ApiEquivalentCostUSD: f64(5.00),
 		CostSource:           "shipped",
-		CaptureComplete:      true,
-	})
+		CaptureComplete:      true}})
 	if err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}

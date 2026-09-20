@@ -258,7 +258,11 @@ func Serve(args []string) error {
 // one calls. proxy.RedactCheck takes one call's header JSON, so the scan is
 // this loop rather than a store method.
 func checkRedaction(ctx context.Context, st *store.Store, logf func(string, ...any)) {
-	events, err := st.ListEvents(ctx, store.EventFilter{Limit: redactScanLimit})
+	// ListEventsFull, not ListEvents: this check reads ReqHeaders to prove the
+	// redactor ran. On the summary projection ReqHeaders is not there to read,
+	// and a version that skipped every row would report zero findings — a
+	// security control silently disabled, with no error and no log.
+	events, err := st.ListEventsFull(ctx, store.EventFilter{Limit: redactScanLimit})
 	if err != nil {
 		logf("serve: redaction self-test: %v", err)
 		return

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -41,7 +42,7 @@ var seedCounter atomic.Int64
 func seedEvent(t *testing.T, st *store.Store, opts func(*store.Event)) *store.Event {
 	t.Helper()
 	cost := 0.01
-	ev := &store.Event{
+	ev := &store.Event{EventSummary: store.EventSummary{
 		RequestID:      "req_" + strconv.FormatInt(seedCounter.Add(1), 10),
 		Source:         "proxy",
 		FirstSource:    "proxy",
@@ -55,8 +56,7 @@ func seedEvent(t *testing.T, st *store.Store, opts func(*store.Event)) *store.Ev
 		CostSource:     "shipped",
 		Method:         "POST",
 		Path:           "/v1/messages",
-		Status:         200,
-	}
+		Status:         200}}
 	if opts != nil {
 		opts(ev)
 	}
@@ -390,5 +390,85 @@ func TestEmbeddedAssetsServedWithoutExternalFetch(t *testing.T) {
 	// The page the user opens is really the index page, not an empty shell.
 	if !strings.Contains(getOK(t, handler, "/").Body.String(), "<title>") {
 		t.Error("GET / did not serve the dashboard's index page")
+	}
+}
+
+// --- the list projections (br-GI-7-01) ------------------------------------
+
+// assertNoBodyColumns checks both halves of the projection guarantee at once:
+// the response is small, and it names none of the four blob columns. The size
+// bound is what makes it non-vacuous -- the fixtures below are sized so a
+// single leaked body would blow far past it.
+func assertNoBodyColumns(t *testing.T, body []byte, what string) {
+	t.Helper()
+	if len(body) > 64*1024 {
+		t.Errorf("%s response = %d bytes, want under 64 KB", what, len(body))
+	}
+	for _, key := range []string{"ReqBody", "RespBody", "ReqHeaders", "RespHeaders"} {
+		if bytes.Contains(body, []byte(`"`+key+`"`)) {
+			t.Errorf("%s response carries a %q key", what, key)
+		}
+	}
+}
+
+// seedFiftyWithBodies stores 50 rows each carrying a 1 MB body, which is the
+// fixture both projection tests need: 50 MB stored, so the 64 KB bound is a
+// real assertion rather than a formality.
+func seedFiftyWithBodies(t *testing.T, st *store.Store, opts func(*store.Event)) {
+	t.Helper()
+	big := bytes.Repeat([]byte("x"), 1<<20)
+	for i := 0; i < 50; i++ {
+		seedEvent(t, st, func(ev *store.Event) {
+			ev.ReqBody, ev.RespBody = big, big
+			ev.ReqHeaders = `{"authorization":["[redacted]"]}`
+			ev.RespHeaders = `{"content-type":["application/json"]}`
+			if opts != nil {
+				opts(ev)
+			}
+		})
+	}
+}
+
+// TestListRouteOmitsBodies (T1): the Calls list is the dashboard's hottest
+// fetch and renders none of the body columns.
+func TestListRouteOmitsBodies(t *testing.T) {
+	st := newTestStore(t)
+	seedFiftyWithBodies(t, st, nil)
+	handler, _, _, _ := newTestAPI(t, st)
+
+	assertNoBodyColumns(t, getOK(t, handler, "/api/requests?limit=50").Body.Bytes(), "list")
+}
+
+// TestSessionRouteOmitsBodies (T2) asserts both halves for the session route.
+// The length half is load-bearing: with Calls typed as EventSummary the
+// "no body key" half is already guaranteed by the type checker and catches
+// nothing new, so a non-empty calls[] is what stops an empty array satisfying
+// the size bound vacuously.
+func TestSessionRouteOmitsBodies(t *testing.T) {
+	st := newTestStore(t)
+	const sid = "sess_big"
+	ctx := context.Background()
+	seedFiftyWithBodies(t, st, func(ev *store.Event) { ev.SessionID = sid })
+	// A session's own row is written separately from its events, so the route
+	// 404s until both exist.
+	if err := st.UpsertSession(ctx, sid, "", time.Now()); err != nil {
+		t.Fatalf("UpsertSession: %v", err)
+	}
+	if err := st.ReconcileSession(ctx, sid); err != nil {
+		t.Fatalf("ReconcileSession: %v", err)
+	}
+	handler, _, _, _ := newTestAPI(t, st)
+
+	body := getOK(t, handler, "/api/sessions/"+sid).Body.Bytes()
+	assertNoBodyColumns(t, body, "session")
+
+	var got struct {
+		Calls []json.RawMessage `json:"calls"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode session: %v", err)
+	}
+	if len(got.Calls) != 50 {
+		t.Errorf("calls = %d, want 50", len(got.Calls))
 	}
 }

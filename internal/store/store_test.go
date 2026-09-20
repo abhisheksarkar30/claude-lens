@@ -40,7 +40,7 @@ func f64(v float64) *float64 { return &v }
 func str(v string) *string   { return &v }
 
 func fullEvent(requestID string) *Event {
-	return &Event{
+	return &Event{EventSummary: EventSummary{
 		RequestID:          requestID,
 		Source:             "proxy",
 		FirstSource:        "proxy",
@@ -66,12 +66,10 @@ func fullEvent(requestID string) *Event {
 		CaptureComplete:    true,
 		Method:             "POST",
 		Path:               "/v1/messages",
-		Status:             200,
-		ReqHeaders:         `{"x-api-key":["[redacted]"]}`,
-		RespHeaders:        `{"content-type":["application/json"]}`,
-		ReqBody:            []byte(`{"model":"claude-sonnet-5"}`),
-		RespBody:           []byte(`{"usage":{}}`),
-	}
+		Status:             200}, ReqHeaders: `{"x-api-key":["[redacted]"]}`,
+		RespHeaders: `{"content-type":["application/json"]}`,
+		ReqBody:     []byte(`{"model":"claude-sonnet-5"}`),
+		RespBody:    []byte(`{"usage":{}}`)}
 }
 
 // Test 5: round trip, WAL, FK cascade, RedactCheck.
@@ -663,4 +661,77 @@ func TestConcurrentReadersDuringWriteBatch(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	close(stop)
 	wg.Wait()
+}
+
+// --- the two event projections -------------------------------------------
+
+func containsStr(hay []string, needle string) bool {
+	for _, s := range hay {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// parseSelectColumns pulls the column names back out of a SELECT string, so a
+// test compares what the query actually asks for rather than the slice it was
+// built from.
+func parseSelectColumns(t *testing.T, sel string) []string {
+	t.Helper()
+	rest, ok := strings.CutPrefix(sel, "SELECT ")
+	if !ok {
+		t.Fatalf("not a SELECT: %q", sel)
+	}
+	parts := strings.Split(rest, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, strings.TrimSpace(p))
+	}
+	return out
+}
+
+// TestSummaryColumnsAreTheFullSetMinusBodies is the projection guard: the
+// list path must select every column the detail path does, except the header
+// and body blobs. Parsing the SELECT strings is what makes it a real check --
+// comparing the slices they are built from would be tautological.
+func TestSummaryColumnsAreTheFullSetMinusBodies(t *testing.T) {
+	full := parseSelectColumns(t, eventSelectColumns)
+	summary := parseSelectColumns(t, summarySelectColumns)
+
+	if want := len(full) - len(summaryOmittedColumns); len(summary) != want {
+		t.Fatalf("summary selects %d columns, want %d (full %d minus %d omitted)",
+			len(summary), want, len(full), len(summaryOmittedColumns))
+	}
+	for _, c := range summaryOmittedColumns {
+		if !containsStr(full, c) {
+			t.Errorf("summaryOmittedColumns names %q, which the full projection does not select", c)
+		}
+	}
+	for _, c := range summary {
+		if containsStr(summaryOmittedColumns, c) {
+			t.Errorf("summary projection selects the omitted column %q", c)
+		}
+		if !containsStr(full, c) {
+			t.Errorf("summary projection selects %q, which the full projection does not", c)
+		}
+	}
+}
+
+// TestSummaryScanMatchesSummaryColumns is the other half of the projection
+// guard, and the one that would otherwise fail at runtime rather than at
+// compile time: the SELECT and the Scan destination list are written in
+// different places, so a column added to one and not the other surfaces as a
+// "sql: expected N destination arguments" error on every list fetch.
+func TestSummaryScanMatchesSummaryColumns(t *testing.T) {
+	var es EventSummary
+	var v eventScanVals
+
+	if got, want := len(v.dest(&es)), len(summaryColumnNames); got != want {
+		t.Errorf("scanEventSummary takes %d destinations for %d columns", got, want)
+	}
+	extras := []any{new(sql.NullString), new(sql.NullString), new([]byte), new([]byte)}
+	if got, want := len(v.dest(&es, extras...)), len(eventColumnNames); got != want {
+		t.Errorf("scanEvent takes %d destinations for %d columns", got, want)
+	}
 }

@@ -219,9 +219,69 @@ func (s *Store) SessionEvents(ctx context.Context, sessionID string) ([]*Event, 
 	return out, rows.Err()
 }
 
+// SessionEventsSummary is SessionEvents at the list projection: the same
+// rows, same order, without the four header/body blobs. The session route
+// renders a call list, so it wants this; the session-scoped analyzer pass
+// compares consecutive request bodies and wants SessionEvents.
+func (s *Store) SessionEventsSummary(ctx context.Context, sessionID string) ([]*EventSummary, error) {
+	rows, err := s.db.QueryContext(ctx, summarySelectColumns+" FROM events WHERE session_id = ? ORDER BY started_at ASC", sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("store: SessionEventsSummary: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*EventSummary
+	for rows.Next() {
+		ev, err := scanEventSummary(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: SessionEventsSummary: %w", err)
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
 // ListEvents returns events matching filter, newest first, paginated by
 // filter.Limit/Offset.
-func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]*Event, error) {
+//
+// It reads the scalar projection only. The header/body blobs are not
+// selected, so a list never pays to read a body it will not render — on a
+// populated store that is the difference between a ~12 MB response and a
+// small one. A caller that genuinely needs a body uses ListEventsFull and
+// says so by name; it cannot reach one through this type by accident.
+func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]*EventSummary, error) {
+	where, args := filter.whereClause()
+	limit := filter.Limit
+	if limit <= 0 {
+		limit = DefaultLimit
+	}
+	query := summarySelectColumns + " FROM events" + where + " ORDER BY started_at DESC LIMIT ? OFFSET ?"
+	args = append(args, limit, filter.Offset)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: ListEvents: %w", err)
+	}
+	defer rows.Close()
+
+	var out []*EventSummary
+	for rows.Next() {
+		ev, err := scanEventSummary(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: ListEvents: %w", err)
+		}
+		out = append(out, ev)
+	}
+	return out, rows.Err()
+}
+
+// ListEventsFull is ListEvents at full row width. Exactly four callers need
+// it, and each names it explicitly rather than relying on a default: the
+// boot-time redaction self-test (which reads headers to prove they were
+// redacted), clens export (documented as the complete dump), clens ls
+// --json (encodes whole rows), and the replay poll (hands the row to
+// replay.OutcomeOf).
+func (s *Store) ListEventsFull(ctx context.Context, filter EventFilter) ([]*Event, error) {
 	where, args := filter.whereClause()
 	limit := filter.Limit
 	if limit <= 0 {
@@ -232,7 +292,7 @@ func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]*Event, e
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("store: ListEvents: %w", err)
+		return nil, fmt.Errorf("store: ListEventsFull: %w", err)
 	}
 	defer rows.Close()
 
@@ -240,7 +300,7 @@ func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]*Event, e
 	for rows.Next() {
 		ev, err := scanEvent(rows)
 		if err != nil {
-			return nil, fmt.Errorf("store: ListEvents: %w", err)
+			return nil, fmt.Errorf("store: ListEventsFull: %w", err)
 		}
 		out = append(out, ev)
 	}
@@ -980,76 +1040,138 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
-const eventSelectColumns = `SELECT
-	id, request_id, source, source_refs, first_source,
-	started_at, ended_at,
-	auth_kind, account, billing_mode,
-	model_requested, model_resolved,
-	input_tokens, output_tokens, cache_write_5m_tokens, cache_write_1h_tokens, cache_read_tokens, thinking_tokens, total_prompt_tokens,
-	service_tier, speed, effort, inference_geo,
-	stop_reason, stop_category,
-	is_sidechain, session_id, project, git_branch, client_version, cli_entrypoint,
-	cost_usd, api_equivalent_cost_usd, cost_source,
-	prefix_hash, replay_of, replay_edits, capture_complete,
-	method, path, status, req_headers, resp_headers, req_body, resp_body`
+// eventColumnNames is the positional column list every event SELECT uses, in
+// scan order. Both scans below take their order from it, and the summary
+// projection is *derived* from it rather than hand-kept, so the list SELECT
+// cannot drift from the detail SELECT.
+var eventColumnNames = []string{
+	"id", "request_id", "source", "source_refs", "first_source",
+	"started_at", "ended_at",
+	"auth_kind", "account", "billing_mode",
+	"model_requested", "model_resolved",
+	"input_tokens", "output_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens", "cache_read_tokens", "thinking_tokens", "total_prompt_tokens",
+	"service_tier", "speed", "effort", "inference_geo",
+	"stop_reason", "stop_category",
+	"is_sidechain", "session_id", "project", "git_branch", "client_version", "cli_entrypoint",
+	"cost_usd", "api_equivalent_cost_usd", "cost_source",
+	"prefix_hash", "replay_of", "replay_edits", "capture_complete",
+	"method", "path", "status", "req_headers", "resp_headers", "req_body", "resp_body",
+}
+
+// summaryOmittedColumns are the header/body blobs the list path never reads.
+// This is the one place the projection names them: adding a column to the
+// blob set is a one-line change here, and the list keeps excluding it.
+var summaryOmittedColumns = []string{"req_headers", "resp_headers", "req_body", "resp_body"}
+
+var (
+	eventSelectColumns   = selectFrom(eventColumnNames)
+	summaryColumnNames   = columnsMinus(eventColumnNames, summaryOmittedColumns)
+	summarySelectColumns = selectFrom(summaryColumnNames)
+)
+
+func selectFrom(cols []string) string { return "SELECT " + strings.Join(cols, ", ") }
+
+func columnsMinus(all, omit []string) []string {
+	drop := make(map[string]bool, len(omit))
+	for _, c := range omit {
+		drop[c] = true
+	}
+	out := make([]string, 0, len(all))
+	for _, c := range all {
+		if !drop[c] {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// eventScanVals holds the intermediate scan targets shared by both event
+// scans, so the two projections cannot decode a column differently.
+type eventScanVals struct {
+	sourceRefs      string
+	startedAt       int64
+	endedAt         sql.NullInt64
+	isSidechain     int64
+	captureComplete int64
+	costUSD         sql.NullFloat64
+	apiEquivCost    sql.NullFloat64
+	prefixHash      sql.NullString
+	method, path    sql.NullString
+	status          sql.NullInt64
+}
+
+// dest returns the Scan destinations for summaryColumnNames, in order,
+// followed by any extras the caller's wider projection appends. Writing the
+// destination list once is what keeps it in step with the column list; the
+// two would otherwise have to be edited together by hand.
+func (v *eventScanVals) dest(es *EventSummary, extra ...any) []any {
+	d := []any{
+		&es.ID, &es.RequestID, &es.Source, &v.sourceRefs, &es.FirstSource,
+		&v.startedAt, &v.endedAt,
+		&es.AuthKind, &es.Account, &es.BillingMode,
+		&es.ModelRequested, &es.ModelResolved,
+		&es.InputTokens, &es.OutputTokens, &es.CacheWrite5mTokens, &es.CacheWrite1hTokens, &es.CacheReadTokens, &es.ThinkingTokens, &es.TotalPromptTokens,
+		&es.ServiceTier, &es.Speed, &es.Effort, &es.InferenceGeo,
+		&es.StopReason, &es.StopCategory,
+		&v.isSidechain, &es.SessionID, &es.Project, &es.GitBranch, &es.ClientVersion, &es.CliEntrypoint,
+		&v.costUSD, &v.apiEquivCost, &es.CostSource,
+		&v.prefixHash, &es.ReplayOf, &es.ReplayEdits, &v.captureComplete,
+		&v.method, &v.path, &v.status,
+	}
+	return append(d, extra...)
+}
+
+// apply writes the shared intermediates onto es.
+func (v *eventScanVals) apply(es *EventSummary) {
+	es.SourceRefs = splitList(v.sourceRefs)
+	es.StartedAt = timeFromNano(v.startedAt)
+	if v.endedAt.Valid {
+		t := timeFromNano(v.endedAt.Int64)
+		es.EndedAt = &t
+	}
+	es.IsSidechain = v.isSidechain != 0
+	es.CaptureComplete = v.captureComplete != 0
+	if v.costUSD.Valid {
+		c := v.costUSD.Float64
+		es.CostUSD = &c
+	}
+	if v.apiEquivCost.Valid {
+		c := v.apiEquivCost.Float64
+		es.ApiEquivalentCostUSD = &c
+	}
+	if v.prefixHash.Valid {
+		h := v.prefixHash.String
+		es.PrefixHash = &h
+	}
+	es.Method = v.method.String
+	es.Path = v.path.String
+	es.Status = int(v.status.Int64)
+}
+
+func scanEventSummary(row rowScanner) (*EventSummary, error) {
+	var es EventSummary
+	var v eventScanVals
+	if err := row.Scan(v.dest(&es)...); err != nil {
+		return nil, err
+	}
+	v.apply(&es)
+	return &es, nil
+}
 
 func scanEvent(row rowScanner) (*Event, error) {
 	var ev Event
-	var sourceRefs string
-	var startedAt int64
-	var endedAt sql.NullInt64
-	var isSidechain, captureComplete int64
-	var costUSD, apiEquivCostUSD sql.NullFloat64
-	var prefixHash sql.NullString
-	var method, path, reqHeaders, respHeaders sql.NullString
-	var status sql.NullInt64
+	var v eventScanVals
+	var reqHeaders, respHeaders sql.NullString
 	var reqBody, respBody []byte
 
-	err := row.Scan(
-		&ev.ID, &ev.RequestID, &ev.Source, &sourceRefs, &ev.FirstSource,
-		&startedAt, &endedAt,
-		&ev.AuthKind, &ev.Account, &ev.BillingMode,
-		&ev.ModelRequested, &ev.ModelResolved,
-		&ev.InputTokens, &ev.OutputTokens, &ev.CacheWrite5mTokens, &ev.CacheWrite1hTokens, &ev.CacheReadTokens, &ev.ThinkingTokens, &ev.TotalPromptTokens,
-		&ev.ServiceTier, &ev.Speed, &ev.Effort, &ev.InferenceGeo,
-		&ev.StopReason, &ev.StopCategory,
-		&isSidechain, &ev.SessionID, &ev.Project, &ev.GitBranch, &ev.ClientVersion, &ev.CliEntrypoint,
-		&costUSD, &apiEquivCostUSD, &ev.CostSource,
-		&prefixHash, &ev.ReplayOf, &ev.ReplayEdits, &captureComplete,
-		&method, &path, &status, &reqHeaders, &respHeaders, &reqBody, &respBody,
-	)
-	if err != nil {
+	if err := row.Scan(v.dest(&ev.EventSummary, &reqHeaders, &respHeaders, &reqBody, &respBody)...); err != nil {
 		return nil, err
 	}
-
-	ev.SourceRefs = splitList(sourceRefs)
-	ev.StartedAt = timeFromNano(startedAt)
-	if endedAt.Valid {
-		t := timeFromNano(endedAt.Int64)
-		ev.EndedAt = &t
-	}
-	ev.IsSidechain = isSidechain != 0
-	ev.CaptureComplete = captureComplete != 0
-	if costUSD.Valid {
-		v := costUSD.Float64
-		ev.CostUSD = &v
-	}
-	if apiEquivCostUSD.Valid {
-		v := apiEquivCostUSD.Float64
-		ev.ApiEquivalentCostUSD = &v
-	}
-	if prefixHash.Valid {
-		v := prefixHash.String
-		ev.PrefixHash = &v
-	}
-	ev.Method = method.String
-	ev.Path = path.String
-	ev.Status = int(status.Int64)
+	v.apply(&ev.EventSummary)
 	ev.ReqHeaders = reqHeaders.String
 	ev.RespHeaders = respHeaders.String
 	ev.ReqBody = reqBody
 	ev.RespBody = respBody
-
 	return &ev, nil
 }
 

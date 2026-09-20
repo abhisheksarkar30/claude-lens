@@ -378,7 +378,7 @@ func (t *Tailer) buildEvent(l *line, f walkedFile) (*store.Event, parse.Meta, pa
 	}
 
 	startedAt := parseTimestamp(l.Timestamp)
-	ev := &store.Event{
+	ev := &store.Event{EventSummary: store.EventSummary{
 		RequestID:          requestKey(l),
 		Source:             "jsonl",
 		FirstSource:        "jsonl",
@@ -401,7 +401,7 @@ func (t *Tailer) buildEvent(l *line, f walkedFile) (*store.Event, parse.Meta, pa
 		ClientVersion:      l.Version,
 		CliEntrypoint:      l.CliEntrypoint,
 		CaptureComplete:    true,
-	}
+	}}
 
 	if t.pricer != nil {
 		usd, costSource := t.pricer.Compute(ev.ModelResolved, usage, "", "", ev.StartedAt)

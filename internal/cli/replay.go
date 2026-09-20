@@ -159,7 +159,7 @@ func replayDump(w io.Writer, orig *store.Event, edits []replay.Edit) error {
 	}
 
 	fmt.Fprintf(w, "would send %s %s (from request %d)\n", orig.Method, orig.Path, orig.ID)
-	fmt.Fprintf(w, "  model   %s\n", displayModel(orig))
+	fmt.Fprintf(w, "  model   %s\n", displayModel(&orig.EventSummary))
 	if editsJSON == "" {
 		fmt.Fprintln(w, "  edits   none")
 	} else {

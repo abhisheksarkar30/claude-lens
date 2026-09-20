@@ -34,13 +34,13 @@ func copyFile(t *testing.T, src, dst string) {
 	}
 }
 
-func eventsByRequestID(t *testing.T, st *store.Store) map[string]*store.Event {
+func eventsByRequestID(t *testing.T, st *store.Store) map[string]*store.EventSummary {
 	t.Helper()
 	evs, err := st.ListEvents(context.Background(), store.EventFilter{})
 	if err != nil {
 		t.Fatalf("ListEvents: %v", err)
 	}
-	out := map[string]*store.Event{}
+	out := map[string]*store.EventSummary{}
 	for _, ev := range evs {
 		out[ev.RequestID] = ev
 	}

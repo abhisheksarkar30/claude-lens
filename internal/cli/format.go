@@ -227,7 +227,7 @@ func intFlag(args []string, name string, def int) (int, []string, error) {
 // back if it reported anything, else what was asked for. Every surface that
 // names a model goes through this so `ls`, `show` and a replay diff can never
 // disagree about which model a call was.
-func displayModel(ev *store.Event) string {
+func displayModel(ev *store.EventSummary) string {
 	if ev.ModelResolved != "" {
 		return ev.ModelResolved
 	}

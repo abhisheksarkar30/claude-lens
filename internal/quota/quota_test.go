@@ -21,7 +21,7 @@ func newTestStore(t *testing.T) *store.Store {
 
 func insertEvent(t *testing.T, st *store.Store, requestID, account, model string, at time.Time, inputTokens int) {
 	t.Helper()
-	ev := &store.Event{
+	ev := &store.Event{EventSummary: store.EventSummary{
 		RequestID:      requestID,
 		Source:         "proxy",
 		FirstSource:    "proxy",
@@ -30,8 +30,7 @@ func insertEvent(t *testing.T, st *store.Store, requestID, account, model string
 		BillingMode:    "subscription",
 		ModelRequested: model,
 		ModelResolved:  model,
-		InputTokens:    inputTokens,
-	}
+		InputTokens:    inputTokens}}
 	if _, _, err := st.InsertEvent(context.Background(), ev); err != nil {
 		t.Fatalf("InsertEvent %s: %v", requestID, err)
 	}

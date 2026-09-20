@@ -389,7 +389,7 @@ func TestConsumerCostWiring(t *testing.T) {
 	sk.Submit(unknown)
 
 	evs := waitForEvents(t, st, 2)
-	var pricedEv, unknownEv *store.Event
+	var pricedEv, unknownEv *store.EventSummary
 	for _, e := range evs {
 		switch e.RequestID {
 		case "req-priced":
@@ -533,7 +533,7 @@ func TestConsumerConcurrentProducer(t *testing.T) {
 	waitForEvents(t, st, 200)
 }
 
-func waitForEvents(t *testing.T, st *store.Store, want int) []*store.Event {
+func waitForEvents(t *testing.T, st *store.Store, want int) []*store.EventSummary {
 	t.Helper()
 	deadline := time.After(10 * time.Second)
 	for {

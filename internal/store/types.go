@@ -2,10 +2,17 @@ package store
 
 import "time"
 
-// Event is one row in events: one observed turn, from source "proxy" or
-// "jsonl". TotalPromptTokens is recomputed by the store on every write
-// (invariant 4) — a caller-supplied value is ignored, never trusted.
-type Event struct {
+// EventSummary is an event row's scalar block: everything Event carries
+// except the four header/body blobs. It is the type ListEvents returns, so
+// the list path never reads a body out of SQLite — and a caller that needs
+// one cannot reach it, because the field is not there to name. That
+// compile error is the point: with a flag on the query instead, a caller
+// that forgot it would silently receive nil where it needed bytes, and a
+// body-less jsonl row is byte-identical on the wire to an unselected one.
+//
+// TotalPromptTokens is recomputed by the store on every write (invariant 4)
+// — a caller-supplied value is ignored, never trusted.
+type EventSummary struct {
 	ID          int64
 	RequestID   string
 	Source      string
@@ -66,9 +73,26 @@ type Event struct {
 	CaptureComplete bool
 
 	// Proxy-only, empty for a source="jsonl" row.
-	Method      string
-	Path        string
-	Status      int
+	Method string
+	Path   string
+	Status int
+}
+
+// Event is one row in events: one observed turn, from source "proxy" or
+// "jsonl".
+//
+// The scalar block is embedded rather than duplicated because Event's wire
+// keys are its Go field names: a second, hand-kept copy could drift from
+// EventSummary field-by-field and silently split the list wire from the
+// detail wire. encoding/json flattens an embedded struct, so the detail
+// route's JSON is unchanged by the split.
+//
+// The four blobs stay direct fields, which is what keeps them off the list
+// path — see EventSummary.
+type Event struct {
+	EventSummary
+
+	// Proxy-only, empty for a source="jsonl" row.
 	ReqHeaders  string // redacted header JSON
 	RespHeaders string // redacted header JSON
 	ReqBody     []byte

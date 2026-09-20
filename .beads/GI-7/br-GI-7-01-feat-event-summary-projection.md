@@ -68,8 +68,12 @@ large. See "Why this cannot be split" below.
    reads `ev.ReqHeaders` (`:266-270`) and hands it to `proxy.RedactCheck`. Left on the summary it
    would `continue` on every row and report zero findings, always, with no error and no log — a
    security control disabled by default.
-2. **`internal/cli/export.go:90` and `:131`** — `clens export`'s two reads. Its JSON form is
-   documented as the complete dump *including the captured bodies* (`export.go:18-21`).
+2. **`internal/cli/export.go:90`** — `clens export`'s JSON read, documented as the complete dump
+   *including the captured bodies* (`export.go:18-21`), so it moves to `ListEventsFull`.
+   **Corrected during implementation:** the CSV read at `:131` does **not** move. This bead
+   originally sent both; `exportColumns` (`:109-116`) carries no header/body column and
+   `rowValues` reads only scalars, so the full-width read there would pull 256 KB per row to emit
+   none of it. CSV stays on `ListEvents` and `rowValues` retypes to `*store.EventSummary`.
 3. **`internal/cli/ls.go:55-62`** — the `--json` branch encodes each whole row (`enc.Encode(ev)`), so
    on the summary type the four header/body keys vanish. That is exactly the silent contract change
    this story exists to fix. The **table** path (`:66-97`, scalars only) stays on the summary.
