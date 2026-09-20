@@ -933,6 +933,70 @@ func TestMergeDoesNotLetABodylessRowZeroObservedUsage(t *testing.T) {
 					"measurement to contribute, and its zeros are 'never looked', not 'none'",
 					got.InputTokens, got.OutputTokens)
 			}
+
+			// The other half of the same defect, and the half that fired in the
+			// *ordinary* proxy-first ordering rather than a race. mergeEvents's
+			// own contract says "a 0-vs-N difference is not a disagreement", but
+			// the completeness case set mismatch from tokensDiffer alone, so an
+			// absent side counted as a conflicting one and every off-policy
+			// merge grew a source_mismatch at SeverityError -- an error warning
+			// about a disagreement that never happened, on the row shape `off`
+			// produces for every call it records.
+			warnings, err := st.ListWarnings(ctx, WarningFilter{})
+			if err != nil {
+				t.Fatalf("ListWarnings: %v", err)
+			}
+			for _, w := range warnings {
+				if w.Kind == "source_mismatch" {
+					t.Errorf("a bodyless row raised %s (%s): no measurement was contradicted -- "+
+						"one side never looked", w.Kind, w.Detail)
+				}
+			}
 		})
+	}
+}
+
+// TestMergeStillWarnsOnATrueDisagreement is the negative half of the gate above,
+// which is the half a "stop warning" fix gets wrong: if the mismatch condition
+// is narrowed too far, a real disagreement goes unreported and nothing fails.
+//
+// Both rows are complete *and* both were measured, differing on the numbers --
+// the case source_mismatch exists for.
+func TestMergeStillWarnsOnATrueDisagreement(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	first := fullEvent("req-gi7-real-mismatch")
+	first.Source, first.FirstSource = "proxy", "proxy"
+	first.CaptureComplete = true
+	first.InputTokens, first.OutputTokens = 100, 50
+
+	second := fullEvent("req-gi7-real-mismatch")
+	second.Source, second.FirstSource = "jsonl", "jsonl"
+	second.CaptureComplete = true
+	second.InputTokens, second.OutputTokens = 111, 55
+
+	if _, _, err := st.InsertEvent(ctx, first); err != nil {
+		t.Fatalf("InsertEvent first: %v", err)
+	}
+	if _, _, err := st.InsertEvent(ctx, second); err != nil {
+		t.Fatalf("InsertEvent second (merge): %v", err)
+	}
+
+	// No EventID filter exists on WarningFilter, and none is needed: this store
+	// holds one merged event, so every warning it returns belongs to it.
+	warnings, err := st.ListWarnings(ctx, WarningFilter{})
+	if err != nil {
+		t.Fatalf("ListWarnings: %v", err)
+	}
+	found := false
+	for _, w := range warnings {
+		if w.Kind == "source_mismatch" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no source_mismatch for two complete captures that disagree on tokens; "+
+			"got %d warnings", len(warnings))
 	}
 }

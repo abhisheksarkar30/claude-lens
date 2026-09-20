@@ -20,8 +20,9 @@
 
 ### Half A — `--body-policy off` records *nothing*, and says otherwise in three places
 
-`internal/proxy/proxy.go:59` returns the bare `httputil.ReverseProxy` before the handler closure that
-installs `stateKey` and the tees is ever built:
+**As it was before this bead** — `New` in `internal/proxy/proxy.go` returned the bare
+`httputil.ReverseProxy` before the handler closure that installs `stateKey` and the tees was ever
+built:
 
 ```go
 if cfg.BodyPolicy == "off" {
@@ -29,8 +30,8 @@ if cfg.BodyPolicy == "off" {
 }
 ```
 
-The closure at `:96-122` — which sets `st := &captureState{…}` and injects it into the request
-context — is below that return, so under `off` no `captureState` exists, `ModifyResponse` is never
+That closure — which sets `st := &captureState{…}` and injects it into the request context — sat
+below that return, so under `off` no `captureState` exists, `ModifyResponse` is never
 installed, and `ErrorHandler`'s `r.Context().Value(stateKey{})` type-asserts to `ok == false` and
 submits nothing. **Zero rows reach the sink.**
 
@@ -45,20 +46,21 @@ Three places state the opposite:
 
 | Where | Claims |
 |---|---|
-| `internal/cli/serve.go:416` | `WARNING: body capture is off — calls are recorded without their bodies.` |
-| `docs/context/data-privacy-and-compliance.md:39` | `off` → "no body is captured" |
-| `README.md:252` | "`--body-policy truncated` and `off` narrow that" |
+| `internal/cli/serve.go` `printBanner` | `WARNING: body capture is off — calls are recorded without their bodies.` |
+| `docs/context/data-privacy-and-compliance.md` | `off` → "no body is captured" |
+| `README.md` | "`--body-policy truncated` and `off` narrow that" |
 
-`serve.go:408-409`'s doc comment on `printBanner` even calls it *"the standing 'nothing is being
+`printBanner`'s own doc comment in `serve.go` even calls it *"the standing 'nothing is being
 recorded' warning"* — the comment and the string it describes disagree, and the code agrees with the
 comment. The failure shape is the bad one: an operator sets `off` to keep latency and status
 observability while dropping content, and silently loses the records too. No test covers it —
-`serve_test.go:126` asserts the banner's *text* and nothing about capture.
+`serve_test.go` asserts the banner's *text* and nothing about capture.
 
 ### Half B — `internal/jsonlogs` never consults the policy at all
 
-`BodyPolicy` is read at exactly one call site in the repo (`proxy.go:59`). `internal/jsonlogs` writes
-`ev.TranscriptContent = l.Message.Content` unconditionally (`jsonlogs.go:412`), so an install running
+`BodyPolicy` is read at exactly one call site in the repo: `New` in `internal/proxy/proxy.go`,
+which branches on `cfg.BodyPolicy != "off"` and returns the bare `ReverseProxy`. `internal/jsonlogs` writes
+`ev.TranscriptContent = l.Message.Content` unconditionally in `buildEvent`, so an install running
 `--body-policy off` still stores a transcript line's `content` whole and uncapped. Neither the plan
 nor `br-GI-7-06` mentions the policy, which is why this reads as an oversight rather than a choice.
 
@@ -83,7 +85,7 @@ over — so the hot path is unchanged and `TestNoBufferingSSE` is the proof.
 **2. Under `off`, `CaptureComplete` is `true`, and the merge — not the flag — carries the
 consequence.**
 
-The flag is about *narrowing*: a body cut at the cap, or a stream that ended early (`sink.go:41-44`).
+The flag is about *narrowing*: a body cut at the cap, or a stream that ended early (`internal/sink/sink.go`, `CaptureComplete`'s doc).
 Under `off` nothing was narrowed — the absence is a policy the operator set, uniformly, and visible
 in `clens doctor`'s `body_policy` line. Setting it false is the alternative and it is worse: the
 response's `Content-Type` survives `off`, so `parse.ExtractUsage` still reports `IsStream` true for a
@@ -96,22 +98,48 @@ backwards. `merge.go`'s pick is:
 
 ```go
 case existing.CaptureComplete && incoming.CaptureComplete:
-    winner = incoming            // <-- the thin off row wins if it arrives second
+    winner = incoming            // <-- the incoming row always wins this case
 ```
 
-so with jsonl-first ordering the `off` row takes the token pick and **zeroes the transcript's
-observed counts**, plus a spurious `source_mismatch`. (Proxy-first is harmless: `!existing &&
-incoming` hands the win to the jsonl row.) The draft claimed the opposite — that `false` would cost
-the `off` row the pick — when losing that pick is exactly what a row with nothing to contribute
-*should* do. Naming the hazard is not fixing it, so this bead also corrects the pick.
+Both rows are complete — the `off` proxy row by decision 2 above, every `jsonl` row by
+`jsonlogs`' `buildEvent`, which sets it unconditionally — so **both write orderings take this one case** and only the argument order
+differs. (Verified by instrumenting the switch, not by reading it; and confirmed a second way when
+removing the guard below failed the test in *both* orderings rather than one.) With `jsonl` first,
+`incoming` is the thin `off` row, so it takes the pick and **zeroes the transcript's observed
+counts**. With the proxy row first, `incoming` is the `jsonl` row and the same case hands the win to
+the side that has the numbers — harmless, but for a different reason than "a different branch runs".
 
-**2a. The merge will not let an unobserved zero overwrite an observed count.** Both orderings,
-because they reach different branches. The rule the flag encodes is "prefer the more complete
-record", and a row that kept no body has no record of usage to prefer — its zeros mean *never
-looked*, not *none*, which is the same distinction `cost-and-quota.md` draws between an unpriced row
-and a `$0.00` one. So after the flag's pick, if the winner has no observed usage and the loser has
-some, the loser wins and the disagreement is reported. Both-zero and both-nonzero are untouched: the
-first has nothing to lose, the second is the ordinary two-captures case the rule was written for.
+The draft got this wrong twice, which is worth recording because the wrong version was convincing:
+it said proxy-first was harmless because `!existing && incoming` fires there. That case cannot fire
+at all — it requires `existing.CaptureComplete` false, and neither row is ever false here. The draft
+also claimed `false` would cost the `off` row the pick, as if that were a cost, when losing that pick
+is exactly what a row with nothing to contribute *should* do. Naming the hazard is not fixing it, so
+this bead also corrects the pick.
+
+**2a. The merge will not let an unobserved zero overwrite an observed count, and will not call it a
+disagreement either.** Both orderings, because the thin row is the `incoming` argument in one and the
+`existing` argument in the other — same `&&` case, opposite roles, so a fix that only handled the
+losing ordering would pass half the time.
+
+The rule the flag encodes is "prefer the more complete record", and a row that kept no body has no
+record of usage to prefer — its zeros mean *never looked*, not *none*, which is the same distinction
+`cost-and-quota.md` draws between an unpriced row and a `$0.00` one. Two changes follow, and the
+second is the one the first draft missed:
+
+- **The pick.** After the flag's decision, if the winner has no observed usage and the loser has
+  some, the loser wins.
+- **The warning, which is a separate bug.** `mismatch` was set from `tokensDiffer` alone in the `&&`
+  case, so a 0-vs-N pair counted as a conflict and every `off`-policy merge grew a `source_mismatch`
+  at `SeverityError`. That contradicts `mergeEvents`'s own contract — *"a 0-vs-N difference is not a
+  disagreement"* — and it fired in the **ordinary proxy-first ordering**, not a race. A disagreement
+  needs two measurements, so the condition now requires both sides to have observed usage. The swap
+  above deliberately sets no mismatch at all, for the same reason: it happens *because* one side never
+  looked, which is an absence rather than a conflict.
+
+Both-zero and both-nonzero are untouched in both halves: the first has nothing to lose, and the
+second is the ordinary two-captures case the rule was written for — including the case
+`source_mismatch` exists to report, which is pinned by its own test so narrowing the condition cannot
+silently stop the warning real disagreements need.
 
 **3. Headers are still captured under `off`.** The flag is `--body-policy`, not `--capture-policy`,
 and the banner's promise is "without their bodies". `req_headers`/`resp_headers` are redacted exactly
@@ -161,11 +189,11 @@ from `started_at_ns` and the attempt counter.
 
 ### What this bead does not fix
 
-**`--body-policy truncated` is still a no-op.** `config.go:316` accepts it and `proxy.go`'s only
+**`--body-policy truncated` is still a no-op.** `config.Validate` accepts it and `proxy.go`'s only
 policy branch is `== "off"`, so `truncated` and `full` execute byte-identical code, both bounded by
 `--body-cap-bytes`. This bead does not change that: making the two differ means deciding whether
 `full` should mean *uncapped*, which is a real design question about the default's blast radius on a
-256 KB-bounded capture, and `README.md:252`'s "`--body-policy truncated` … narrow[s] that" stays an
+256 KB-bounded capture, and the README's "`--body-policy truncated` … narrow[s] that" stays an
 overclaim until it is answered. Recorded here so it is not lost; out of scope.
 
 **A request body upstream never reads in full** is still stored as a prefix with no marker — the
@@ -197,8 +225,8 @@ the context doc all say.
   redacted `req_headers`/`resp_headers`, method, path, `TTFB` and `Duration` — and `ReqBody` and
   `RespBody` both NULL. Confirmed by a test, and by the probe that found the defect.
 - `CaptureComplete` is true on that row, and no `stream_incomplete` warning is produced for it.
-- `serve.go:416`'s banner is **true as written**: no string change, but `printBanner`'s doc comment
-  (`:408-409`) stops calling it a "nothing is being recorded" warning.
+- `printBanner`'s banner string is **true as written**: no string change, but its doc comment stops
+  calling it a "nothing is being recorded" warning.
 - A transcript line ingested with the policy wired to `off` stores no `transcript_content` and no
   `transcript_role`; with the policy wired to `full` and a small cap, the stored content is exactly
   the cap and the row's `CaptureComplete` is **unchanged from what it would otherwise be**.
@@ -209,7 +237,10 @@ the context doc all say.
 - A request with no `Request-Id` header, and an unreachable upstream, both produce a row and the
   latter still answers `502`: no panic escapes `submit`, in either path.
 - A merge between a transcript row and a bodyless complete row keeps the transcript's observed
-  counts in **both** write orderings.
+  counts in **both** write orderings, and raises **no** `source_mismatch` — an absent side is not a
+  disagreeing one.
+- Two complete captures that *do* disagree on tokens still raise `source_mismatch`, so the gate
+  above cannot quietly stop the warning the kind exists for.
 - `TestNoBufferingSSE` passes unchanged for `full`, and is extended to cover `off` — the gate on
   half A being free, on the policy that adds a second wrapper to the response body.
 - `go build ./...`, `go vet ./...`, `go test ./...` pass.
@@ -243,9 +274,19 @@ the context doc all say.
   implementer following it literally would have been sent to a file that isn't there. Caught by the
   implementation cross-review as a spec escalation; the shipped test is
   `TestNewTailerWiresTheBodyPolicy`.)*
-- Unit Tests (`internal/store/merge_test.go`): a bodyless complete row and a transcript row for the
-  same `request_id`, **in both orderings**, asserting the merged row keeps the observed counts.
-  Both are needed because only the jsonl-first ordering reaches the branch that lost them.
+- Unit Tests (`internal/store/merge_test.go`), a pair — the second is what stops the first from
+  being satisfied by a fix that is too broad:
+  - `TestMergeDoesNotLetABodylessRowZeroObservedUsage`: a bodyless complete row and a transcript row
+    for the same `request_id`, **in both orderings**, asserting the merged row keeps the observed
+    counts *and* that no `source_mismatch` was attached. Both orderings are needed because the thin
+    row is `incoming` in one and `existing` in the other, so a fix that handled only the losing one
+    would pass half the time. The fixture must zero **all six** token columns, not the two the
+    assertion reads: `fullEvent` populates the cache columns, and leaving them set makes the fixture
+    a row that *had* been measured — the opposite of the shape under test. That is not hypothetical;
+    the first version of this test did exactly that and failed for the wrong reason.
+  - `TestMergeStillWarnsOnATrueDisagreement`: two complete captures, both measured, differing on the
+    numbers. Narrowing the mismatch condition too far would silently stop reporting real
+    disagreements, and nothing else in the suite would notice.
 - Unit Tests (`internal/web/assets_test.go`): the transcript section's cap comparison, as a
   source-shape assertion with `TestAssetsTheBodyRendererEscapes`'s stated ceiling unchanged.
 - Integration Tests: none — no API or schema change. `transcript_content` is already nullable, so
@@ -255,17 +296,17 @@ the context doc all say.
 
 ## Files to Touch
 
-- `internal/proxy/proxy.go` (modify — remove the `off` early return at `:59`; make the buffers and
-  the `io.TeeReader` conditional on the policy; guard `reqBody` in `submit` at `:225` **and in
-  `requestID` at `:275`, per decision 8**)
+- `internal/proxy/proxy.go` (modify — remove `New`'s `off` early return; make the buffers and the
+  `io.TeeReader` conditional on the policy; guard `reqBody` in **both** `submit` and `requestID`,
+  per decision 8)
 - `internal/proxy/proxy_test.go` (modify — the off-policy capture and redaction cases, and the
   missing-`Request-Id` / unreachable-upstream pair)
 - `internal/jsonlogs/jsonlogs.go` (modify — the `SetBodyPolicy` seam beside the existing `Set*`s, and
-  the content write at `:411-414`)
+  the content write in `buildEvent`)
 - `internal/jsonlogs/jsonlogs_test.go` (modify — the three policy cases)
-- `internal/cli/ingest.go` (modify — wire the policy in `newTailer`, `:79-93`)
+- `internal/cli/ingest.go` (modify — wire the policy in `newTailer`)
 - `internal/cli/cli_test.go` (modify — the wiring assertion; see the Test Specifications note)
-- `internal/cli/serve.go` (modify — `printBanner`'s doc comment at `:408-409` only; the string is
+- `internal/cli/serve.go` (modify — `printBanner`'s doc comment only; the string is
   already correct)
 - `internal/store/merge.go` (modify — the observed-usage guard after the completeness pick, decision 2a)
 - `internal/store/merge_test.go` (modify — that guard, in both orderings)

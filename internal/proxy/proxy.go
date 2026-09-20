@@ -275,11 +275,13 @@ func (st *captureState) requestID(respHeaders http.Header) string {
 	// reqBody is nil under --body-policy off, and the hash of it is a
 	// constant. That costs the key nothing: this branch is already the
 	// fallback for "upstream sent no Request-Id", and the started_at_ns and
-	// attempt fields below are what make the key unique -- the body hash only
-	// disambiguates two *identical* bodies, which a body we did not keep cannot
-	// do anyway. Guarded rather than branched at the call site because this
-	// runs on the ErrorHandler path too, where respHeaders is nil and the early
-	// return above cannot help.
+	// attempt fields below are what make the key unique. The hash's only job is
+	// to *separate* two calls whose bodies differ; two calls whose bodies are
+	// alike hash alike, which is why the attempt counter is what keeps them
+	// apart -- and a body we never kept has no hash to contribute either way.
+	// Guarded rather than branched at the call site because this runs on the
+	// ErrorHandler path too, where respHeaders is nil and the early return
+	// above cannot help.
 	var reqBody []byte
 	if st.reqBody != nil {
 		reqBody = st.reqBody.Bytes()

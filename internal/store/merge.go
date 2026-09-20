@@ -143,18 +143,6 @@ func insertOrMerge(ctx context.Context, tx *sql.Tx, ev *Event) (id int64, sessio
 // structurally cannot supply (proxy-only capture fields for a JSONL row,
 // and the JSONL-only fields for a proxy row) are backfilled from whichever
 // side actually has them.
-// usageObserved reports whether a row carries any measured token count at all.
-// It is the "was this ever observed" test, not a "was this expensive" one: a
-// row captured under --body-policy off has no usage because usage is parsed out
-// of the response body, and every one of its token columns is the zero value of
-// never having looked. Reading that zero as a measurement is the same error as
-// reading an unpriced API row's absent cost as $0.00.
-func usageObserved(ev *Event) bool {
-	return ev.InputTokens != 0 || ev.OutputTokens != 0 ||
-		ev.CacheWrite5mTokens != 0 || ev.CacheWrite1hTokens != 0 ||
-		ev.CacheReadTokens != 0 || ev.ThinkingTokens != 0
-}
-
 func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	merged := *existing
 	merged.SourceRefs = unionStrings(existing.SourceRefs, append([]string{existing.Source}, incoming.Source))
@@ -179,7 +167,14 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	switch {
 	case existing.CaptureComplete && incoming.CaptureComplete:
 		winner = incoming
-		mismatch = tokensDiffer
+		// A disagreement needs two measurements. This function's own contract
+		// says "a 0-vs-N difference is not a disagreement", and under
+		// --body-policy off that is exactly the pair a merge produces: the
+		// proxy row looked at nothing, so all six of its columns are zero, and
+		// ungated this fired a source_mismatch at SeverityError on every
+		// off-policy call that merged -- in the *ordinary* proxy-first
+		// ordering, not a race. Reproduced before it was fixed.
+		mismatch = tokensDiffer && usageObserved(existing) && usageObserved(incoming)
 	case !existing.CaptureComplete && incoming.CaptureComplete:
 		winner = incoming
 	}
@@ -204,8 +199,9 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 			loser = existing
 		}
 		if usageObserved(loser) {
+			// No mismatch here either: the swap happens precisely *because*
+			// one side never looked, which is an absence, not a conflict.
 			winner = loser
-			mismatch = tokensDiffer
 		}
 	}
 
@@ -330,6 +326,18 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	merged.TranscriptRole = preferNonEmpty(existing.TranscriptRole, incoming.TranscriptRole)
 
 	return &merged, mismatch
+}
+
+// usageObserved reports whether a row carries any measured token count at all.
+// It is the "was this ever observed" test, not a "was this expensive" one: a row
+// captured under --body-policy off has no usage because usage is parsed out of
+// the response body, and every one of its token columns is the zero value of
+// never having looked. Reading that zero as a measurement is the same error as
+// reading an unpriced API row's absent cost as $0.00.
+func usageObserved(ev *Event) bool {
+	return ev.InputTokens != 0 || ev.OutputTokens != 0 ||
+		ev.CacheWrite5mTokens != 0 || ev.CacheWrite1hTokens != 0 ||
+		ev.CacheReadTokens != 0 || ev.ThinkingTokens != 0
 }
 
 func preferNonEmpty(existing, incoming string) string {
