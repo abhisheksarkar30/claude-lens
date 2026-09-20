@@ -309,6 +309,89 @@ func TestCaptureRecordsUnderPolicyOff(t *testing.T) {
 	}
 }
 
+// TestPolicyOffSurvivesAMissingRequestID is the regression the first version of
+// br-GI-7-09 shipped. captureState.requestID hashes st.reqBody to build its
+// fallback key, and under "off" that field is nil -- so any call whose response
+// carried no Request-Id panicked on a nil *boundedBuffer. net/http recovers a
+// handler panic and logs it, so the suite stayed green while the row was
+// silently never submitted.
+//
+// Both paths are here because they reach the same line and only one of them
+// looks like an error: a 200 with no Request-Id, and an unreachable upstream,
+// where respHeaders is nil so the early return above cannot help and the panic
+// lands *before* ErrorHandler's WriteHeader(502) -- turning a failed upstream
+// into an aborted request and breaking fail-open for the client.
+func TestPolicyOffSurvivesAMissingRequestID(t *testing.T) {
+	tests := []struct {
+		name       string
+		upstream   func(t *testing.T) string
+		wantStatus int
+		wantRow    bool
+	}{
+		{
+			name: "no Request-Id header on a healthy response",
+			upstream: func(t *testing.T) string {
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					// Deliberately no Request-Id: requestID must fall back.
+					w.WriteHeader(http.StatusOK)
+					w.Write([]byte(`{}`))
+				}))
+				t.Cleanup(srv.Close)
+				return srv.URL
+			},
+			wantStatus: http.StatusOK,
+			wantRow:    true,
+		},
+		{
+			name: "unreachable upstream, so respHeaders is nil",
+			upstream: func(t *testing.T) string {
+				// Nothing listens here -- every dial fails.
+				return "http://127.0.0.1:1"
+			},
+			wantStatus: http.StatusBadGateway,
+			wantRow:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig(tt.upstream(t))
+			cfg.BodyPolicy = "off"
+			sk := sink.New(16)
+			h, err := New(cfg, sk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			front := httptest.NewServer(h)
+			defer front.Close()
+
+			resp, err := http.Get(front.URL + "/v1/messages")
+			if err != nil {
+				// The fail-open half: a panic inside submit aborts the
+				// connection before the error response is written, so the
+				// client sees this instead of a 502.
+				t.Fatalf("client got an aborted request instead of a response: %v", err)
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+
+			if resp.StatusCode != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tt.wantStatus)
+			}
+			call := captureOne(t, sk)
+			if call.Method != http.MethodGet {
+				t.Errorf("Method = %q, want GET", call.Method)
+			}
+			// The synthetic key is the whole reason requestID ran at all, and
+			// an empty one would collapse every off-policy row onto a single
+			// UNIQUE request_id.
+			if !strings.HasPrefix(call.RequestID, "proxy:") {
+				t.Errorf("RequestID = %q, want a proxy: synthetic key", call.RequestID)
+			}
+		})
+	}
+}
+
 // All the cases are one table on purpose. The regression this guards is as
 // much "the response half stopped being checked" as "the request half is not",
 // and a request-only test would let the first through.

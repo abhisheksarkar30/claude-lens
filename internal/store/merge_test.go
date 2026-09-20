@@ -874,3 +874,65 @@ func TestMergePrefersTheWhollyCapturedRowOverATruncatedRequest(t *testing.T) {
 		t.Error("merged CaptureComplete = false, want true: one side captured the request whole")
 	}
 }
+
+// TestMergeDoesNotLetABodylessRowZeroObservedUsage is the hazard br-GI-7-09
+// introduced and its review caught, pinned in both orderings.
+//
+// Under --body-policy off the proxy writes a row with no bodies, and every
+// token column is zero because usage is parsed out of the response body it
+// never kept. That row also reports CaptureComplete *true* -- nothing was
+// narrowed -- so the flag-based pick hands it the win whenever it arrives
+// second, and the zero it carries is not a measurement. The merged row would
+// lose the transcript's real counts and gain a spurious source_mismatch.
+//
+// Both orderings are here because they reach different branches: proxy-first
+// takes the `!existing && incoming` case, jsonl-first takes the `&&` case, and
+// the second is the one that lost the data.
+func TestMergeDoesNotLetABodylessRowZeroObservedUsage(t *testing.T) {
+	for _, first := range []string{"jsonl", "proxy"} {
+		t.Run(first+" first", func(t *testing.T) {
+			st := newTestStore(t)
+			ctx := context.Background()
+
+			jsonl := fullEvent("req-gi7-off-merge")
+			jsonl.Source, jsonl.FirstSource = "jsonl", "jsonl"
+			jsonl.CaptureComplete = true
+			jsonl.InputTokens, jsonl.OutputTokens = 111, 55
+
+			// The off-policy row: complete, and empty because nothing was kept.
+			// All six token columns, not just the two the assertion reads --
+			// fullEvent populates the cache columns, and leaving them set made
+			// this fixture a row that *had* been measured, which is the
+			// opposite of the shape under test.
+			empty := fullEvent("req-gi7-off-merge")
+			empty.Source, empty.FirstSource = "proxy", "proxy"
+			empty.CaptureComplete = true
+			empty.InputTokens, empty.OutputTokens = 0, 0
+			empty.CacheWrite5mTokens, empty.CacheWrite1hTokens = 0, 0
+			empty.CacheReadTokens, empty.ThinkingTokens = 0, 0
+			empty.ReqBody, empty.RespBody = nil, nil
+
+			rows := []*Event{jsonl, empty}
+			if first == "proxy" {
+				rows[0], rows[1] = rows[1], rows[0]
+			}
+			if _, _, err := st.InsertEvent(ctx, rows[0]); err != nil {
+				t.Fatalf("InsertEvent first: %v", err)
+			}
+			id, _, err := st.InsertEvent(ctx, rows[1])
+			if err != nil {
+				t.Fatalf("InsertEvent second (merge): %v", err)
+			}
+
+			got, err := st.GetEvent(ctx, id)
+			if err != nil {
+				t.Fatalf("GetEvent: %v", err)
+			}
+			if got.InputTokens != 111 || got.OutputTokens != 55 {
+				t.Errorf("tokens = %d/%d, want the observed 111/55: a row with no bodies has no "+
+					"measurement to contribute, and its zeros are 'never looked', not 'none'",
+					got.InputTokens, got.OutputTokens)
+			}
+		})
+	}
+}

@@ -80,11 +80,38 @@ over — so the hot path is unchanged and `TestNoBufferingSSE` is the proof.
 `jsonlogs`: the tailer stores no `TranscriptContent`/`TranscriptRole`, so both columns stay NULL —
 "no transcript reconstruction", the same meaning a non-assistant line already has.
 
-**2. Under `off`, `CaptureComplete` is `true`.** The flag is about *narrowing* — a body cut at the
-cap, or a stream that ended early (`sink.go:41-44`) — and under `off` nothing was narrowed; the
-absence is a policy the operator set, uniformly, and visible in `clens doctor`'s `body_policy` line.
-Setting it false would make `analyze`'s `stream_incomplete` fire on every 200 and would make every
-`off` row lose the merge token pick, for a reason that has nothing to do with either rule's subject.
+**2. Under `off`, `CaptureComplete` is `true`, and the merge — not the flag — carries the
+consequence.**
+
+The flag is about *narrowing*: a body cut at the cap, or a stream that ended early (`sink.go:41-44`).
+Under `off` nothing was narrowed — the absence is a policy the operator set, uniformly, and visible
+in `clens doctor`'s `body_policy` line. Setting it false is the alternative and it is worse: the
+response's `Content-Type` survives `off`, so `parse.ExtractUsage` still reports `IsStream` true for a
+streamed call and `ruleStreamIncomplete` would fire at `SeverityError` on *every* streamed request,
+claiming a truncation that never happened. A flood of false error warnings is not a trade this repo
+makes anywhere else.
+
+But the flag alone does not carry the whole decision, and the first draft of this bead got that
+backwards. `merge.go`'s pick is:
+
+```go
+case existing.CaptureComplete && incoming.CaptureComplete:
+    winner = incoming            // <-- the thin off row wins if it arrives second
+```
+
+so with jsonl-first ordering the `off` row takes the token pick and **zeroes the transcript's
+observed counts**, plus a spurious `source_mismatch`. (Proxy-first is harmless: `!existing &&
+incoming` hands the win to the jsonl row.) The draft claimed the opposite — that `false` would cost
+the `off` row the pick — when losing that pick is exactly what a row with nothing to contribute
+*should* do. Naming the hazard is not fixing it, so this bead also corrects the pick.
+
+**2a. The merge will not let an unobserved zero overwrite an observed count.** Both orderings,
+because they reach different branches. The rule the flag encodes is "prefer the more complete
+record", and a row that kept no body has no record of usage to prefer — its zeros mean *never
+looked*, not *none*, which is the same distinction `cost-and-quota.md` draws between an unpriced row
+and a `$0.00` one. So after the flag's pick, if the winner has no observed usage and the loser has
+some, the loser wins and the disagreement is reported. Both-zero and both-nonzero are untouched: the
+first has nothing to lose, the second is the ordinary two-captures case the rule was written for.
 
 **3. Headers are still captured under `off`.** The flag is `--body-policy`, not `--capture-policy`,
 and the banner's promise is "without their bodies". `req_headers`/`resp_headers` are redacted exactly
@@ -116,7 +143,21 @@ adds. Pinned by a test, so a later change to it is a decision rather than a side
 **7. The dashboard's transcript section gets the cap marker the bodies have.** `app.js`'s transcript
 block already labels its provenance; it gains the same length-against-`BodyCapBytes` comparison
 `readPathMarker` uses, so a capped reconstruction cannot look identical to a whole one. This is the
-lesson `br-GI-7-08` was about, applied to the third content column rather than discovered again.
+lesson `br-GI-7-08` was about, applied to the third content column rather than discovered again. Its
+wording names the measurement and then the inference, because a content exactly the cap's length may
+simply have been that long — the same hedge `captureMarker` carries.
+
+**8. `requestID` must tolerate a nil `reqBody`, which the first draft did not.** `captureState.requestID`
+hashes `st.reqBody` to build its fallback key, and under `off` that field is nil, so
+`(*boundedBuffer).Bytes` dereferenced a nil receiver. It fires on any response with no `Request-Id`
+header and **always** on the `ErrorHandler` path, where `respHeaders` is nil and the early return
+cannot help — and there the panic lands *before* `WriteHeader(502)`, so a failed upstream returned an
+aborted request instead of a bad gateway. That is a fail-open regression against CLAUDE.md's "a
+broken observer never breaks the user's coding session", and `net/http` recovers handler panics and
+logs them, so the whole suite stayed green while the beacon row was silently never submitted. The
+guard goes in `requestID`, not at its call sites, because both paths reach the same line; the hash of
+a body we did not keep is a constant, and this branch is already the fallback whose uniqueness comes
+from `started_at_ns` and the attempt counter.
 
 ### What this bead does not fix
 
@@ -163,8 +204,14 @@ the context doc all say.
   the cap and the row's `CaptureComplete` is **unchanged from what it would otherwise be**.
 - `newTailer` wires the policy, so `clens ingest`, `clens serve` and `clens refresh` cannot disagree.
 - The dashboard's transcript section draws a cap marker for content whose length equals
-  `BodyCapBytes`, and none otherwise.
-- `TestNoBufferingSSE` passes unchanged — the gate on half A being free.
+  `BodyCapBytes`, and none otherwise — and the assertion covers that the branch *calls* it, not only
+  that the function is correct.
+- A request with no `Request-Id` header, and an unreachable upstream, both produce a row and the
+  latter still answers `502`: no panic escapes `submit`, in either path.
+- A merge between a transcript row and a bodyless complete row keeps the transcript's observed
+  counts in **both** write orderings.
+- `TestNoBufferingSSE` passes unchanged for `full`, and is extended to cover `off` — the gate on
+  half A being free, on the policy that adds a second wrapper to the response body.
 - `go build ./...`, `go vet ./...`, `go test ./...` pass.
 
 ## Test Specifications
@@ -188,8 +235,17 @@ the context doc all say.
     flag to the cap.
   - The seam unwired (`capBytes <= 0`): content is stored whole, so a caller that forgets the seam
     cannot silently truncate every transcript to zero.
-- Unit Tests (`internal/cli/ingest_test.go`): `newTailer` propagates the configured policy and cap —
-  the wiring, which is the half a unit test of either endpoint would miss.
+- Unit Tests (`internal/cli/cli_test.go`): `newTailer` propagates the configured policy and cap —
+  the wiring, which is the half a unit test of either endpoint would miss. *(This bullet named
+  `internal/cli/ingest_test.go` in the bead's first draft. That file does not exist — `internal/cli`'s
+  test files are `cli_test.go`, `additions_test.go`, `replay_test.go`, `serve_test.go` and
+  `doctor_test.go` — and the draft's Files to Touch named no `internal/cli` test file at all, so an
+  implementer following it literally would have been sent to a file that isn't there. Caught by the
+  implementation cross-review as a spec escalation; the shipped test is
+  `TestNewTailerWiresTheBodyPolicy`.)*
+- Unit Tests (`internal/store/merge_test.go`): a bodyless complete row and a transcript row for the
+  same `request_id`, **in both orderings**, asserting the merged row keeps the observed counts.
+  Both are needed because only the jsonl-first ordering reaches the branch that lost them.
 - Unit Tests (`internal/web/assets_test.go`): the transcript section's cap comparison, as a
   source-shape assertion with `TestAssetsTheBodyRendererEscapes`'s stated ceiling unchanged.
 - Integration Tests: none — no API or schema change. `transcript_content` is already nullable, so
@@ -200,13 +256,18 @@ the context doc all say.
 ## Files to Touch
 
 - `internal/proxy/proxy.go` (modify — remove the `off` early return at `:59`; make the buffers and
-  the `io.TeeReader` conditional on the policy; guard `reqBody` in `submit` at `:225`)
-- `internal/proxy/proxy_test.go` (modify — the off-policy capture and redaction cases)
+  the `io.TeeReader` conditional on the policy; guard `reqBody` in `submit` at `:225` **and in
+  `requestID` at `:275`, per decision 8**)
+- `internal/proxy/proxy_test.go` (modify — the off-policy capture and redaction cases, and the
+  missing-`Request-Id` / unreachable-upstream pair)
 - `internal/jsonlogs/jsonlogs.go` (modify — the `SetBodyPolicy` seam beside the existing `Set*`s, and
   the content write at `:411-414`)
 - `internal/jsonlogs/jsonlogs_test.go` (modify — the three policy cases)
 - `internal/cli/ingest.go` (modify — wire the policy in `newTailer`, `:79-93`)
+- `internal/cli/cli_test.go` (modify — the wiring assertion; see the Test Specifications note)
 - `internal/cli/serve.go` (modify — `printBanner`'s doc comment at `:408-409` only; the string is
   already correct)
+- `internal/store/merge.go` (modify — the observed-usage guard after the completeness pick, decision 2a)
+- `internal/store/merge_test.go` (modify — that guard, in both orderings)
 - `internal/web/app.js` (modify — the transcript section's cap marker)
-- `internal/web/assets_test.go` (modify — the assertion for it)
+- `internal/web/assets_test.go` (modify — the assertion for it, including that it is *called*)

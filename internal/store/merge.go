@@ -143,6 +143,18 @@ func insertOrMerge(ctx context.Context, tx *sql.Tx, ev *Event) (id int64, sessio
 // structurally cannot supply (proxy-only capture fields for a JSONL row,
 // and the JSONL-only fields for a proxy row) are backfilled from whichever
 // side actually has them.
+// usageObserved reports whether a row carries any measured token count at all.
+// It is the "was this ever observed" test, not a "was this expensive" one: a
+// row captured under --body-policy off has no usage because usage is parsed out
+// of the response body, and every one of its token columns is the zero value of
+// never having looked. Reading that zero as a measurement is the same error as
+// reading an unpriced API row's absent cost as $0.00.
+func usageObserved(ev *Event) bool {
+	return ev.InputTokens != 0 || ev.OutputTokens != 0 ||
+		ev.CacheWrite5mTokens != 0 || ev.CacheWrite1hTokens != 0 ||
+		ev.CacheReadTokens != 0 || ev.ThinkingTokens != 0
+}
+
 func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	merged := *existing
 	merged.SourceRefs = unionStrings(existing.SourceRefs, append([]string{existing.Source}, incoming.Source))
@@ -170,6 +182,31 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 		mismatch = tokensDiffer
 	case !existing.CaptureComplete && incoming.CaptureComplete:
 		winner = incoming
+	}
+
+	// ...with one correction, which the completeness flag alone cannot make.
+	// A row captured under --body-policy off reports CaptureComplete true --
+	// nothing was narrowed, the body was simply never kept -- and carries no
+	// usage at all, because usage is parsed out of the response body. Under the
+	// rule above that row *wins* whenever it arrives second, zeroing the
+	// populated tokens of the jsonl row it merged with, and the zero is not a
+	// measurement: it means "never observed", the same distinction
+	// cost-and-quota draws between an unpriced row and a $0.00 one. So a row
+	// with no observed usage never takes the pick from a row that has some.
+	//
+	// Both-zero and both-nonzero keep the flag's decision untouched: the first
+	// has nothing to lose, and the second is the ordinary two-captures case
+	// this rule was written for. winner is only ever one of the two arguments,
+	// so the identity test below is exact.
+	if !usageObserved(winner) {
+		loser := incoming
+		if winner == incoming {
+			loser = existing
+		}
+		if usageObserved(loser) {
+			winner = loser
+			mismatch = tokensDiffer
+		}
 	}
 
 	merged.InputTokens = winner.InputTokens

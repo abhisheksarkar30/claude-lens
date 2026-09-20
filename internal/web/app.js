@@ -233,14 +233,18 @@ function captureMarker(e) {
 // It is deliberately NOT driven by CaptureComplete: that flag is about the two
 // teed bodies, and a capped transcript has not truncated any capture. Length
 // against the cap is the only signal there is, and it is the same one the
-// bodies use -- with the same caveat, that a content exactly the cap's length
-// might be a coincidence, which is why the wording says the cap is the cause
-// "on this row" rather than asserting it always is.
+// bodies use, and with the same caveat the wording carries: a content exactly
+// the cap's length might be a coincidence, which is why the marker names the
+// measurement and then the inference rather than asserting the line was cut.
 function transcriptCapMarker(e) {
   if (!e.BodyCapBytes) return '';
   if (wireBytes(e.TranscriptContent).length !== e.BodyCapBytes) return '';
-  return 'reconstruction capped at the ' + fmtInt(e.BodyCapBytes) +
-    '-byte read cap — the transcript line carried more than this';
+  // States the measurement, then names the inference -- the same shape
+  // captureMarker uses, and for the same reason: a content exactly the cap's
+  // length may simply have been that long, so asserting "it carried more"
+  // would claim a cause this row does not record.
+  return 'capped, or exactly this long — the stored reconstruction is the ' +
+    fmtInt(e.BodyCapBytes) + '-byte read cap, so the cap is the cause on this row';
 }
 
 // --------------------------------------------------------- list/detail modes

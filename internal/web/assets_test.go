@@ -530,4 +530,22 @@ func TestAssetsTheBodyRendererEscapes(t *testing.T) {
 	if strings.Index(tcap, "BodyCapBytes") > strings.Index(tcap, "TranscriptContent") {
 		t.Error("transcriptCapMarker compares TranscriptContent before checking BodyCapBytes is wired")
 	}
+
+	// And it must actually be *called*, which is not the same assertion.
+	// Deleting the call from the transcript branch leaves this function perfect
+	// and never rendered, and every check above still passes -- the marker
+	// would simply never appear, which is precisely the defect the marker
+	// exists to prevent.
+	//
+	// Scoped to showCall's body, not the whole file: `transcriptCapMarker(e)`
+	// also matches the function's own definition, so a file-wide Contains is
+	// satisfied by the definition alone and passes with the call deleted. That
+	// vacuous version was written first and the mutation check caught it.
+	call, ok := funcBody(js, "showCall")
+	if !ok {
+		t.Fatal("app.js has no top-level showCall, so the call site cannot be located")
+	}
+	if !strings.Contains(call, "transcriptCapMarker(e)") {
+		t.Error("transcriptCapMarker is defined but never called from showCall: the marker never renders")
+	}
 }
