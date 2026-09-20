@@ -885,9 +885,17 @@ func TestMergePrefersTheWhollyCapturedRowOverATruncatedRequest(t *testing.T) {
 // second, and the zero it carries is not a measurement. The merged row would
 // lose the transcript's real counts and gain a spurious source_mismatch.
 //
-// Both orderings are here because they reach different branches: proxy-first
-// takes the `!existing && incoming` case, jsonl-first takes the `&&` case, and
-// the second is the one that lost the data.
+// Both orderings are here because the thin row is the `incoming` argument in one
+// and the `existing` argument in the other -- the *same* `case existing.
+// CaptureComplete && incoming.CaptureComplete` both times, since both rows are
+// complete, so only the argument order differs and a fix that handled one
+// ordering would pass half the time. (`!existing && incoming` cannot fire here:
+// it needs an incomplete `existing`, and neither row is ever incomplete.)
+//
+// A first draft of this comment claimed the two orderings reached different
+// branches. They do not, and the claim survived into a bead before review caught
+// it -- removal of the guard below failing the test in *both* orderings is the
+// reading that shows it.
 func TestMergeDoesNotLetABodylessRowZeroObservedUsage(t *testing.T) {
 	for _, first := range []string{"jsonl", "proxy"} {
 		t.Run(first+" first", func(t *testing.T) {

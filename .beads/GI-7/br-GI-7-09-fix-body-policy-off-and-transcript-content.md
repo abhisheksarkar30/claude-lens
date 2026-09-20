@@ -58,11 +58,16 @@ observability while dropping content, and silently loses the records too. No tes
 
 ### Half B — `internal/jsonlogs` never consults the policy at all
 
-`BodyPolicy` is read at exactly one call site in the repo: `New` in `internal/proxy/proxy.go`,
-which branches on `cfg.BodyPolicy != "off"` and returns the bare `ReverseProxy`. `internal/jsonlogs` writes
-`ev.TranscriptContent = l.Message.Content` unconditionally in `buildEvent`, so an install running
-`--body-policy off` still stores a transcript line's `content` whole and uncapped. Neither the plan
-nor `br-GI-7-06` mentions the policy, which is why this reads as an oversight rather than a choice.
+**As it was before this bead.** `BodyPolicy` was read at exactly one call site in the repo — `New` in
+`internal/proxy/proxy.go` — and `internal/jsonlogs` wrote `ev.TranscriptContent = l.Message.Content`
+unconditionally in `buildEvent`, so an install running `--body-policy off` still stored a transcript
+line's `content` whole and uncapped. Neither the plan nor `br-GI-7-06` mentions the policy, which is
+why this reads as an oversight rather than a choice.
+
+Both of those sentences describe the code this bead replaces. They are kept in the past tense on
+purpose: every claim in this section is about the state the bead was written against, and the shipped
+code is what the decisions below describe. The distinction is not pedantry — it is the defect three
+review rounds kept finding, where a sentence written before the change was read after it.
 
 Half B cannot be specified without half A: if `off` means "no capture" in the proxy, the consistent
 reading for the transcript collector is "write no row", which would silently stop `clens ingest`.
@@ -147,12 +152,32 @@ as before.
 
 **4. The `off` row is thin, and that is the honest consequence.** A body that was never captured
 cannot be parsed: `parse.ExtractMeta(nil, …)` yields an empty `Meta` and `parse.ExtractUsage(nil, …)`
-yields a zero `Usage`, so the row carries method/path/status/headers/TTFB/duration and no model, no
-tokens, no cost. Walking `internal/analyze/rules.go`: every event-level rule keys on `meta`, `usage`,
-or `ev.StopReason` and goes inert, leaving only the ones that key on `ev.Status`/`ev.AuthKind`
-(`rate_limited`, `overloaded`, `upstream_error_body`, `auth_kind_anomaly`) — which is precisely the
-set that remains useful without bodies. This is recorded, not worked around: a row with no tokens is
-the truthful record of a call whose body was not kept.
+yields a zero `Usage` — but *not* an inert one, since `ExtractUsage` switches on the `Content-Type`
+header, which `off` still records. So the row carries method/path/status/headers/TTFB/duration and no
+model, no tokens, no cost.
+
+**Which warnings survive, read off each rule's own guard rather than from memory** — the rule list
+here was wrong in the first draft, which named `upstream_error_body` among the survivors when it is
+the one rule that provably cannot fire:
+
+| Rule | Under `off` | Why |
+|---|---|---|
+| `cache_breakpoints_exceeded`, `cache_prefix_below_minimum` | inert | need `meta.CacheControlSites` / `meta.HasCacheControl` |
+| `thinking_budget_rejected`, `thinking_display_omitted` | inert | need `meta.HasThinking` |
+| `max_tokens_truncation`, `refusal` | inert | need `usage.StopReason` |
+| `api_equivalent_cost` | inert | needs a priced subscription row; nothing was priced |
+| `upstream_error_body` | **inert** | returns early on `len(ev.RespBody) == 0`, and `RespBody` is NULL here |
+| `stream_incomplete` | inert | needs `!ev.CaptureComplete` — decision 2, not a zeroed input |
+| `rate_limited`, `overloaded` | **fires** | key on `ev.Status` (429 / 529) |
+| `auth_kind_anomaly` | **fires** | keys on `ev.AuthKind` and `ev.Path` |
+
+Plus `upstream_error`, which is not a rule at all: it comes from `internal/consumer`'s
+transport-failure path, and fires on an `off` row whenever the call errored — which is exactly the
+path decision 8 repairs.
+
+The session rules are all inert for the first reason: they read the token columns, which are zero.
+This is recorded, not worked around: a row with no tokens is the truthful record of a call whose body
+was not kept, and the three survivors are the ones that never needed the body.
 
 **5. `jsonlogs` gets the cap too, and a `Set*` seam — not a `config` import.** `capBytes <= 0` means
 *no cap*, so the tailer's own default (the seam unwired) never silently truncates to zero bytes. The
@@ -163,10 +188,15 @@ drift.
 **6. A capped transcript is *not* a capped capture: `CaptureComplete` is not cleared, and
 `transcript_content` is not a body.** `br-GI-7-08` widened the flag to cover both *teed* bodies, and
 this is deliberately not a third. `transcript_content` lives in its own columns precisely because it
-is a reconstruction rather than a capture (`br-GI-7-06`), and clearing the flag would make a `jsonl`
-row lose the merge token pick over a column the merge never reads for tokens. The truncation is
-instead made visible the way a body's is — by length against the cap — which is what decision 7
-adds. Pinned by a test, so a later change to it is a decision rather than a side effect.
+is a reconstruction rather than a capture (`br-GI-7-06`), and the flag's meaning is "was a *capture*
+narrowed" — a reconstruction cut at a cap narrows nothing that was ever captured.
+
+The first draft gave a second reason that 2a then invalidated: that clearing the flag would cost a
+`jsonl` row the merge token pick. With the observed-usage guard in place it no longer would — the
+guard protects a row with measured counts regardless of the flag. The decision stands on the first
+ground alone, and the truncation is made visible the way a body's is — by length against the cap —
+which is what decision 7 adds. Pinned by a test, so a later change to it is a decision rather than a
+side effect.
 
 **7. The dashboard's transcript section gets the cap marker the bodies have.** `app.js`'s transcript
 block already labels its provenance; it gains the same length-against-`BodyCapBytes` comparison
