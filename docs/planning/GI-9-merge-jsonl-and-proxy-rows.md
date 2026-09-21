@@ -1500,6 +1500,53 @@ the expected handful of `source_mismatch` warnings (§6). (4) **The drawer is al
 **303** ids with no verbatim transcript match — every miss a true absentee — so the live run
 **re-confirms** the zero rather than establishing it.
 
+#### Result (br-GI-9-06, recorded 2026-09-21)
+
+Run against the live `~/.clens/lens.db` (983 MB; 96,690 `events` / 648 `sessions` before the run),
+with `clens serve` stopped and a verified backup taken first —
+`~/.clens/backups/lens.db.pre-gi9-20260921-131105`, sha256-matched against the live file at the
+moment of the copy, `PRAGMA integrity_check: ok`. The corpus is larger than either prior pass (2,915
+distinct proxy body ids here, against 663 and 1,203 before), which is expected — §2's preamble names
+the absolutes as perishable for exactly this reason.
+
+1. **Premise check.** 3,166 proxy rows scanned (`source='proxy' AND resp_body IS NOT NULL`); 251
+   yielded no id; **2,915 distinct proxy body ids**. 1,194 transcript files walked (312,494 lines) for
+   distinct `message.id`: **2,396 of 2,915 matched verbatim — 82.2%**. The ratio moved the same
+   direction it did between the two prior passes (77% → 79% → 82.2%, each on a larger corpus than the
+   last) — **the relation holds**, which confirms the premise; it does not by itself validate the
+   story (that is check 2).
+2. **The check that validates the story.** Post-rekey, **2,396** rows carry `source_refs` containing
+   both `proxy` and `jsonl` — 0 before the run. This is not merely within the expected ratio, it is
+   **exactly** check (1)'s "matched verbatim" count, which is what D1's one-id-one-row collapse
+   predicts rather than approximates: every proxy id with a verbatim transcript match now owns one row
+   carrying both sources.
+3. **The row-count drop, from the command's own report** (`clens rekey --yes`, verbatim):
+   ```
+   pass 1 (proxy body id): re-keyed 2915, left 266 synthetic (no body id)
+   pass 2 (proxy session): re-attributed 3139, left 42 unattributed
+   dangling replay_of: 0
+   pass 3 (jsonl re-ingest): deleted 76465 jsonl-keyed row(s), re-inserted 44262 (re-priced against the current rate table)
+   ```
+   Pass 3's net drop is **32,203** rows — "tens of thousands," as the acceptance line requires, and
+   larger than §2.4's 28,405-row floor, consistent with the corpus having grown since that measurement
+   rather than disagreeing with it. Total `events` rows: 96,690 → **45,047**. `sessions` rows:
+   648 → **216**, the D7 session collapse. `PRAGMA integrity_check` after the run: **ok**.
+4. **The drawer, re-confirmed.** Of the 519 proxy ids with no verbatim transcript match (larger than
+   the frozen 303 because the corpus grew), the interval+token discriminator (§2.3's method: same
+   session, `[started_at, ended_at]` widened by the 3.2s median offset, token columns matching, a
+   **different** id) found **0** mismatches — **519 true absentees, 0 mismatches**. The drawer is
+   still empty at 1.7× the frozen population.
+
+**`source_mismatch` warnings: 7**, across the 2,396 merged rows — a rate consistent in shape with
+§6's "3 of 90" (a rare disagreement, not a widespread one). The absolute is this run's and will move
+with the corpus, exactly as §6 says it would; the operator should expect to see these and not read
+them as failures.
+
+**No figure here disagrees with the story; every figure that differs from §2/§6's frozen ones differs
+because the corpus grew, and the direction and shape match what growth predicts.** The §2.3, §2.4, and
+§6 frozen readings are therefore **re-confirmed by this run, not rewritten** — kept beside these fresh
+figures as §2's preamble instructs, not replaced by them.
+
 ## 6. Risk areas
 
 - **Deleting rows is the destructive act, and it is the point.** The JSONL half deletes; the proxy
