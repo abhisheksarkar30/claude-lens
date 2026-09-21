@@ -51,6 +51,9 @@ func TestResolveSplitsBeyondGapWindow(t *testing.T) {
 	}
 }
 
+// A header-carrying call's identity *is* the header (D7), not merely a
+// grouping key: id1 is asserted equal to the header value itself, not just
+// distinct from id2's.
 func TestResolveHeaderOverridesPrefix(t *testing.T) {
 	r := New(newTestStore(t), 30)
 	base := time.Unix(1700000000, 0)
@@ -62,11 +65,32 @@ func TestResolveHeaderOverridesPrefix(t *testing.T) {
 	if id1 == id2 {
 		t.Error("different session headers with the same prefix grouped, want different sessions")
 	}
+	if id1 != "s1" {
+		t.Errorf("id1 = %q, want the header verbatim (s1)", id1)
+	}
 
 	// Same header, same prefix, within window: groups.
 	id3 := r.Resolve(parse.Meta{PrefixHash: strPtr("abc"), SessionHeader: "s1"}, base.Add(2*time.Minute))
 	if id1 != id3 {
 		t.Error("same session header did not group")
+	}
+}
+
+// Two header-carrying calls beyond the inactivity gap still share one id
+// (D7): a header-carrying call's identity is the header, so the gap
+// window -- which only applies to the header-less fallback -- never
+// splits it.
+func TestResolveHeaderCallsBeyondGapWindowShareID(t *testing.T) {
+	r := New(newTestStore(t), 30)
+	base := time.Unix(1700000000, 0)
+
+	id1 := r.Resolve(headerMeta("conv-abc"), base)
+	id2 := r.Resolve(headerMeta("conv-abc"), base.Add(2*time.Hour))
+	if id1 != id2 {
+		t.Errorf("two header-carrying calls beyond the gap window: id1=%q id2=%q, want equal", id1, id2)
+	}
+	if id1 != "conv-abc" {
+		t.Errorf("id1 = %q, want the header verbatim (conv-abc)", id1)
 	}
 }
 
@@ -78,6 +102,9 @@ func TestResolveHeaderOnOneCallDoesNotGroup(t *testing.T) {
 	withoutHeader := r.Resolve(hashMeta("abc"), base.Add(time.Minute))
 	if withHeader == withoutHeader {
 		t.Error("header-on-one-call/absent-on-the-other grouped, want different sessions")
+	}
+	if withHeader != "s1" {
+		t.Errorf("withHeader = %q, want the header verbatim (s1)", withHeader)
 	}
 }
 

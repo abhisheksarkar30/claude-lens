@@ -12,6 +12,7 @@ import (
 	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/jsonlogs"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
+	"github.com/abhisheksarkar30/claude-lens/internal/session"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
@@ -50,7 +51,12 @@ func runIngest(args []string, w io.Writer) error {
 		}
 	}
 
-	tailer := newTailer(cfg, root, st)
+	// newTailer's collectorStore surface carries no UpsertSession/
+	// ReconcileSession, so the recorder is built here (where the
+	// *store.Store is in hand) and passed in, exactly as addCollectors'
+	// callers do (D7).
+	sess := session.New(st, cfg.SessionGapMinutes)
+	tailer := newTailer(cfg, root, st, sess)
 
 	stats, err := tailer.Poll(ctx)
 	if err != nil {
@@ -75,8 +81,9 @@ func jsonlRoot() string {
 // jsonlRoot() are distinct expressions, and only one of them is the settled
 // default, so a helper that resolved the root itself would silently drop the
 // other's.
-func newTailer(cfg *config.Config, root string, st collectorStore) *jsonlogs.Tailer {
+func newTailer(cfg *config.Config, root string, st collectorStore, recorder jsonlogs.SessionRecorder) *jsonlogs.Tailer {
 	t := jsonlogs.New(root, st)
+	t.SetSessionRecorder(recorder)
 	t.SetPriceTable(newPriceLoader(cfg))
 	// The guard is load-bearing, not decorative: SetAccount assigns
 	// unconditionally and New seeds "subscription", so a zero Account on an

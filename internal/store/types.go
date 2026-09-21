@@ -60,9 +60,12 @@ type EventSummary struct {
 	ApiEquivalentCostUSD *float64
 	CostSource           string
 
-	// PrefixHash's NULL-ness is load-bearing for the session resolver:
-	// nil means "keyed by an explicit session header instead", and a
-	// non-nil "" means the request body did not parse as JSON.
+	// PrefixHash is nil for a JSONL-sourced row (no request body to hash)
+	// and otherwise always populated for a proxy-sourced row (D7): the
+	// session resolver's groupKey checks SessionHeader first, so a
+	// present session header wins there, not by nil-ing this field. A
+	// non-nil "" means the request body did not parse as JSON; any other
+	// non-nil value is the computed hash.
 	PrefixHash *string
 
 	ReplayOf    string

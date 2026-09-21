@@ -597,19 +597,19 @@ func TestNewTailerGuardKeepsTheSeededBillingMode(t *testing.T) {
 	// No subscription account configured: the guard skips SetAccount entirely,
 	// so the mode New seeded survives.
 	cfg := config.Default()
-	if name, mode := newTailer(cfg, t.TempDir(), st).Account(); name != "" || mode != "subscription" {
+	if name, mode := newTailer(cfg, t.TempDir(), st, nil).Account(); name != "" || mode != "subscription" {
 		t.Errorf("Account() = (%q, %q), want (\"\", subscription) when no subscription account is configured", name, mode)
 	}
 
 	// An api-mode account is not a subscription account, and must not be
 	// adopted as one -- that would mis-attribute every JSONL row.
 	cfg.Accounts = []config.Account{{Name: "payg", BillingMode: "api"}}
-	if name, mode := newTailer(cfg, t.TempDir(), st).Account(); name != "" || mode != "subscription" {
+	if name, mode := newTailer(cfg, t.TempDir(), st, nil).Account(); name != "" || mode != "subscription" {
 		t.Errorf("an api-only account was adopted: Account() = (%q, %q), want (\"\", subscription)", name, mode)
 	}
 
 	cfg.Accounts = []config.Account{{Name: "work", BillingMode: "subscription", Plan: "max5x"}}
-	if name, mode := newTailer(cfg, t.TempDir(), st).Account(); name != "work" || mode != "subscription" {
+	if name, mode := newTailer(cfg, t.TempDir(), st, nil).Account(); name != "work" || mode != "subscription" {
 		t.Errorf("Account() = (%q, %q), want (work, subscription)", name, mode)
 	}
 }
@@ -632,7 +632,7 @@ func TestNewTailerWiresTheBodyPolicy(t *testing.T) {
 	cfg.BodyPolicy = "off"
 	cfg.BodyCapBytes = 4096
 
-	policy, capBytes := newTailer(cfg, t.TempDir(), st).BodyPolicy()
+	policy, capBytes := newTailer(cfg, t.TempDir(), st, nil).BodyPolicy()
 	if policy != "off" || capBytes != 4096 {
 		t.Errorf("BodyPolicy() = (%q, %d), want (off, 4096) -- newTailer did not wire the configured policy",
 			policy, capBytes)
@@ -643,7 +643,7 @@ func TestNewTailerWiresTheBodyPolicy(t *testing.T) {
 	// hard-coded "off".
 	cfg.BodyPolicy = "full"
 	cfg.BodyCapBytes = 1024
-	policy, capBytes = newTailer(cfg, t.TempDir(), st).BodyPolicy()
+	policy, capBytes = newTailer(cfg, t.TempDir(), st, nil).BodyPolicy()
 	if policy != "full" || capBytes != 1024 {
 		t.Errorf("BodyPolicy() = (%q, %d), want (full, 1024)", policy, capBytes)
 	}
@@ -660,7 +660,7 @@ func TestNewTailerWiresResolvedAPIPrefixes(t *testing.T) {
 
 	// An unconfigured install: the shipped default, not an empty list.
 	cfg := config.Default()
-	prefixes, account, mode := newTailer(cfg, t.TempDir(), st).ModelBilling()
+	prefixes, account, mode := newTailer(cfg, t.TempDir(), st, nil).ModelBilling()
 	if len(prefixes) != 1 || prefixes[0] != "deepseek-" {
 		t.Errorf("ModelBilling prefixes = %v, want the shipped [deepseek-] on an unconfigured install", prefixes)
 	}
@@ -680,7 +680,7 @@ func TestNewTailerWiresResolvedAPIPrefixes(t *testing.T) {
 		{Name: "work", BillingMode: "subscription", Plan: "max5x"},
 		{Name: "payg", BillingMode: "api"},
 	}
-	prefixes, account, mode = newTailer(cfg, t.TempDir(), st).ModelBilling()
+	prefixes, account, mode = newTailer(cfg, t.TempDir(), st, nil).ModelBilling()
 	if len(prefixes) != 1 || prefixes[0] != "acme-" {
 		t.Errorf("ModelBilling prefixes = %v, want [acme-] (the resolver's output, replacing the shipped list)", prefixes)
 	}

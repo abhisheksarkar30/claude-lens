@@ -130,7 +130,7 @@ func Serve(args []string) error {
 	// trigger -- the same addCollectors source set `clens refresh` runs, so a
 	// click in the Sources tab and a cron tick collect the same things.
 	runner := ingest.New(pubStore)
-	addCollectors(ctx, runner, cfg, pubStore)
+	addCollectors(ctx, runner, cfg, pubStore, sess)
 	// Runner.RunOnce returns per-source Outcomes rather than an error, because
 	// the ingest layer's whole job is to keep one failing source from stopping
 	// the others (invariant 6). The seam speaks error, so this collapses the

@@ -37,6 +37,44 @@ func TestExtractMetaSessionHeader(t *testing.T) {
 	}
 }
 
+// x-claude-code-session-id (D7) fills Meta.SessionHeader when
+// x-clens-session is absent.
+func TestExtractMetaSessionHeaderFromClaudeCodeSessionIDWhenClensSessionAbsent(t *testing.T) {
+	h := http.Header{}
+	h.Set("x-claude-code-session-id", "conv-abc123")
+	m := ExtractMeta([]byte(`{}`), h)
+	if m.SessionHeader != "conv-abc123" {
+		t.Errorf("SessionHeader = %q, want conv-abc123", m.SessionHeader)
+	}
+}
+
+// x-clens-session still wins when both headers are present.
+func TestExtractMetaSessionHeaderClensSessionWinsOverClaudeCodeSessionID(t *testing.T) {
+	h := http.Header{}
+	h.Set("x-clens-session", "operator-override")
+	h.Set("x-claude-code-session-id", "conv-abc123")
+	m := ExtractMeta([]byte(`{}`), h)
+	if m.SessionHeader != "operator-override" {
+		t.Errorf("SessionHeader = %q, want operator-override (x-clens-session must win)", m.SessionHeader)
+	}
+}
+
+// An overlong x-clens-session does not supply a value, so a valid
+// x-claude-code-session-id is used instead -- the overlong override case.
+func TestExtractMetaOverlongClensSessionFallsBackToClaudeCodeSessionID(t *testing.T) {
+	h := http.Header{}
+	overlong := make([]byte, maxSessionHeaderLen+1)
+	for i := range overlong {
+		overlong[i] = 'x'
+	}
+	h.Set("x-clens-session", string(overlong))
+	h.Set("x-claude-code-session-id", "conv-abc123")
+	m := ExtractMeta([]byte(`{}`), h)
+	if m.SessionHeader != "conv-abc123" {
+		t.Errorf("SessionHeader = %q, want conv-abc123 (overlong x-clens-session must be treated as absent)", m.SessionHeader)
+	}
+}
+
 func TestExtractMetaCacheControlSitesAndTools(t *testing.T) {
 	body := []byte(`{
 		"system": [{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}],
@@ -97,15 +135,19 @@ func TestExtractMetaPrefixHashStableAndSensitive(t *testing.T) {
 	}
 }
 
-// TestExtractMetaPrefixHashNilWhenSessionHeaderPresent covers the
-// NULL-ness contract: an explicit session header means the resolver will
-// key by it, so PrefixHash is left nil rather than computed.
+// TestExtractMetaPrefixHashNilWhenSessionHeaderPresent's invariant moved
+// (D7): the hash is now always computed, session header or not -- the
+// session resolver's groupKey checks SessionHeader first, so a present
+// header still wins there without the hash being nil-ed.
 func TestExtractMetaPrefixHashNilWhenSessionHeaderPresent(t *testing.T) {
 	h := http.Header{}
 	h.Set("x-clens-session", "explicit-session")
 	m := ExtractMeta([]byte(`{"system":"s","messages":[]}`), h)
-	if m.PrefixHash != nil {
-		t.Errorf("PrefixHash = %v, want nil when SessionHeader is set", *m.PrefixHash)
+	if m.PrefixHash == nil {
+		t.Fatal("PrefixHash = nil, want a computed hash even when SessionHeader is set")
+	}
+	if *m.PrefixHash == "" {
+		t.Error("PrefixHash = empty string, want a real computed hash (the body parsed)")
 	}
 }
 
