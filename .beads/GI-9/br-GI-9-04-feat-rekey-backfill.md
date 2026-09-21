@@ -361,6 +361,10 @@ this instruction is about the code this bead moves.)
 
 - `clens rekey` exists and is registered in `cmd/clens/main.go`; without `--yes` it refuses and
   changes nothing.
+- **`cmd/clens/main_test.go`'s `carriedOver` names `rekey`, and
+  `TestEveryCarriedOverCommandIsDispatched` passes** — the dispatch map and that list are the same
+  size, so registering the command without extending the list is a red test, not a passing one. The
+  list is the side that moves; the length assertion is correct and stays.
 - `--dry-run` reports N/M (pass 1), K/L (pass 2), the dangling-`replay_of` count, and the re-pricing
   note, and writes nothing.
 - Pass 1 re-keys each `proxy:`-keyed row whose body yields an id (read by
@@ -559,10 +563,26 @@ twice, so a line range in this bead would be a pointer that does not survive the
   N/M/K/L report, the dangle count and the re-pricing note)
 - `internal/cli/rekey_test.go` (new — every case in §5's rekey section, as enumerated above)
 - `cmd/clens/main.go` (modify — register `rekey`)
+- `cmd/clens/main_test.go` (modify — **a registration is not complete until this file moves with
+  it.** `TestEveryCarriedOverCommandIsDispatched` asserts the dispatch map **in both directions**:
+  the loop checks each name in `carriedOver` resolves to a non-nil entry, and then
+  `len(commands) != len(carriedOver)` fails the test if the two sets differ in **size**. `rekey`
+  makes that 19 against 18, so the test goes red on a correct registration — with a message about
+  counts, not about anything the implementer changed. Add `"rekey"` to the `carriedOver` list and
+  take its comment's "the 18 subcommands" to 19. **Do not resolve it by deleting the length check**
+  (it is what notices a key that exists but points at nothing, which would panic at dispatch rather
+  than at build) **and do not resolve it by leaving `rekey` out of the map** (then `clens rekey` is
+  reported unimplemented). The count check is correct; the list is what is stale.)
 - `internal/cli/purge.go` (modify — its doc comment says "This is the one command in the CLI that
   destroys data"; `rekey` is the second, so it becomes the two-cases wording)
-- `internal/cli/cli_test.go` (modify — add `rekey` to the **credential-subcommand** table
-  `TestNoCommandPrintsACredential`, **not** the carried-over table
-  `TestEveryCarriedOverCommandRunsAgainstATempStore` — that is a 10-entry set for carried-over
-  commands, the wrong table for a new command. **The same file's seven `newTailer` call sites are
-  br-GI-9-07's edit**, D7's resolver parameter; keep the two edits disjoint.)
+- `internal/cli/cli_test.go` (modify — add `rekey` to the **credential-containment** map in
+  `TestNoCommandPrintsACredential`, **not** the sibling `cases` slice in
+  `TestEveryCarriedOverCommandRunsAgainstATempStore` — that is an **11**-entry set for the GI-1
+  carried-over commands, and `rekey` is not one of them; adding it there would misdescribe the set
+  rather than extend it. `TestNoCommandPrintsACredential`'s map carries **no count assertion**, so
+  extending it is additive and safe. **The same file's seven `newTailer` call sites are
+  br-GI-9-07's edit**, D7's resolver parameter; keep the two edits disjoint. **Note the trap this
+  file shares with `cmd/clens/main_test.go`: two different tests are called "carried-over"**, and
+  the instruction here is the **opposite** of the one there — `main_test.go`'s `carriedOver` must
+  gain `rekey`, this file's must not. They are separate files and separate lists; do not carry
+  either instruction across.)
