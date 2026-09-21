@@ -14,10 +14,38 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/analyze"
+	"github.com/abhisheksarkar30/claude-lens/internal/consumer"
+	"github.com/abhisheksarkar30/claude-lens/internal/sink"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
 // --- fixture helpers ------------------------------------------------------
+
+// strPtr returns a pointer to s, for the nullable EventSummary columns
+// (PrefixHash).
+func strPtr(s string) *string { return &s }
+
+// ingestProxyCall drives one CapturedCall through a real consumer.Consumer so
+// the resulting proxy row's identity comes from the live precedence (the
+// response header over the body id, consumer.requestID), not a hand-set key.
+// The consumer is cancelled once the call is queued; its shutdown path drains
+// and flushes the buffered call, so one row lands synchronously.
+func ingestProxyCall(t *testing.T, st *store.Store, call *sink.CapturedCall) {
+	t.Helper()
+	sk := sink.New(sink.DefaultCapacity)
+	cons := consumer.New(sk, st, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- cons.Run(ctx) }()
+	if !sk.Submit(call) {
+		t.Fatal("sink rejected the call")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("consumer.Run: %v", err)
+	}
+}
 
 func mustHeaderJSON(t *testing.T, h http.Header) string {
 	t.Helper()
@@ -324,6 +352,7 @@ func TestRekeyProxyVsJSONLTakerCollision(t *testing.T) {
 		mintedSession = "s_minted1"
 		convSession   = "conv_session_1"
 		targetKey     = "msg_taken"
+		prefixHash    = "deadbeef"
 	)
 	proxyStarted := time.Now().Add(-2 * time.Hour)
 	jsonlStarted := time.Now().Add(-1 * time.Hour)
@@ -349,14 +378,18 @@ func TestRekeyProxyVsJSONLTakerCollision(t *testing.T) {
 	// the same id. Its billing_mode is deliberately empty with a non-NULL
 	// cost_usd, to pin the empty-mode derivation, and its tokens differ from
 	// the taker's, to pin both the winner pick and the source_mismatch
-	// warning.
+	// warning. It carries a non-nil prefix_hash (which the JSONL taker cannot,
+	// types.go) and a cache write, so the merge must carry both onto the
+	// survivor and the hash-keyed session rules can still evaluate it.
 	proxyCost := 1.23
 	proxyID := seedProxyRow(t, st, &store.Event{
 		EventSummary: store.EventSummary{
 			RequestID: "proxy:merge1", Source: "proxy", FirstSource: "proxy",
 			StartedAt: proxyStarted, SessionID: mintedSession,
 			CaptureComplete: true, InputTokens: 99, OutputTokens: 42,
-			BillingMode: "", CostUSD: &proxyCost,
+			CacheWrite5mTokens: 7,
+			BillingMode:        "", CostUSD: &proxyCost,
+			PrefixHash: strPtr(prefixHash),
 		},
 		RespBody: nonStreamMessageBody(targetKey), RespHeaders: mustHeaderJSON(t, jsonContentType()),
 	})
@@ -428,6 +461,30 @@ func TestRekeyProxyVsJSONLTakerCollision(t *testing.T) {
 	}
 	if survivor.CostUSD == nil || *survivor.CostUSD != proxyCost {
 		t.Fatalf("survivor CostUSD = %v, want %v", survivor.CostUSD, proxyCost)
+	}
+
+	// The incoming proxy row's prefix_hash must be carried onto the JSONL
+	// survivor (a JSONL row is nil for the column, types.go). A regression
+	// that drops it bytes both hash-keyed session rules, which `continue` on a
+	// nil hash -- so pin that the survivor's hash is non-NULL and that
+	// ruleCacheExpiredBetweenTurns still groups the survivor under it: an
+	// earlier re-write of the same prefix, beyond its TTL, must fire on the
+	// survivor (which only happens if the rule sees the carried hash).
+	if survivor.PrefixHash == nil || *survivor.PrefixHash != prefixHash {
+		t.Fatalf("survivor PrefixHash = %v, want the incoming proxy row's %q", survivor.PrefixHash, prefixHash)
+	}
+	priorWrite := &store.Event{EventSummary: store.EventSummary{
+		ID: 999999, RequestID: "prior_write", StartedAt: jsonlStarted.Add(-10 * time.Minute),
+		PrefixHash: strPtr(prefixHash), CacheWrite5mTokens: 1,
+	}}
+	fired := false
+	for _, w := range analyze.AnalyzeSession([]*store.Event{priorWrite, survivor}) {
+		if w.Kind == string(analyze.KindCacheExpiredBetweenTurns) && w.EventID == survivor.ID {
+			fired = true
+		}
+	}
+	if !fired {
+		t.Fatal("ruleCacheExpiredBetweenTurns did not evaluate the survivor's carried prefix_hash")
 	}
 
 	// A source_mismatch warning was attached, and the absorbed row's own
@@ -877,22 +934,36 @@ func TestRekeyReingestReprices(t *testing.T) {
 	}
 }
 
-// TestRekeyReportsWallClock is a reported measurement, not a gate: the
-// output must name the re-ingest's row count and elapsed time, but no bound
-// on the duration is asserted.
+// TestRekeyReportsWallClock is a reported measurement, not a gate. The test
+// reports the run's wall clock beside the re-ingest's row count, and asserts
+// the count is reported (wiring that can silently vanish); it asserts no
+// bound on the duration -- a wall-clock bound is flaky, and the wiring's
+// absence can only make the run faster, never slower, so no bound can fail on
+// it. (The wiring's existence is gated by br-GI-9-07's tailer-wiring case.)
 func TestRekeyReportsWallClock(t *testing.T) {
 	home := withHome(t)
 	st := openTestStore(t, home)
-	_ = st
+
+	projectDir := filepath.Join(home, ".claude", "projects", "proj1")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(projectDir, "session1.jsonl")
+	line := `{"type":"assistant","sessionId":"s1","uuid":"u1","message":{"id":"msg_clock","model":"claude-sonnet-5","usage":{"input_tokens":1,"output_tokens":1}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedJSONLKeyedRow(t, st, "jsonl:s1:u1", "s1")
+
 	start := time.Now()
 	var buf bytes.Buffer
 	if err := runRekey([]string{"--dry-run"}, &buf); err != nil {
 		t.Fatalf("runRekey --dry-run: %v\noutput:\n%s", err, buf.String())
 	}
 	elapsed := time.Since(start)
-	t.Logf("rekey --dry-run on an empty store took %s", elapsed)
-	if elapsed < 0 {
-		t.Fatal("negative elapsed time")
+	t.Logf("rekey --dry-run over 1 jsonl-keyed row took %s", elapsed)
+	if !strings.Contains(buf.String(), "would delete 1 jsonl-keyed row(s)") {
+		t.Fatalf("the run did not report its re-ingest row count: %s", buf.String())
 	}
 }
 
@@ -1046,20 +1117,39 @@ func TestRekeyAcceptedSplitAndItsMeeting(t *testing.T) {
 		st := openTestStore(t, home)
 		ctx := context.Background()
 
+		// The JSONL line's requestId is X (tier 1).
 		if _, _, err := st.InsertEvent(ctx, &store.Event{EventSummary: store.EventSummary{
 			RequestID: "reqhdr_X", Source: "jsonl", FirstSource: "jsonl", StartedAt: time.Now(),
 		}}); err != nil {
 			t.Fatalf("InsertEvent (jsonl): %v", err)
 		}
-		if _, _, err := st.InsertEvent(ctx, &store.Event{EventSummary: store.EventSummary{
-			// The response DID carry a request-id header (tier 1), which wins
-			// over the body's own (different) message id.
-			RequestID: "reqhdr_X", Source: "proxy", FirstSource: "proxy", StartedAt: time.Now(),
-		}, RespBody: nonStreamMessageBody("msg_different_from_header"), RespHeaders: mustHeaderJSON(t, jsonContentType())}); err != nil {
-			t.Fatalf("InsertEvent (proxy): %v", err)
-		}
+
+		// The proxy capture's response carries the request-id header X (tier 1)
+		// while its body carries a *different* message id. Drive it through the
+		// real consumer identity (consumer.requestID), not a hand-set key, so
+		// this fixture fails if the header tier silently stops *meeting* the
+		// JSONL row: a broken tier falls through to the body id and leaves two
+		// rows keyed X and msg_different_from_header.
+		ingestProxyCall(t, st, &sink.CapturedCall{
+			RequestIDHeader: "reqhdr_X",
+			StartedAt:       time.Now(),
+			Duration:        10 * time.Millisecond,
+			Method:          "POST",
+			Path:            "/v1/messages",
+			Status:          200,
+			AuthKind:        "api_key",
+			ReqHeaders:      http.Header{"Content-Type": {"application/json"}},
+			RespHeaders:     http.Header{"Content-Type": {"application/json"}, "Request-Id": {"reqhdr_X"}},
+			ReqBody:         []byte(`{"model":"claude-sonnet-5","messages":[]}`),
+			RespBody:        nonStreamMessageBody("msg_different_from_header"),
+			CaptureComplete: true,
+		})
+
 		if n := countAllEvents(t, st); n != 1 {
-			t.Fatalf("row count = %d, want 1 (the meeting case)", n)
+			t.Fatalf("row count = %d, want 1 (the meeting case: the header tier must meet)", n)
+		}
+		if ev := findEventByRequestID(t, st, "msg_different_from_header"); ev != nil {
+			t.Fatal("the proxy row was keyed by its body id, not the header: the header tier did not win")
 		}
 		row := findEventByRequestID(t, st, "reqhdr_X")
 		if row == nil {
