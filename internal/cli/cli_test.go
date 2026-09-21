@@ -451,6 +451,7 @@ func TestNoCommandPrintsACredential(t *testing.T) {
 		"doctor":   func(w io.Writer) error { return runDoctor(nil, w) },
 		"purge":    func(w io.Writer) error { return runPurge([]string{"--older-than", "1d", "--dry-run"}, w) },
 		"replay":   func(w io.Writer) error { return runReplay([]string{itoa(id), "--dump"}, w) },
+		"rekey":    func(w io.Writer) error { return runRekey([]string{"--dry-run"}, w) },
 	}
 	for name, run := range runs {
 		var buf bytes.Buffer

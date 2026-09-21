@@ -114,22 +114,40 @@ func insertOrMerge(ctx context.Context, tx *sql.Tx, ev *Event) (id int64, sessio
 		return 0, "", false, fmt.Errorf("merge: load existing request_id %s: %w", ev.RequestID, gerr)
 	}
 
-	result, mismatch := mergeEvents(existing, ev)
+	result, err := applyMergeTx(ctx, tx, existing, ev)
+	if err != nil {
+		return 0, "", false, err
+	}
+	return result.ID, result.SessionID, true, nil
+}
+
+// applyMergeTx merges incoming into existing and persists the result --
+// it performs no load of its own; the caller supplies existing already
+// loaded by whichever key its own path resolves. insertOrMerge's own
+// collision branch and internal/cli/rekey's collision path (br-GI-9-04)
+// both call this one function, so the two cannot drift into two merge
+// rules; the load is the one thing they cannot share (insertOrMerge loads
+// by ev.RequestID, the rekey path by its target key) and it stays with
+// each caller. On the rekey path, existing is the taker -- the row that
+// already holds the target key -- so its request_id, id and session_id
+// are the survivor's; nothing is re-keyed here.
+func applyMergeTx(ctx context.Context, tx *sql.Tx, existing, incoming *Event) (*Event, error) {
+	result, mismatch := mergeEvents(existing, incoming)
 	if err := updateEventTx(ctx, tx, result); err != nil {
-		return 0, "", false, fmt.Errorf("merge: update: %w", err)
+		return nil, fmt.Errorf("merge: update: %w", err)
 	}
 	if mismatch {
 		w := Warning{
 			Kind:      "source_mismatch",
 			Severity:  "error",
-			Detail:    fmt.Sprintf("sources %s and %s disagree on token counts for request_id %s", existing.Source, ev.Source, ev.RequestID),
+			Detail:    fmt.Sprintf("sources %s and %s disagree on token counts for request_id %s", existing.Source, incoming.Source, existing.RequestID),
 			CreatedAt: time.Now(),
 		}
 		if err := upsertWarningsTx(ctx, tx, result.ID, []Warning{w}); err != nil {
-			return 0, "", false, fmt.Errorf("merge: attach source_mismatch: %w", err)
+			return nil, fmt.Errorf("merge: attach source_mismatch: %w", err)
 		}
 	}
-	return result.ID, result.SessionID, true, nil
+	return result, nil
 }
 
 // mergeEvents merges incoming into existing (existing.ID is preserved) and

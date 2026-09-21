@@ -16,12 +16,13 @@ import (
 // Purge is `clens purge`: delete captured rows by age or by the unpriced
 // predicate, and optionally reclaim the file's pages afterwards.
 //
-// This is the one command in the CLI that destroys data, so the default is the
-// opposite of destructive: nothing is deleted without --yes, and --dry-run
-// prints what --yes would have deleted. There is no "--yes implies --dry-run
-// first" dance -- the two flags are independent, so `--dry-run --yes` is
-// simply a dry run, and the only way to delete anything is a run that passes
-// --yes without --dry-run.
+// This is one of two commands in the CLI that destroy data -- `clens rekey`
+// (internal/cli/rekey.go) is the other -- so the default is the opposite of
+// destructive: nothing is deleted without --yes, and --dry-run prints what
+// --yes would have deleted. There is no "--yes implies --dry-run first"
+// dance -- the two flags are independent, so `--dry-run --yes` is simply a
+// dry run, and the only way to delete anything is a run that passes --yes
+// without --dry-run.
 func Purge(args []string) error {
 	return runPurge(args, os.Stdout)
 }
