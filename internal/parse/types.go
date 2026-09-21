@@ -50,6 +50,14 @@ type Usage struct {
 	// true price — is unknown.
 	TTLUnknown bool
 	IsStream   bool
+	// MessageID is the upstream message id: message_start.message.id for a
+	// streaming body, or the top-level id for a non-streaming body whose
+	// own type is "message". First-seen wins when a body carries more than
+	// one message_start. The gate proves shape only — that the body is
+	// message-shaped — not that the id is per-request; a stable org or
+	// gateway id would pass the same gate. Empty when neither shape is
+	// present or the body carries no id.
+	MessageID string
 }
 
 // Meta is everything the system needs to know about a request before it
