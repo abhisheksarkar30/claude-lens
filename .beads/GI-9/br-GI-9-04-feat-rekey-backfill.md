@@ -149,7 +149,11 @@ second caller and every one is **silent** when missed:
 - **The deleted row's warnings are re-attached to the survivor** (upsert by `(event_id, kind)`).
   `warnings.event_id` is `ON DELETE CASCADE` (`schema.sql:93-102`), so **the deleted row's** warnings
   vanish with it; `insertOrMerge` re-computes the *arriving* side's warnings onto the survivor, so
-  the helper re-attaches the deleted row's too, so the two callers agree. Reachable kinds on a JSONL
+  the rekey path re-attaches the deleted row's too, so the two paths end with the same warning set.
+  **The re-attach lives in the caller (`store.go:1677-1682`), not in `applyMergeTx`** — the operation
+  is defined on the row that gets *deleted*, and `insertOrMerge`'s incoming side is a freshly built
+  `Event` that was never inserted, so it structurally holds no `warnings` row to carry
+  (`store.go:1713-1717`). Reachable kinds on a JSONL
   row are narrow but not zero: `source_mismatch` from an earlier `insertOrMerge`, and the tailer's
   `peak_pricing`.
 - **The `incoming` row's `prefix_hash` / `replay_of` / `replay_edits` are carried onto the survivor
