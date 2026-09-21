@@ -85,6 +85,41 @@ func TestRuleCacheInvalidatedByToolsSilentOnIdenticalArray(t *testing.T) {
 	}
 }
 
+// D7 turns a session into the whole conversation, so proxy rows can have
+// JSONL rows (no ReqBody) interleaved between them. ruleCacheInvalidatedByTools
+// filters to the rows carrying a request body before the pair walk, so the
+// two proxy rows are still compared as consecutive -- a rule that instead
+// skipped only the pair touching the JSONL row would never compare them at
+// all, and this case would go silent for no reason anyone chose.
+func TestRuleCacheInvalidatedByToolsFiresAcrossInterleavedJSONLRow(t *testing.T) {
+	rows := []*store.Event{
+		{EventSummary: store.EventSummary{ID: 1, Source: "proxy", StartedAt: at(0), TotalPromptTokens: 5000}, ReqBody: reqBodyWithTools("bash", "read")},
+		{EventSummary: store.EventSummary{ID: 2, Source: "jsonl", StartedAt: at(1)}}, // no ReqBody -- structurally, a JSONL row
+		{EventSummary: store.EventSummary{ID: 3, Source: "proxy", StartedAt: at(2), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900}, ReqBody: reqBodyWithTools("bash", "read", "edit")},
+	}
+	found := warningKinds(ruleCacheInvalidatedByTools(rows))
+	if ids := found[string(KindCacheInvalidatedByTools)]; len(ids) != 1 || ids[0] != 3 {
+		t.Errorf("changed tools findings across an interleaved JSONL row = %v, want exactly [3]", ids)
+	}
+}
+
+// The accepted degradation's counterpart: ruleCachePrefixInvalidation has
+// no ReqBody guard at all, so the same interleaving shifts its result with
+// no code change. This is accepted (§6), not fixed -- the assertion makes
+// the cost visible rather than silent. The zero-CacheWrite JSONL row
+// breaks the "every turn wrote a big fraction" walk that would otherwise
+// fire on the two proxy rows alone.
+func TestRuleCachePrefixInvalidationDegradesOnInterleavedJSONLRow(t *testing.T) {
+	rows := []*store.Event{
+		{EventSummary: store.EventSummary{ID: 1, Source: "proxy", StartedAt: at(0), TotalPromptTokens: 5000, CacheWrite5mTokens: 5000}},
+		{EventSummary: store.EventSummary{ID: 2, Source: "jsonl", StartedAt: at(1), TotalPromptTokens: 5100}}, // no CacheWrite -- breaks the loop
+		{EventSummary: store.EventSummary{ID: 3, Source: "proxy", StartedAt: at(2), TotalPromptTokens: 5200, CacheWrite5mTokens: 5100}},
+	}
+	if got := ruleCachePrefixInvalidation(rows); got != nil {
+		t.Errorf("mixed session raised %v, want nil (the accepted degradation -- proxy-only rows would fire here)", got)
+	}
+}
+
 // --- cache_write_never_read ------------------------------------------
 
 func TestRuleCacheWriteNeverReadFiresWithNoLaterRead(t *testing.T) {

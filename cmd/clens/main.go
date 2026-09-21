@@ -35,6 +35,7 @@ var commands = map[string]func([]string) error{
 	"prices":   cli.Prices,
 	"replay":   cli.Replay,
 	"purge":    cli.Purge,
+	"rekey":    cli.Rekey,
 }
 
 func main() {

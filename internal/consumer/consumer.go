@@ -6,6 +6,7 @@ package consumer
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -393,6 +394,40 @@ func (c *Consumer) runOneAnalyzer(a Analyzer, meta parse.Meta, usage parse.Usage
 	return a.Analyze(meta, usage, ev)
 }
 
+// fallbackSeqCounter disambiguates synthetic requestID keys across every
+// call this process handles. Package-level (not per-Consumer) so a consumer
+// that is rebuilt mid-process still never reuses a disambiguator.
+var fallbackSeqCounter = new(uint64)
+
+// requestID resolves the cross-source dedup key (D2): the upstream
+// request-id header when the response carried one, then the response
+// body's own message id, then a synthetic proxy:<hash>:<started_at_ns>:
+// <attempt> key for a call that produced neither. This is the one place
+// the identity rule is decided — the hot path (internal/proxy) never
+// parses the body, so it cannot resolve past the header tier itself.
+func requestID(call *sink.CapturedCall, usage parse.Usage) string {
+	if call.RequestIDHeader != "" {
+		return call.RequestIDHeader
+	}
+	if usage.MessageID != "" {
+		return usage.MessageID
+	}
+	return syntheticRequestID(call)
+}
+
+// syntheticRequestID builds a proxy:<hash>:<started_at_ns>:<attempt> key.
+// The attempt counter is what keeps two byte-identical bodies (e.g. two
+// retried attempts of the same call) from collapsing onto the same
+// synthetic key, which would destroy the rate_limited/overloaded signal
+// those attempts exist to record — started_at_ns alone is not sufficient,
+// since a fast enough retry could in principle share a nanosecond
+// timestamp.
+func syntheticRequestID(call *sink.CapturedCall) string {
+	attempt := atomic.AddUint64(fallbackSeqCounter, 1)
+	sum := sha256.Sum256(call.ReqBody)
+	return fmt.Sprintf("proxy:%x:%d:%d", sum, call.StartedAt.UnixNano(), attempt)
+}
+
 // buildEvent assembles a store.Event from a captured call's status/timings
 // plus the extracted meta and usage. Cost, session, and account are filled
 // in by the caller afterward.
@@ -400,7 +435,7 @@ func buildEvent(call *sink.CapturedCall, meta parse.Meta, usage parse.Usage) *st
 	endedAt := call.StartedAt.Add(call.Duration)
 	ev := &store.Event{
 		EventSummary: store.EventSummary{
-			RequestID:          call.RequestID,
+			RequestID:          requestID(call, usage),
 			Source:             "proxy",
 			FirstSource:        "proxy",
 			StartedAt:          call.StartedAt,

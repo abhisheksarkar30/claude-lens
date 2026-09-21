@@ -23,6 +23,7 @@ type line struct {
 }
 
 type message struct {
+	ID         string      `json:"id"`
 	Model      string      `json:"model"`
 	StopReason string      `json:"stop_reason"`
 	Usage      *usageShape `json:"usage"`
@@ -92,14 +93,23 @@ func parseLine(raw []byte) (*line, error) {
 	return &l, nil
 }
 
-// requestKey is the dedup key: the JSONL requestId, or
-// jsonl:<sessionId>:<uuid> when a line carries none. This is the primary
-// key the plan's cross-source identity section assumes byte-equals the
-// proxy's request-id response header -- an assumption not yet verified
-// live (see the bead's test 11b flag).
+// requestKey is the three-tier dedup key (D1), mirroring the proxy's own
+// precedence (internal/consumer's requestID): the JSONL requestId, when
+// present; else the transcript's own message.id, already present on the
+// line and previously discarded; else jsonl:<sessionId>:<uuid>. The
+// header leads because it is the only tier that can key a row whose body
+// carries no id at all (an error body, a cap-truncated body, a response
+// with no content type) -- where the upstream sends both, the header must
+// win on both sides or the Anthropic case would regress from working to
+// broken. The message-id tier is what lets DeepSeek traffic (body id
+// only, no header) meet the proxy's row: both sides fall to tier two and
+// key identically.
 func requestKey(l *line) string {
 	if l.RequestID != "" {
 		return l.RequestID
+	}
+	if l.Message != nil && l.Message.ID != "" {
+		return l.Message.ID
 	}
 	return "jsonl:" + l.SessionID + ":" + l.UUID
 }

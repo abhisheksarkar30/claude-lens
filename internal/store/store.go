@@ -10,13 +10,17 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/decode"
+	"github.com/abhisheksarkar30/claude-lens/internal/parse"
 	"github.com/abhisheksarkar30/claude-lens/internal/proxy"
 
 	_ "modernc.org/sqlite"
@@ -324,10 +328,11 @@ func (s *Store) GetEvent(ctx context.Context, id int64) (*Event, error) {
 
 // SessionEvents returns sessionID's rows oldest-first, for the
 // session-scoped analyzer pass (br-GI-1-09) that compares consecutive
-// calls. Unlike ListEvents it takes no pagination: a session's row count
-// is already bounded by the session resolver's own gap window, since a
-// call beyond the gap gets a fresh session id rather than joining this
-// one.
+// calls. Unlike ListEvents it takes no pagination. Before D7 a session's
+// row count was bounded by the session resolver's own gap window, since a
+// call beyond the gap got a fresh session id rather than joining this
+// one; D7 makes a session the whole conversation a header names, so that
+// bound no longer holds and nothing here replaces it.
 func (s *Store) SessionEvents(ctx context.Context, sessionID string) ([]*Event, error) {
 	rows, err := s.db.QueryContext(ctx, eventSelectColumns+" FROM events WHERE session_id = ? ORDER BY started_at ASC", sessionID)
 	if err != nil {
@@ -652,17 +657,35 @@ func (s *Store) WarningSummary(ctx context.Context) ([]WarningSummary, error) {
 // last_seen. It never touches the aggregate columns — those are always
 // re-derived by ReconcileSession, never incremented here.
 func (s *Store) UpsertSession(ctx context.Context, sessionID, prefixHash string, at time.Time) error {
-	_, err := s.db.ExecContext(ctx, `
+	if err := upsertSessionExec(ctx, s.db, sessionID, prefixHash, at); err != nil {
+		return fmt.Errorf("store: UpsertSession: %w", err)
+	}
+	return nil
+}
+
+// execer is the ExecContext surface *sql.DB and *sql.Tx share -- neither
+// exports a common interface for it, so upsertSessionExec takes its own.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// upsertSessionTx runs UpsertSession's write inside an already-open
+// transaction, for the rekey passes: pass 2 re-attributes a row to a
+// conversation session that may not exist yet, and the upsert must land in
+// the same transaction as the reconcile that follows it.
+func upsertSessionTx(ctx context.Context, tx *sql.Tx, sessionID, prefixHash string, at time.Time) error {
+	return upsertSessionExec(ctx, tx, sessionID, prefixHash, at)
+}
+
+func upsertSessionExec(ctx context.Context, ex execer, sessionID, prefixHash string, at time.Time) error {
+	_, err := ex.ExecContext(ctx, `
 		INSERT INTO sessions (id, prefix_hash, first_seen, last_seen)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			first_seen = MIN(first_seen, excluded.first_seen),
 			last_seen = MAX(last_seen, excluded.last_seen)
 	`, sessionID, prefixHash, unixNano(at), unixNano(at))
-	if err != nil {
-		return fmt.Errorf("store: UpsertSession: %w", err)
-	}
-	return nil
+	return err
 }
 
 // ReconcileSession re-derives sessionID's aggregate columns from events and
@@ -764,6 +787,16 @@ func reconcileSessionTx(ctx context.Context, tx *sql.Tx, sessionID string) error
 		return fmt.Errorf("update session: %w", err)
 	}
 	return nil
+}
+
+// deleteSessionIfEmptyTx removes sessionID's sessions row once a prior
+// reconcileSessionTx call in the same transaction has shown it holds zero
+// events -- reconcileSessionTx only UPDATEs and never deletes, so a session a
+// merge or re-attribution has emptied would otherwise linger as a ghost row
+// in `clens sessions` / GET /api/sessions.
+func deleteSessionIfEmptyTx(ctx context.Context, tx *sql.Tx, sessionID string) error {
+	_, err := tx.ExecContext(ctx, `DELETE FROM sessions WHERE id = ? AND request_count = 0`, sessionID)
+	return err
 }
 
 func nullInt64OrNil(n sql.NullInt64) any {
@@ -919,6 +952,44 @@ func (s *Store) SetIngestState(ctx context.Context, key string, state IngestStat
 		return fmt.Errorf("store: SetIngestState: %w", err)
 	}
 	return nil
+}
+
+// IngestStateEntry is one cursor row -- Key carries the collector's own
+// encoding (e.g. "jsonl:<path>"), Value its cursor payload (a jsonlogs cursor
+// is a decimal byte offset).
+type IngestStateEntry struct {
+	Key   string
+	Value string
+}
+
+// IngestStateKeysWithPrefix lists every cursor whose key starts with prefix.
+// Used by rekey pass 3's precondition check, which must walk every recorded
+// "jsonl:<path>" cursor -- there is no store-side row-to-file link, so the
+// cursor table is the only place that enumerates them.
+func (s *Store) IngestStateKeysWithPrefix(ctx context.Context, prefix string) ([]IngestStateEntry, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, value FROM ingest_state WHERE key LIKE ? ESCAPE '\'`,
+		likeEscape(prefix)+"%")
+	if err != nil {
+		return nil, fmt.Errorf("store: IngestStateKeysWithPrefix: %w", err)
+	}
+	defer rows.Close()
+	var out []IngestStateEntry
+	for rows.Next() {
+		var e IngestStateEntry
+		if err := rows.Scan(&e.Key, &e.Value); err != nil {
+			return nil, fmt.Errorf("store: IngestStateKeysWithPrefix: %w", err)
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// likeEscape escapes a LIKE pattern's own wildcard characters in a literal
+// prefix, so a path containing "%" or "_" (both valid on some filesystems)
+// cannot be misread as a wildcard.
+func likeEscape(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, "%", `\%`, "_", `\_`)
+	return r.Replace(s)
 }
 
 // InsertQuotaSnapshot records one quota_snapshots row (source C, one row
@@ -1480,4 +1551,319 @@ func (s *Store) StatsByCostSource(ctx context.Context, filter EventFilter) ([]Co
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// --- Rekey (br-GI-9-04) -------------------------------------------------
+//
+// The three `clens rekey` passes repair rows the forward fix (br-GI-9-01…03,
+// -07) cannot reach because they predate it. Each row is processed in its
+// own transaction -- nothing is atomic across a pass, deliberately, so a
+// partial run is resumable and a second run is a no-op over whatever the
+// first already fixed.
+
+// RekeyPass1Report is pass 1's dry-run/live count pair: ReKeyed is N (a
+// body-id was read), Synthetic is M (it was not, so the row keeps its
+// "proxy:" key forever).
+type RekeyPass1Report struct {
+	ReKeyed   int
+	Synthetic int
+}
+
+// RekeyProxyBodyIDs is pass 1: every "proxy:"-keyed row's true identity is
+// already inside its own stored resp_body (D2's precedence, the same rule
+// the live consumer path applies), so this pass re-reads it and re-keys in
+// place. bodyCapBytes must be the running config's BodyCapBytes -- the same
+// limit the live path decodes with; a non-positive limit makes decode.Body
+// error on a compressed body and this pass would then silently re-key
+// nothing for that row while still reporting success for the rest.
+func (s *Store) RekeyProxyBodyIDs(ctx context.Context, bodyCapBytes int, dryRun bool) (RekeyPass1Report, error) {
+	rows, err := s.db.QueryContext(ctx, eventSelectColumns+` FROM events WHERE source = 'proxy' AND request_id LIKE 'proxy:%'`)
+	if err != nil {
+		return RekeyPass1Report{}, fmt.Errorf("store: RekeyProxyBodyIDs: select: %w", err)
+	}
+	var candidates []*Event
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			rows.Close()
+			return RekeyPass1Report{}, fmt.Errorf("store: RekeyProxyBodyIDs: scan: %w", err)
+		}
+		candidates = append(candidates, ev)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return RekeyPass1Report{}, fmt.Errorf("store: RekeyProxyBodyIDs: rows: %w", err)
+	}
+	rows.Close()
+
+	var report RekeyPass1Report
+	for _, ev := range candidates {
+		id := rekeyBodyMessageID(ev, bodyCapBytes)
+		if id == "" {
+			report.Synthetic++
+			continue
+		}
+		report.ReKeyed++
+		if dryRun {
+			continue
+		}
+		if err := s.rekeyOneProxyRow(ctx, ev, id); err != nil {
+			return RekeyPass1Report{}, fmt.Errorf("store: RekeyProxyBodyIDs: row %d: %w", ev.ID, err)
+		}
+	}
+	return report, nil
+}
+
+// rekeyBodyMessageID reads ev's true identity out of its own stored
+// resp_body, mirroring internal/consumer's processCall byte for byte: decode
+// first (a body carrying Content-Encoding errors on a non-positive limit,
+// and the err == nil guard then keeps the decoded bytes only on success),
+// then parse.ExtractUsage unconditionally. Returns "" when the body yields
+// no id -- resp_body is empty, decode fails and is not retried, or the body
+// itself carries none (D2's gate).
+func rekeyBodyMessageID(ev *Event, bodyCapBytes int) string {
+	respHeaders := parseHeaderJSON(ev.RespHeaders)
+	respBody := ev.RespBody
+	if decoded, decodedHeaders, _, err := decode.Body(respHeaders, respBody, bodyCapBytes); err == nil {
+		respBody, respHeaders = decoded, decodedHeaders
+	}
+	return parse.ExtractUsage(respBody, respHeaders.Get("Content-Type")).MessageID
+}
+
+// parseHeaderJSON decodes a stored req_headers/resp_headers column back into
+// an http.Header -- the same shape internal/analyze's parseRespHeaders
+// decodes, duplicated rather than imported because internal/analyze imports
+// internal/store and importing it back would cycle.
+func parseHeaderJSON(raw string) http.Header {
+	if raw == "" {
+		return http.Header{}
+	}
+	var h http.Header
+	if json.Unmarshal([]byte(raw), &h) != nil || h == nil {
+		return http.Header{}
+	}
+	return h
+}
+
+// rekeyOneProxyRow re-keys ev (loaded before this call, outside any
+// transaction) to newID: a plain UPDATE when newID is free, or the
+// collision path -- merge into whichever row already holds it -- when it is
+// taken. Each call is its own transaction.
+func (s *Store) rekeyOneProxyRow(ctx context.Context, ev *Event, newID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	taker, gerr := getEventByRequestIDTx(ctx, tx, newID)
+	if gerr == sql.ErrNoRows {
+		if _, err := tx.ExecContext(ctx, `UPDATE events SET request_id = ? WHERE id = ?`, newID, ev.ID); err != nil {
+			return fmt.Errorf("update request_id: %w", err)
+		}
+		return tx.Commit()
+	}
+	if gerr != nil {
+		return fmt.Errorf("load taker: %w", gerr)
+	}
+
+	// The collision path. taker already holds the target key -- existing --
+	// and ev, the proxy row, is incoming and absorbed: applyMergeTx never
+	// re-keys, so the survivor is the taker's id, session_id and request_id.
+	survivor, err := applyMergeTx(ctx, tx, taker, ev)
+	if err != nil {
+		return fmt.Errorf("merge: %w", err)
+	}
+	// The deleted row's own warnings would otherwise vanish with it
+	// (warnings.event_id is ON DELETE CASCADE) -- carry them onto the
+	// survivor before the delete.
+	if err := reattachWarningsTx(ctx, tx, ev.ID, survivor.ID); err != nil {
+		return fmt.Errorf("reattach warnings: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM events WHERE id = ?`, ev.ID); err != nil {
+		return fmt.Errorf("delete absorbed row: %w", err)
+	}
+	deletedIDStr := strconv.FormatInt(ev.ID, 10)
+	survivorIDStr := strconv.FormatInt(survivor.ID, 10)
+	if _, err := tx.ExecContext(ctx, `UPDATE events SET replay_of = ? WHERE replay_of = ?`, survivorIDStr, deletedIDStr); err != nil {
+		return fmt.Errorf("repoint replay_of: %w", err)
+	}
+
+	// The reconcile set is the two sessions among the two rows: the absorbed
+	// proxy row always carried a pre-D7 minted session (pass 1's predicate
+	// selects only "proxy:"-keyed rows, which a post-D7 row cannot be), and
+	// the taker's session is whatever it already had -- most often a real
+	// conversation id.
+	if ev.SessionID != "" && ev.SessionID != survivor.SessionID {
+		if err := reconcileSessionTx(ctx, tx, ev.SessionID); err != nil {
+			return fmt.Errorf("reconcile absorbed session: %w", err)
+		}
+		if err := deleteSessionIfEmptyTx(ctx, tx, ev.SessionID); err != nil {
+			return fmt.Errorf("remove emptied session: %w", err)
+		}
+	}
+	if survivor.SessionID != "" {
+		if err := reconcileSessionTx(ctx, tx, survivor.SessionID); err != nil {
+			return fmt.Errorf("reconcile survivor session: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// reattachWarningsTx carries fromEventID's stored warnings onto toEventID
+// (upsert by (event_id, kind)) before fromEventID is deleted. insertOrMerge
+// needs no equivalent: its incoming side is a freshly built Event that was
+// never itself inserted, so it structurally holds no warnings row of its
+// own; the rekey path's incoming side is a real, previously inserted row.
+func reattachWarningsTx(ctx context.Context, tx *sql.Tx, fromEventID, toEventID int64) error {
+	rows, err := tx.QueryContext(ctx, `SELECT kind, severity, detail, path, created_at FROM warnings WHERE event_id = ?`, fromEventID)
+	if err != nil {
+		return err
+	}
+	var warnings []Warning
+	for rows.Next() {
+		var w Warning
+		var createdAt int64
+		if err := rows.Scan(&w.Kind, &w.Severity, &w.Detail, &w.Path, &createdAt); err != nil {
+			rows.Close()
+			return err
+		}
+		w.CreatedAt = timeFromNano(createdAt)
+		warnings = append(warnings, w)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	return upsertWarningsTx(ctx, tx, toEventID, warnings)
+}
+
+// RekeyPass2Report is pass 2's dry-run/live count pair: Reattributed is K (a
+// qualifying session header was found), Unattributed is L (it was not, so
+// the row keeps its minted session forever).
+type RekeyPass2Report struct {
+	Reattributed int
+	Unattributed int
+}
+
+// RekeyProxySessions is pass 2: every proxy row's true conversation id is
+// already inside its own stored req_headers (D7's x-claude-code-session-id),
+// so this pass reads it with the exact precedence and length bound the live
+// parse.ExtractMeta applies and re-attributes the row directly -- never
+// through the merge path, which never rewrites session_id (D3) and must
+// stay that way.
+func (s *Store) RekeyProxySessions(ctx context.Context, dryRun bool) (RekeyPass2Report, error) {
+	rows, err := s.db.QueryContext(ctx, eventSelectColumns+` FROM events WHERE source = 'proxy'`)
+	if err != nil {
+		return RekeyPass2Report{}, fmt.Errorf("store: RekeyProxySessions: select: %w", err)
+	}
+	var candidates []*Event
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			rows.Close()
+			return RekeyPass2Report{}, fmt.Errorf("store: RekeyProxySessions: scan: %w", err)
+		}
+		candidates = append(candidates, ev)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return RekeyPass2Report{}, fmt.Errorf("store: RekeyProxySessions: rows: %w", err)
+	}
+	rows.Close()
+
+	var report RekeyPass2Report
+	for _, ev := range candidates {
+		headers := parseHeaderJSON(ev.ReqHeaders)
+		newSessionID := parse.ExtractMeta(nil, headers).SessionHeader
+		if newSessionID == "" {
+			report.Unattributed++
+			continue
+		}
+		report.Reattributed++
+		if dryRun || newSessionID == ev.SessionID {
+			continue
+		}
+		if err := s.reattributeOneProxyRow(ctx, ev, newSessionID); err != nil {
+			return RekeyPass2Report{}, fmt.Errorf("store: RekeyProxySessions: row %d: %w", ev.ID, err)
+		}
+	}
+	return report, nil
+}
+
+// reattributeOneProxyRow moves ev to newSessionID: a direct UPDATE (never
+// through the merge path), then upserts the new session first -- pass 2 can
+// run before pass 3 has re-ingested anything, so the conversation session
+// may not exist yet -- and reconciles both the new session and, once it
+// might be empty, the old one.
+func (s *Store) reattributeOneProxyRow(ctx context.Context, ev *Event, newSessionID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	oldSessionID := ev.SessionID
+	if _, err := tx.ExecContext(ctx, `UPDATE events SET session_id = ? WHERE id = ?`, newSessionID, ev.ID); err != nil {
+		return fmt.Errorf("update session_id: %w", err)
+	}
+	if err := upsertSessionTx(ctx, tx, newSessionID, "", ev.StartedAt); err != nil {
+		return fmt.Errorf("upsert new session: %w", err)
+	}
+	if err := reconcileSessionTx(ctx, tx, newSessionID); err != nil {
+		return fmt.Errorf("reconcile new session: %w", err)
+	}
+	if oldSessionID != "" && oldSessionID != newSessionID {
+		if err := reconcileSessionTx(ctx, tx, oldSessionID); err != nil {
+			return fmt.Errorf("reconcile old session: %w", err)
+		}
+		if err := deleteSessionIfEmptyTx(ctx, tx, oldSessionID); err != nil {
+			return fmt.Errorf("remove emptied session: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// CountJSONLKeyedEvents reports how many rows pass 3 would delete -- its
+// dry-run count.
+func (s *Store) CountJSONLKeyedEvents(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM events WHERE source = 'jsonl' AND request_id LIKE 'jsonl:%'`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: CountJSONLKeyedEvents: %w", err)
+	}
+	return n, nil
+}
+
+// DeleteJSONLKeyedEvents is pass 3's delete: every row whose identity was
+// never stored (a "jsonl:"-keyed row) is dropped in one statement, so the
+// re-ingest that follows can re-derive it from the transcript with today's
+// key rule. One statement is already one transaction; there is no per-row
+// model to state. No replay_of can name a "jsonl:"-keyed row (a replay
+// original must carry a body, which a JSONL row never does), so there is
+// nothing to re-point here -- that belongs to pass 1's collision path.
+func (s *Store) DeleteJSONLKeyedEvents(ctx context.Context) (int64, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM events WHERE source = 'jsonl' AND request_id LIKE 'jsonl:%'`)
+	if err != nil {
+		return 0, fmt.Errorf("store: DeleteJSONLKeyedEvents: %w", err)
+	}
+	return res.RowsAffected()
+}
+
+// DanglingReplayOfCount reports how many rows' replay_of names an id no
+// longer present in events -- the number `clens rekey --dry-run` must
+// report, not the much larger non-empty-replay_of referrer count, which
+// measures a different population.
+func (s *Store) DanglingReplayOfCount(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM events e
+		WHERE e.replay_of <> ''
+		AND NOT EXISTS (SELECT 1 FROM events t WHERE CAST(t.id AS TEXT) = e.replay_of)
+	`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: DanglingReplayOfCount: %w", err)
+	}
+	return n, nil
 }

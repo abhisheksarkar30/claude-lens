@@ -90,6 +90,41 @@ func TestIngestRebuildRereadsWithoutDuplicating(t *testing.T) {
 	}
 }
 
+// TestIngestWritesASessionRowForTheTranscript is D7's tailer-wiring case:
+// SetSessionRecorder (internal/jsonlogs) is defined but was never called by
+// any caller in the module, so t.recorder stayed nil and the JSONL half
+// silently recorded no sessions rows. runIngest now builds a
+// session.Resolver and passes it to newTailer, so a transcript's own
+// sessionId must appear in the sessions table after an ordinary ingest.
+// This case fails before that wiring exists -- it is the existence gate
+// br-GI-9-04's re-ingest wall-clock case only measures.
+func TestIngestWritesASessionRowForTheTranscript(t *testing.T) {
+	home := withHome(t)
+	projectDir := filepath.Join(home, ".claude", "projects", "proj1")
+	if err := os.MkdirAll(projectDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transcript := filepath.Join(projectDir, "session1.jsonl")
+	line := `{"type":"assistant","sessionId":"s1","requestId":"req_a","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1,"output_tokens":1}}}` + "\n"
+	if err := os.WriteFile(transcript, []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := runIngest(nil, &buf); err != nil {
+		t.Fatalf("runIngest: %v\noutput:\n%s", err, buf.String())
+	}
+
+	st := openTestStore(t, home)
+	sess, err := st.GetSession(context.Background(), "s1")
+	if err != nil {
+		t.Fatalf("GetSession(s1): %v", err)
+	}
+	if sess == nil {
+		t.Fatal("no sessions row for the transcript's sessionId \"s1\" -- the recorder was never wired")
+	}
+}
+
 func TestRefreshDispatchesCleanOnEmptyInstall(t *testing.T) {
 	withHome(t)
 	var buf bytes.Buffer

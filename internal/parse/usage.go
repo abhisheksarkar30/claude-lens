@@ -30,6 +30,7 @@ type stopDetailsJSON struct {
 // model, service_tier, speed, and the initial usage snapshot.
 type sseMessageStart struct {
 	Message struct {
+		ID          string    `json:"id"`
 		Model       string    `json:"model"`
 		ServiceTier string    `json:"service_tier"`
 		Speed       string    `json:"speed"`
@@ -52,6 +53,8 @@ type sseMessageDelta struct {
 // application/json response body: the same fields an SSE stream would
 // deliver across message_start and message_delta, all at the top level.
 type nonStreamBody struct {
+	ID          string           `json:"id"`
+	Type        string           `json:"type"`
 	Model       string           `json:"model"`
 	ServiceTier string           `json:"service_tier"`
 	Speed       string           `json:"speed"`
@@ -102,6 +105,9 @@ func usageFromFrames(frames []Frame, isStream bool) Usage {
 			u.Model = ev.Message.Model
 			u.ServiceTier = ev.Message.ServiceTier
 			u.Speed = ev.Message.Speed
+			if u.MessageID == "" {
+				u.MessageID = ev.Message.ID
+			}
 			applyUsageJSON(&u, ev.Message.Usage)
 
 		case "message_delta":
@@ -133,6 +139,9 @@ func usageFromFrames(frames []Frame, isStream bool) Usage {
 			u.StopReason = body.StopReason
 			if body.StopReason == "refusal" && body.StopDetails != nil {
 				u.StopCategory = body.StopDetails.Category
+			}
+			if u.MessageID == "" && body.Type == "message" {
+				u.MessageID = body.ID
 			}
 			applyUsageJSON(&u, body.Usage)
 		}

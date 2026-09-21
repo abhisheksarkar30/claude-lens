@@ -318,21 +318,32 @@ step**, not a fact:
   Record the result here. If equal, the header is the key and the assumption is discharged with
   evidence. If not equal, **the fallback key below becomes primary** and the JSONL `requestId` is
   used only within JSONL.
-- **Fallback key (primary if the header does not match).** A value the plan can verify locally:
-  `(model, session_id, started_at ±1s, input/cache-write/cache-read/output token quadruple)`, with
-  `request-id` used *when present and matching* to strengthen it.
+- **Fallback key, as actually built (GI#9).** Not the `(model, session_id, started_at ±1s, token
+  quadruple)` composite this section originally proposed — that key was never implemented. The
+  identity rule that shipped is a three-tier precedence, mirrored on both sides (`internal/consumer`'s
+  `requestID`, `internal/jsonlogs`'s `requestKey`): the `request-id` header when the response carried
+  one, else the response body's own `message.id` (a tier the header-only design above did not have —
+  it is what lets a proxy row and a JSONL row for the same call converge on one key even when the
+  header is absent from one side), else a namespaced synthetic key —
+  `proxy:<sha256(body)>:<started_at_ns>:<attempt>` on the proxy side,
+  `jsonl:<sessionId>:<uuid>` on the JSONL side. See
+  [decisions/008](decisions/008-three-tier-identity-key.md).
 
 #### Verification result (br-GI-1-19)
 
-**Status: still open — not captured.** br-GI-1-19's acceptance run is where this was to be
+**Status: never exercised, not falsified.** br-GI-1-19's acceptance run is where this was to be
 discharged (`docs/acceptance.md` §"test 11(b)"), and it could not be: a live capture needs a real
 Anthropic credential, and the run had none. The operator's own
 `~/.claude/.credentials.json` is not this tool's to spend.
 
-So the assumption stands exactly as it stood before: **the `request-id` header has no captured
-counterpart**, the fallback key remains the operative identity, and `request-id` continues to be
-used only *when present and matching*. `br-GI-1-11`'s switch has **not** flipped, because nothing
-observed says it should.
+Scoped precisely: the header↔`requestId` equivalence is **moot on this install**, because the
+message-id tier added in GI#9 gives the header-less side (a proxy row or a JSONL row missing
+`request-id`) a second, already-verified way to converge with its counterpart — the merge does not
+depend on the header match to function here. It remains **load-bearing and unverified** on any
+install whose upstream *does* send `request-id`: if that header were ever byte-unequal to the
+JSONL `requestId` on such an install, tier 1 would key the two sides apart and they would **silently
+fail to merge** — no error, just two rows instead of one. `br-GI-1-11`'s switch has **not** flipped,
+because nothing observed says it should.
 
 The one thing the run did establish is that the fallback path works: a proxied call that returned
 **401** — no `request-id` header at all — was still keyed, stored, and readable, with the composite
@@ -1102,7 +1113,7 @@ branches hang off the store: `06 → 11`, `06,07 → 12`, `06,07 → 13`, conver
 | Stack | Go 1.24, single binary | Python/FastAPI (the tech plan's stack) — would mean reimplementing 13 proven packages and rebuilding the hot path in a slower runtime; deepseek-lens's own decision log already rejected Python for the hot path |
 | Source count | Four (proxy + JSONL + snapshot + admin) | Three (the tech plan's set) — would lose the proxy's body-based *localisation* (the two token-ratio cache rules still fire from JSONL) and its non-Claude-Code client coverage |
 | Storage shape | Fine-grained `events` and coarse `admin_*_days` as separate tables; within `events`, subscription rows write `api_equivalent_cost_usd` and leave `cost_usd` NULL | One unified table — would let a daily billed total be summed with a per-call computed total; and a single `cost_usd` column would let a subscription figure and an API figure be summed directly, which is the one arithmetic error this tool must not make |
-| Cross-source identity | `request_id` UNIQUE, merge-not-add; the header↔`requestId` equivalence is an assumption **verified live** before the merge is relied on, with a fallback key if it fails | Row per (source, turn) with a dedup view — leaves the inflation bug reachable by any query that forgets the view |
+| Cross-source identity | `request_id` UNIQUE, merge-not-add; three-tier key (`request-id` header → response body `message.id` → a namespaced synthetic fallback) — the header↔`requestId` equivalence (test 11(b)) was never live-verified, and is moot on this install since the message-id tier already converges the two sides | Row per (source, turn) with a dedup view — leaves the inflation bug reachable by any query that forgets the view |
 | Quota snapshots | One row per `(window)` | Fixed `session_pct`/`weekly_pct` columns (the tech plan's schema) — would silently drop the per-model windows some plans return |
 | Plan limits | Empty by default; learned from your own snapshots and confirmed | Shipped per-plan limit table — inventing a number is the failure mode deepseek-lens already named |
 | Price table | Ships populated with documented (cited) first-party rates, plus `provisional` rows where the bundle lists a model but prices it nowhere — verification step named | Empty by default (deepseek-lens's choice) — that choice was forced by having no authoritative source, which is no longer true |

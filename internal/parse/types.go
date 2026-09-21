@@ -50,6 +50,14 @@ type Usage struct {
 	// true price — is unknown.
 	TTLUnknown bool
 	IsStream   bool
+	// MessageID is the upstream message id: message_start.message.id for a
+	// streaming body, or the top-level id for a non-streaming body whose
+	// own type is "message". First-seen wins when a body carries more than
+	// one message_start. The gate proves shape only — that the body is
+	// message-shaped — not that the id is per-request; a stable org or
+	// gateway id would pass the same gate. Empty when neither shape is
+	// present or the body carries no id.
+	MessageID string
 }
 
 // Meta is everything the system needs to know about a request before it
@@ -71,10 +79,14 @@ type Meta struct {
 	HasThinking       bool
 	ThinkingBudget    *int // thinking.budget_tokens (nil if absent)
 	SessionHeader     string
-	// PrefixHash's NULL-ness is load-bearing for the session resolver:
-	// nil means "keyed by the explicit SessionHeader instead", and a
-	// non-nil "" means the request body did not parse as JSON at all.
-	// Any other non-nil value is the computed hash.
+	// PrefixHash is always computed by ExtractMeta, regardless of
+	// SessionHeader: the session resolver's groupKey checks SessionHeader
+	// first, so a present header still wins there — it is not expressed
+	// by nil-ing this field. A non-nil "" means the request body did not
+	// parse as JSON at all; any other non-nil value is the computed hash.
+	// ExtractMeta never leaves this nil (nil only ever reaches
+	// store.Event.PrefixHash for a JSONL-sourced row, which has no
+	// request body to hash at all).
 	PrefixHash *string
 
 	ClientVersion string

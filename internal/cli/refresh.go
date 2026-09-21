@@ -12,6 +12,7 @@ import (
 	"github.com/abhisheksarkar30/claude-lens/internal/ingest"
 	"github.com/abhisheksarkar30/claude-lens/internal/jsonlogs"
 	"github.com/abhisheksarkar30/claude-lens/internal/secret"
+	"github.com/abhisheksarkar30/claude-lens/internal/session"
 	"github.com/abhisheksarkar30/claude-lens/internal/snapshot"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
@@ -58,7 +59,11 @@ func runRefresh(args []string, w io.Writer) error {
 
 	ctx := context.Background()
 	r := ingest.New(st)
-	addCollectors(ctx, r, cfg, st)
+	// runRefresh has no session.New elsewhere in this path (unlike serve,
+	// which already builds one for the consumer's resolver/aggregator
+	// seams), so one is built here for the tailer's recorder (D7).
+	sess := session.New(st, cfg.SessionGapMinutes)
+	addCollectors(ctx, r, cfg, st, sess)
 
 	outcomes := r.RunOnce(ctx)
 	failed := false
@@ -91,8 +96,8 @@ type collectorStore interface {
 // `clens refresh` (one-shot, on a timer) and `clens serve` (its scheduler and
 // the dashboard's on-demand trigger) so the two can never drift into
 // different sets of sources.
-func addCollectors(ctx context.Context, r *ingest.Runner, cfg *config.Config, st collectorStore) {
-	tailer := newTailer(cfg, jsonlRoot(), st)
+func addCollectors(ctx context.Context, r *ingest.Runner, cfg *config.Config, st collectorStore, recorder jsonlogs.SessionRecorder) {
+	tailer := newTailer(cfg, jsonlRoot(), st, recorder)
 	r.Add(ingest.SourceJSONL, "root", "jsonl:"+jsonlRoot(), ingest.CollectorFunc(func(ctx context.Context) (int, error) {
 		stats, err := tailer.Poll(ctx)
 		return stats.Inserted, err

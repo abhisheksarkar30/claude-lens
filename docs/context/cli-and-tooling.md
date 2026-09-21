@@ -3,7 +3,7 @@
 # CLI & Tooling
 
 One entry point: [cmd/clens/main.go](../../cmd/clens/main.go), a `map[string]func([]string) error`
-of 18 subcommands dispatching into [internal/cli](../../internal/cli/). Every subcommand accepts
+of 19 subcommands dispatching into [internal/cli](../../internal/cli/). Every subcommand accepts
 the same config flag set (`--proxy-addr`, `--dashboard-addr`, `--upstream-url`, `--db-path`,
 `--body-policy`, `--body-cap-bytes`, `--allow-remote`, `--session-gap-minutes`, `--retention-days`,
 `--replay`, `--accounts-path`) — see [build-and-run.md](build-and-run.md).
@@ -32,15 +32,20 @@ An unknown name prints `clens <name>: not implemented yet` and exits non-zero.
 | `models` | — | the rate catalogue, and which models have no rate at all | [internal/cli/models.go](../../internal/cli/models.go) |
 | `prices` | — | the effective rate table, plus the edit paths | [internal/cli/prices.go](../../internal/cli/prices.go) |
 | `purge` | `--yes`, `--dry-run` | delete captured rows by age or by the unpriced predicate | [internal/cli/purge.go](../../internal/cli/purge.go) |
+| `rekey` | `--yes`, `--dry-run` | the one-off historical backfill: pass 1 re-keys `proxy:`-synthetic rows from the body id already inside `resp_body`, pass 2 re-attributes proxy rows from the conversation id already inside `req_headers`, pass 3 deletes and re-derives the `jsonl:`-keyed rows whose identity was never stored. `--dry-run` reports N/M/K/L plus the dangling-`replay_of` count and a re-pricing note; run with `clens serve` stopped | [internal/cli/rekey.go](../../internal/cli/rekey.go) |
 
-## The one destructive command
+## The two destructive commands
 
-`clens purge` deletes rows. Its default is therefore the **opposite of destructive**:
+`clens purge` and `clens rekey` delete rows. Both default to the **opposite of destructive**:
 
 - nothing is deleted without `--yes`
 - `--dry-run` prints what `--yes` would have deleted
 
-This is the pattern any future destructive subcommand should follow. See
+This is the pattern any future destructive subcommand should follow. `rekey` additionally refuses
+outright (no rows changed, non-zero exit) when its pass-3 precondition fails — every recorded JSONL
+cursor must still name a readable file at least as large as its stored byte offset, and must live
+under the walked root — because pass 3's delete is unconditional over the `jsonl:` prefix and would
+otherwise destroy rows nothing could rebuild. See
 [data-privacy-and-compliance.md](data-privacy-and-compliance.md) for what retention means here.
 
 ## Dev tooling

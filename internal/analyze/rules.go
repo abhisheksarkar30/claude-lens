@@ -310,13 +310,21 @@ func ruleCachePrefixInvalidation(rows []*store.Event) []store.Warning {
 // two consecutive calls in a session and the later call then paid a full
 // rewrite -- the effect (a big write) is visible in usage alone; the
 // cause (which array changed) needs the captured request bodies.
+//
+// D7 turns a "session" from one gap-window burst of proxy rows into the
+// whole conversation, so rows can interleave JSONL rows (which
+// structurally never carry a request body) between two proxy rows. The
+// row set is filtered to the rows carrying a request body *before* the
+// pair walk -- not by skipping a pair mid-walk -- so a JSONL row sitting
+// between two proxy calls does not silently break their adjacency: under
+// the default body policy the filtered set is exactly the proxy
+// population, and because a session is now the whole conversation this
+// hands the rule more proxy rows than it saw before D7, never fewer.
 func ruleCacheInvalidatedByTools(rows []*store.Event) []store.Warning {
+	rows = rowsWithRequestBody(rows)
 	var out []store.Warning
 	for i := 1; i < len(rows); i++ {
 		prev, cur := rows[i-1], rows[i]
-		if len(prev.ReqBody) == 0 || len(cur.ReqBody) == 0 {
-			continue
-		}
 		if prev.TotalPromptTokens == 0 {
 			continue
 		}
@@ -329,6 +337,21 @@ func ruleCacheInvalidatedByTools(rows []*store.Event) []store.Warning {
 		}
 		out = append(out, withEventID(cur.ID, warning(KindCacheInvalidatedByTools, SeverityWarn,
 			"tools array changed between turns, invalidating the cached prefix from position 0")))
+	}
+	return out
+}
+
+// rowsWithRequestBody returns the subset of rows carrying a request body,
+// in order. A JSONL-sourced row structurally never carries one (the
+// transcript records no request), so this is what lets a rule that
+// compares consecutive request bodies skip over an interleaved JSONL row
+// rather than treating it as an adjacent, body-less pair.
+func rowsWithRequestBody(rows []*store.Event) []*store.Event {
+	out := make([]*store.Event, 0, len(rows))
+	for _, r := range rows {
+		if len(r.ReqBody) > 0 {
+			out = append(out, r)
+		}
 	}
 	return out
 }

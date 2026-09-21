@@ -114,22 +114,40 @@ func insertOrMerge(ctx context.Context, tx *sql.Tx, ev *Event) (id int64, sessio
 		return 0, "", false, fmt.Errorf("merge: load existing request_id %s: %w", ev.RequestID, gerr)
 	}
 
-	result, mismatch := mergeEvents(existing, ev)
+	result, err := applyMergeTx(ctx, tx, existing, ev)
+	if err != nil {
+		return 0, "", false, err
+	}
+	return result.ID, result.SessionID, true, nil
+}
+
+// applyMergeTx merges incoming into existing and persists the result --
+// it performs no load of its own; the caller supplies existing already
+// loaded by whichever key its own path resolves. insertOrMerge's own
+// collision branch and internal/cli/rekey's collision path (br-GI-9-04)
+// both call this one function, so the two cannot drift into two merge
+// rules; the load is the one thing they cannot share (insertOrMerge loads
+// by ev.RequestID, the rekey path by its target key) and it stays with
+// each caller. On the rekey path, existing is the taker -- the row that
+// already holds the target key -- so its request_id, id and session_id
+// are the survivor's; nothing is re-keyed here.
+func applyMergeTx(ctx context.Context, tx *sql.Tx, existing, incoming *Event) (*Event, error) {
+	result, mismatch := mergeEvents(existing, incoming)
 	if err := updateEventTx(ctx, tx, result); err != nil {
-		return 0, "", false, fmt.Errorf("merge: update: %w", err)
+		return nil, fmt.Errorf("merge: update: %w", err)
 	}
 	if mismatch {
 		w := Warning{
 			Kind:      "source_mismatch",
 			Severity:  "error",
-			Detail:    fmt.Sprintf("sources %s and %s disagree on token counts for request_id %s", existing.Source, ev.Source, ev.RequestID),
+			Detail:    fmt.Sprintf("sources %s and %s disagree on token counts for request_id %s", existing.Source, incoming.Source, existing.RequestID),
 			CreatedAt: time.Now(),
 		}
 		if err := upsertWarningsTx(ctx, tx, result.ID, []Warning{w}); err != nil {
-			return 0, "", false, fmt.Errorf("merge: attach source_mismatch: %w", err)
+			return nil, fmt.Errorf("merge: attach source_mismatch: %w", err)
 		}
 	}
-	return result.ID, result.SessionID, true, nil
+	return result, nil
 }
 
 // mergeEvents merges incoming into existing (existing.ID is preserved) and
@@ -308,6 +326,23 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	if len(existing.RespBody) == 0 {
 		merged.RespBody = incoming.RespBody
 	}
+	// The proxy-only prefix/replay columns the JSONL side structurally cannot
+	// supply (br-GI-9-04, plan §3 F12.2). mergeEvents assigns none of them --
+	// they ride `merged := *existing` -- so on the *live* ordering the proxy
+	// row is written first with a computed PrefixHash and the JSONL arrival is
+	// nil/empty for all three, a no-op. On the rekey collision the seats are
+	// reversed: existing is the JSONL taker (nil/empty for all three) and
+	// incoming is the proxy row carrying the hash the backfill just computed.
+	// Without the carry the merge would drop it *durably* -- pass 3's re-ingest
+	// is a JSONL row, nil for all three -- and the two hash-keyed session rules
+	// `continue` on a nil hash (internal/analyze/rules.go), silently disabling
+	// them on exactly the rows the backfill merges. Carry the incoming value
+	// only when the survivor has none: `preferNonEmpty` for the string pair and
+	// the nil test for the nullable hash (a non-nil "" there is a real value --
+	// "the body did not parse as JSON" -- not an absence).
+	merged.PrefixHash = preferNonEmptyPtr(existing.PrefixHash, incoming.PrefixHash)
+	merged.ReplayOf = preferNonEmpty(existing.ReplayOf, incoming.ReplayOf)
+	merged.ReplayEdits = preferNonEmpty(existing.ReplayEdits, incoming.ReplayEdits)
 	// The transcript columns are written by one side only -- internal/jsonlogs.
 	// A new column with no rule here would be silently dropped from the
 	// incoming side, and the common ordering is proxy-first: the capture is
@@ -342,6 +377,17 @@ func usageObserved(ev *Event) bool {
 
 func preferNonEmpty(existing, incoming string) string {
 	if existing != "" {
+		return existing
+	}
+	return incoming
+}
+
+// preferNonEmptyPtr is preferNonEmpty for a nullable column: the survivor
+// keeps its own non-nil value and only a NULL survivor takes the incoming
+// side. A non-nil "" is a real value for PrefixHash (the body did not parse
+// as JSON), not an absence, so it is kept rather than overwritten.
+func preferNonEmptyPtr(existing, incoming *string) *string {
+	if existing != nil {
 		return existing
 	}
 	return incoming

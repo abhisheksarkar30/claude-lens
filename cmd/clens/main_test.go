@@ -7,10 +7,11 @@ import (
 	"testing"
 )
 
-// carriedOver is the 18 subcommands the story's outcome definition names:
-// doctor and serve, br-GI-1-15's six collectors, and br-GI-1-17's ten readers
-// and writers. It is written out rather than derived from the map, because a
-// list derived from the thing under test cannot notice a missing entry.
+// carriedOver is the 19 subcommands the story's outcome definition names:
+// doctor and serve, br-GI-1-15's six collectors, br-GI-1-17's ten readers and
+// writers, and br-GI-9-04's rekey. It is written out rather than derived from
+// the map, because a list derived from the thing under test cannot notice a
+// missing entry.
 var carriedOver = []string{
 	// br-GI-1-01 / br-GI-1-14
 	"doctor", "serve",
@@ -18,9 +19,11 @@ var carriedOver = []string{
 	"ingest", "refresh", "quota", "accounts", "models", "reconcile",
 	// br-GI-1-17
 	"ls", "show", "tail", "stats", "sessions", "warnings", "export", "prices", "replay", "purge",
+	// br-GI-9-04
+	"rekey",
 }
 
-// TestEveryCarriedOverCommandIsDispatched is the bead's "all 18 subcommands
+// TestEveryCarriedOverCommandIsDispatched is the bead's "all 19 subcommands
 // dispatch" clause. A nil entry is a key that exists but points at nothing --
 // which would panic at dispatch rather than at build, so it is checked too.
 func TestEveryCarriedOverCommandIsDispatched(t *testing.T) {

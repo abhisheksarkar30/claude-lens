@@ -22,8 +22,11 @@ func TestDedupeAssistantLinesTakesDistinctRequest(t *testing.T) {
 	}
 }
 
-// A line with no requestId falls back to jsonl:<sessionId>:<uuid>, and
-// two such lines with different uuids are never collapsed together.
+// A line with no requestId and no message.id falls back to
+// jsonl:<sessionId>:<uuid>, and two such lines with different uuids are
+// never collapsed together. (This fixture sets no message.id, so it
+// exercises only the third tier -- the middle tier has its own case
+// below.)
 func TestDedupeAssistantLinesFallbackKeyPerUUID(t *testing.T) {
 	l1 := &line{Type: "assistant", SessionID: "sess-x", UUID: "u1",
 		Message: &message{Usage: &usageShape{InputTokens: 1}}}
@@ -53,6 +56,58 @@ func TestDedupeAssistantLinesSkipsNonUsageLines(t *testing.T) {
 	}
 	if distinct[0].RequestID != "req_has_usage" {
 		t.Errorf("kept requestId %q, want req_has_usage", distinct[0].RequestID)
+	}
+}
+
+// The middle tier: no requestId, but the transcript's own message.id is
+// present -- requestKey resolves to it rather than falling to the
+// jsonl:<sessionId>:<uuid> tier.
+func TestRequestKeyMiddleTierResolvesFromMessageID(t *testing.T) {
+	l := &line{SessionID: "sess-x", UUID: "u1", Message: &message{ID: "msg_shared"}}
+	if got := requestKey(l); got != "msg_shared" {
+		t.Errorf("requestKey = %q, want msg_shared", got)
+	}
+}
+
+// The measured defect, directly: two content-block lines of one response
+// share a message.id but carry different uuids -- they must collapse to
+// one row, not two.
+func TestDedupeAssistantLinesCollapseOnSharedMessageID(t *testing.T) {
+	l1 := &line{Type: "assistant", SessionID: "sess-x", UUID: "a1",
+		Message: &message{ID: "msg_shared", Usage: &usageShape{InputTokens: 100, OutputTokens: 50}}}
+	l2 := &line{Type: "assistant", SessionID: "sess-x", UUID: "a2",
+		Message: &message{ID: "msg_shared", Usage: &usageShape{InputTokens: 100, OutputTokens: 50}}}
+
+	distinct := dedupeAssistantLines([]*line{l1, l2})
+	if len(distinct) != 1 {
+		t.Fatalf("dedupeAssistantLines returned %d requests, want 1 (shared message.id, distinct uuids)", len(distinct))
+	}
+}
+
+// Precedence: when both a requestId and a message.id are present, the
+// requestId still wins -- the middle tier only fills in when the first is
+// absent.
+func TestRequestKeyPrefersRequestIDOverMessageID(t *testing.T) {
+	l := &line{RequestID: "req_explicit", SessionID: "sess-x", UUID: "u1",
+		Message: &message{ID: "msg_should_be_ignored"}}
+	if got := requestKey(l); got != "req_explicit" {
+		t.Errorf("requestKey = %q, want req_explicit (requestId must win over message.id)", got)
+	}
+}
+
+// The direct negative the existing fixtures don't exercise: two lines with
+// different message.ids, identical usage, the same session, must stay two
+// rows -- collapsing on usage equality rather than identity would be the
+// wrong rule entirely.
+func TestDedupeAssistantLinesDistinctMessageIDsStayDistinct(t *testing.T) {
+	l1 := &line{Type: "assistant", SessionID: "sess-x", UUID: "a1",
+		Message: &message{ID: "msg_one", Usage: &usageShape{InputTokens: 100, OutputTokens: 50}}}
+	l2 := &line{Type: "assistant", SessionID: "sess-x", UUID: "a2",
+		Message: &message{ID: "msg_two", Usage: &usageShape{InputTokens: 100, OutputTokens: 50}}}
+
+	distinct := dedupeAssistantLines([]*line{l1, l2})
+	if len(distinct) != 2 {
+		t.Fatalf("dedupeAssistantLines returned %d requests, want 2 (distinct message.ids, equal usage)", len(distinct))
 	}
 }
 

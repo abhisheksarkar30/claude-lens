@@ -12,10 +12,14 @@ import (
 // scanner for the shapes br-GI-1-09's tool/cache-invalidation rules
 // compare across turns.
 //
-// maxSessionHeaderLen bounds x-clens-session before it is accepted as
-// Meta.SessionHeader, which the session resolver uses verbatim as the
-// session's id. 200 is generous for a client-chosen id/label and small
-// next to SQLite's own TEXT limits.
+// maxSessionHeaderLen bounds whichever header supplies Meta.SessionHeader
+// before it is accepted, since the session resolver uses it verbatim as
+// the session's id. 200 is generous for a client-chosen id/label and
+// small next to SQLite's own TEXT limits. It applies to both sources
+// below: x-clens-session (the explicit operator override) and
+// x-claude-code-session-id (the request's own conversation id, D7) — an
+// overlong header is treated as absent, not truncated, so an unbounded
+// client value never becomes an unbounded primary key.
 const maxSessionHeaderLen = 200
 
 // ExtractMeta pulls every request-level detail the rest of the system
@@ -31,12 +35,18 @@ const maxSessionHeaderLen = 200
 func ExtractMeta(reqBody []byte, headers http.Header) Meta {
 	m := Meta{}
 
-	// An overlong x-clens-session is left empty rather than truncated:
-	// unlike PrefixHash (a bounded 16-char hash), this value rides
-	// straight into sessions.id verbatim, so an unbounded client header
-	// would mean an unbounded primary key.
-	if sh := headers.Get("x-clens-session"); len(sh) <= maxSessionHeaderLen {
+	// x-clens-session is the explicit operator override and is read
+	// first; x-claude-code-session-id (the request's own conversation id,
+	// D7) fills the value only when x-clens-session is absent. An
+	// overlong header is treated as absent rather than truncated: unlike
+	// PrefixHash (a bounded 16-char hash), this value rides straight into
+	// sessions.id verbatim, so an unbounded client header would mean an
+	// unbounded primary key — and an overlong x-clens-session does not
+	// supply a value, so the second header is used instead.
+	if sh := headers.Get("x-clens-session"); sh != "" && len(sh) <= maxSessionHeaderLen {
 		m.SessionHeader = sh
+	} else if ccsid := headers.Get("x-claude-code-session-id"); ccsid != "" && len(ccsid) <= maxSessionHeaderLen {
+		m.SessionHeader = ccsid
 	}
 
 	var body map[string]interface{}
@@ -99,14 +109,14 @@ func ExtractMeta(reqBody []byte, headers http.Header) Meta {
 	m.CacheControlSites = sites
 	m.HasCacheControl = len(sites) > 0
 
-	if m.SessionHeader != "" {
-		// NULL: the session resolver will key by the explicit header
-		// instead, so the hash is not needed.
-		m.PrefixHash = nil
-	} else {
-		h := prefixHash(body["system"], msgArr)
-		m.PrefixHash = &h
-	}
+	// Always computed, header or not: groupKey checks SessionHeader first
+	// (see internal/session), so a present header still wins there — but
+	// ruleCacheExpiredBetweenTurns and ruleCacheConcurrentWriteRace
+	// (internal/analyze) continue on a nil hash, and D7 makes
+	// SessionHeader non-empty for ~97% of proxy calls, so nil-ing it here
+	// would silently kill both rules for nearly every call.
+	h := prefixHash(body["system"], msgArr)
+	m.PrefixHash = &h
 
 	return m
 }

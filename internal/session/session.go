@@ -41,10 +41,19 @@ func New(st *store.Store, gapMinutes int) *Resolver {
 	}
 }
 
-// Resolve returns the session id meta belongs to: the same id as the
-// grouping key's last call if that call was within the gap window,
-// otherwise a freshly minted one.
+// Resolve returns the session id meta belongs to. A call carrying
+// SessionHeader (D7: x-clens-session, or the request's own
+// x-claude-code-session-id) has that value *as* its identity, verbatim —
+// not merely as a grouping key — because the request already names the
+// conversation it belongs to. The inactivity-gap window below applies
+// only to the residual header-less calls: the same id as the grouping
+// key's last call if that call was within the gap window, otherwise a
+// freshly minted one.
 func (r *Resolver) Resolve(meta parse.Meta, now time.Time) string {
+	if meta.SessionHeader != "" {
+		return meta.SessionHeader
+	}
+
 	key := groupKey(meta)
 
 	r.mu.Lock()
@@ -60,17 +69,13 @@ func (r *Resolver) Resolve(meta parse.Meta, now time.Time) string {
 	return id
 }
 
-// groupKey is the grouping identity a call resolves against. An explicit
-// session header always wins over the prefix hash (and lives in its own
-// key namespace, so a header-keyed session can never collide with a
-// prefix-keyed one). Absent a header, calls group by prefix_hash's value,
-// including the empty string parse.Meta uses for "body did not parse" --
-// every unparseable-body call on a given header-less connection shares
-// that one bucket rather than getting a unique session each.
+// groupKey is the grouping identity a header-less call resolves against
+// (Resolve returns SessionHeader directly and never reaches this for a
+// header-carrying call). Calls group by prefix_hash's value, including
+// the empty string parse.Meta uses for "body did not parse" -- every
+// unparseable-body call on a given header-less connection shares that one
+// bucket rather than getting a unique session each.
 func groupKey(meta parse.Meta) string {
-	if meta.SessionHeader != "" {
-		return "header:" + meta.SessionHeader
-	}
 	if meta.PrefixHash != nil {
 		return "prefix:" + *meta.PrefixHash
 	}

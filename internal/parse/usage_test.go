@@ -118,3 +118,49 @@ func TestExtractUsageUnrecognizedContentTypeYieldsZeroUsage(t *testing.T) {
 		t.Errorf("Usage = %+v, want zero value", u)
 	}
 }
+
+func TestExtractUsageStreamingMessageIDPopulated(t *testing.T) {
+	stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_abc123\",\"model\":\"m\",\"usage\":{}}}\n\n"
+	u := ExtractUsage([]byte(stream), "text/event-stream")
+	if u.MessageID != "msg_abc123" {
+		t.Errorf("MessageID = %q, want msg_abc123", u.MessageID)
+	}
+}
+
+func TestExtractUsageNonStreamMessageIDPopulatedWhenTypeIsMessage(t *testing.T) {
+	body := []byte(`{"id":"msg_xyz789","type":"message","model":"m","usage":{}}`)
+	u := ExtractUsage(body, "application/json")
+	if u.MessageID != "msg_xyz789" {
+		t.Errorf("MessageID = %q, want msg_xyz789", u.MessageID)
+	}
+}
+
+func TestExtractUsageNonStreamMessageIDGatedOnBodyType(t *testing.T) {
+	body := []byte(`{"id":"not_a_message_id","type":"error","model":"m","usage":{}}`)
+	u := ExtractUsage(body, "application/json")
+	if u.MessageID != "" {
+		t.Errorf("MessageID = %q, want empty — body type is not %q", u.MessageID, "message")
+	}
+}
+
+func TestExtractUsageTwoMessageStartFramesFirstIDWins(t *testing.T) {
+	stream := "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_first\",\"model\":\"m\",\"usage\":{}}}\n\n" +
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_second\",\"model\":\"m\",\"usage\":{}}}\n\n"
+	u := ExtractUsage([]byte(stream), "text/event-stream")
+	if u.MessageID != "msg_first" {
+		t.Errorf("MessageID = %q, want msg_first (first-seen wins)", u.MessageID)
+	}
+}
+
+func TestExtractUsageNoIDYieldsEmptyMessageID(t *testing.T) {
+	streamBody := []byte(`{"type":"error","error":{"type":"overloaded_error","message":"boom"}}`)
+	u := ExtractUsage(streamBody, "application/json")
+	if u.MessageID != "" {
+		t.Errorf("MessageID = %q, want empty for an error body", u.MessageID)
+	}
+
+	nonStream := ExtractUsage([]byte(`{"model":"m","usage":{}}`), "application/json")
+	if nonStream.MessageID != "" {
+		t.Errorf("MessageID = %q, want empty when the body carries no id and no type", nonStream.MessageID)
+	}
+}
