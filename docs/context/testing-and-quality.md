@@ -9,9 +9,10 @@
 | Unit + integration | Go's stdlib `testing` only — no assertion library, no mocking framework | `*_test.go` beside the code | [go.mod](../../go.mod) has no test dependency |
 | End-to-end | none — no suite; one recorded manual run instead | [docs/acceptance.md](../acceptance.md) | the doc states which half could not be run |
 
-**51 test files, 15,051 lines** against 14,803 lines of non-test Go (re-measured at
-`GI-7-header-and-body-visibility`, which took the count 50 → 51 on one new file —
-[internal/api/mode_test.go](../../internal/api/mode_test.go); everything else it added went into
+**52 test files, 16,544 lines** against 15,498 lines of non-test Go (re-measured at
+`GI-9-merge-jsonl-and-proxy-rows`, which took the count 51 → 52 on one new file —
+[internal/cli/rekey_test.go](../../internal/cli/rekey_test.go); the story's other new cases — the
+identity, session and merge-precedence tests in `internal/parse` and `internal/session` — went into
 existing test files). Real components are used
 rather than mocked: tests open a real temp SQLite store, run a real `httptest.Server` upstream, and
 drive the real `ServeMux`.

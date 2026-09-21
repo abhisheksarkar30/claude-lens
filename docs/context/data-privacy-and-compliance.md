@@ -108,9 +108,15 @@ same principle to a cost it cannot compute: see [cost-and-quota.md](cost-and-quo
 | `--dry-run` | prints exactly what `--yes` would have deleted |
 | `--vacuum` | reclaims the space afterwards |
 
-**The destructive command defaults to the opposite of destructive.** Nothing is deleted without
-`--yes`; `--dry-run` is independent of it (so `--dry-run --yes` reports and deletes in one pass,
-which is deliberate — [internal/cli/purge.go:20](../../internal/cli/purge.go#L20)).
+**The two destructive commands (`clens purge` and `clens rekey`) default to the opposite of
+destructive.** Nothing is deleted without `--yes`; `--dry-run` is independent of it, but the two flags
+are not symmetric — `--dry-run --yes` is simply a dry run, and the only way to delete anything is a
+run that passes `--yes` without `--dry-run` —
+[internal/cli/purge.go:22-25](../../internal/cli/purge.go#L22-L25).
+
+**`rekey` adds no new capture and no new retention.** Pass 1's body id and pass 2's conversation id
+are both read out of `resp_body` / `req_headers`, which the consumer already stores verbatim; nothing
+new is captured, and re-attribution only rewrites a column from a value already on disk.
 
 **Cascade is scoped:** `ON DELETE CASCADE` appears only on `warnings.event_id`. Purging an event
 takes its warnings with it and nothing else — `sessions` is not cascaded, which is why a session

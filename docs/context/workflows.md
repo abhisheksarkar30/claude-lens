@@ -59,6 +59,16 @@ sequenceDiagram
 Source A and source B can both describe the same call. `request_id` is `UNIQUE`, so the second
 arrival merges instead of inserting.
 
+**The merge now fires** — before GI#9 the proxy and `jsonlogs` rarely produced the same
+`request_id` for the same call, because each fell to its own shape of synthetic key when the
+`request-id` header was absent. GI#9 gave both writers a shared three-tier identity rule
+(`internal/consumer`'s `requestID`, `internal/jsonlogs`'s `requestKey`): **the response body's
+`message.id` is the request's identity on both sides**, ranked between the `request-id` header (tier
+1) and a namespaced synthetic fallback (tier 3, `proxy:<sha256(body)>:<started_at_ns>:<attempt>` /
+`jsonl:<sessionId>:<uuid>`) — see [decisions/008](decisions/008-three-tier-identity-key.md). Two
+writers landing on the same message id is what makes this flow a normal occurrence rather than an
+edge case only `request-id` could trigger.
+
 ```mermaid
 sequenceDiagram
   participant J as internal/jsonlogs
@@ -128,6 +138,12 @@ sequenceDiagram
   as one merged row.
 - **Idempotent:** re-ingesting the same JSONL re-merges to the same result. That is what makes
   `clens ingest --rebuild` the re-pricing path rather than a duplicate-row risk.
+- **The session a merged row belongs to is the conversation id, not a heuristic group (D7).** The
+  proxy now adopts `x-claude-code-session-id` as its stored `session_id` — the id the request already
+  carries — instead of the gap-window `s_…` grouping it used before GI#9. A proxy row and its JSONL
+  counterpart therefore agree on `session_id` before they even merge, and `clens sessions` shows real
+  conversations rather than proxy-only heuristic groups. See
+  [decisions/009](decisions/009-proxy-adopts-the-conversation-id.md).
 
 ## 3. `clens refresh` — the collector fan-out
 

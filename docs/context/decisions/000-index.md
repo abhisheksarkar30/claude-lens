@@ -2,7 +2,7 @@
 
 # Decision records
 
-Seven architectural forks where the code took one path and a real alternative was rejected. Each is
+Nine architectural forks where the code took one path and a real alternative was rejected. Each is
 recorded because **the losing side is the one a future change is most likely to reintroduce** —
 these are not history for its own sake.
 
@@ -10,7 +10,8 @@ these are not history for its own sake.
 §Decision log), which records the choice and the rejected alternative as they were made. **007 is
 different in kind**: it records a GI-1 decision being *superseded*, and it is here because the
 rejected side of that original decision — "no migrations" — is the one a reader will still find
-quoted in the older docs.
+quoted in the older docs. **008 and 009 come from the GI-9 plan** (`docs/planning/GI-9-merge-jsonl-and-proxy-rows.md`,
+D1 and D7): the identity key and the session id the cross-source merge relies on.
 
 | ADR | Decision | Reintroducing the rejected side would… |
 |---|---|---|
@@ -21,6 +22,8 @@ quoted in the older docs.
 | [005](005-no-develop-branch.md) | v1 lands on `main` via a `GI-<n>-…` branch; no `develop` | break both CI guards, which were adapted specifically for this |
 | [006](006-dashboard-with-no-build-step.md) | the dashboard is hand-written and embedded; no bundler, no CDN | add a network dependency and a build step to a loopback tool holding every prompt |
 | [007](007-schema-migrations-by-user-version.md) | schema changes go through a `PRAGMA user_version` runner; `schema.sql` never `ALTER`s | recreate (or hand-edit) the user's database to add a column — silently, because it looks safe when the database is a temp file |
+| [008](008-three-tier-identity-key.md) | cross-source identity is a three-tier key (`request-id` header → response body `message.id` → namespaced synthetic) | fall back to a header-only key that cannot converge a proxy row with its JSONL counterpart whenever the header is absent from either side |
+| [009](009-proxy-adopts-the-conversation-id.md) | the proxy adopts `x-claude-code-session-id` as its stored `session_id` | leave `clens sessions` showing gap-window heuristic groups instead of real conversations |
 
-The status of all seven is **Accepted**. None is superseded — 007 supersedes a *GI-1 decision*
+The status of all nine is **Accepted**. None is superseded — 007 supersedes a *GI-1 decision*
 ("migrations: none in v1"), not another ADR.

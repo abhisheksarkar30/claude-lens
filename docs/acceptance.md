@@ -214,10 +214,14 @@ $ grep -h '"requestId"' ~/.claude/projects/**/*.jsonl | tail -1
 {"requestId":"<JSONL_VALUE>", ...}
 ```
 
-**Outcome: not captured.** Recorded in
-`docs/planning/GI-1-claude-lens-v1.md` §Cross-source identity as still-open,
-with the fallback key remaining the operative one until it is. No equality may
-be asserted here that was not observed.
+**Outcome: never exercised, not falsified.** Recorded in
+`docs/planning/GI-1-claude-lens-v1.md` §Cross-source identity, scoped as: moot
+on this install — GI#9's message-id tier already converges a proxy row and its
+JSONL counterpart without needing the header match — but load-bearing and
+unverified, and **silently failing** (no error, just two rows instead of one)
+on any install whose upstream sends `request-id` if that header were ever
+byte-unequal to the JSONL `requestId`. No equality may be asserted here that
+was not observed.
 
 ## Findings
 
