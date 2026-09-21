@@ -170,3 +170,41 @@ of two (fixed in `br-GI-7-08`, found by the manual run); the body policy reached
 same bead); and none was visible to any test — the first because every fixture truncated a response,
 the second because the one test that read the banner checked its text and not its claim, the third
 because no test asserted the *accepted* set, only a rejected one.
+
+**2026-09-21 — REFRESH, scoped to `GI-9-merge-jsonl-and-proxy-rows`** (beads `br-GI-9-01` … `-07`;
+plan `docs/planning/GI-9-merge-jsonl-and-proxy-rows.md` v23). **No module was added or retired** — no
+new dependency, route, entity, or build step. `decisions/` gained **two ADRs** — [008](decisions/008-three-tier-identity-key.md)
+(the three-tier identity key) and [009](decisions/009-proxy-adopts-the-conversation-id.md) (the proxy
+adopts the conversation id) — so the count above moved seven → nine and the `decisions/` hint changed.
+
+**The story changed nine files under `docs/context/` — seven modified, two created** — and this
+refresh then changed two more, for eleven. The story's seven: `INDEX.md` (19 subcommands, nine forks,
+52 test files), `cli-and-tooling.md` (the `rekey` row; "the one destructive command" → two, plus
+`rekey`'s pass-3 precondition), `storage-schema.md` and `data-privacy-and-compliance.md` (each
+carrying its own copy of that claim — the second also the `--dry-run --yes` misstatement and its
+citation, and the no-new-capture statement), `workflows.md` §2 (the merge now fires; the session
+rule), `testing-and-quality.md` (the size figures), and `decisions/000-index.md`. **This refresh's
+two: `testing-and-quality.md` again, and `glossary.md`** — see below. **Everything else came back
+*no changes needed*** — `architecture.md`, `api-surface.md`, `conventions.md`, `build-and-run.md`,
+`dashboard.md`, `cost-and-quota.md`, `security-and-permissions.md`, `infra-and-deploy.md`,
+`integrations-and-external-services.md`, and `decisions/001`–`007`.
+
+**This refresh found a size figure stale by exactly one commit.** `testing-and-quality.md` said
+"52 test files, **16,544** lines against **15,498** lines of non-test Go"; both numbers were
+measured and committed by `br-GI-9-05` (`aab22ad`), and the implementation cross-review's fix commit
+`b871c7c` then added 28 lines to `internal/store/merge.go` and a net 90 to
+`internal/cli/rekey_test.go`. The doc was 90 and 28 short of the branch tip. Re-measured: **16,634**
+and **15,526**. The file count and its provenance (51 → 52, one new file, `rekey_test.go`) were
+correct and stay. The clause now states that a mid-branch count is a count *of that commit*, not of
+the story — the form this drift keeps taking.
+
+**`glossary.md` carried two definitions the story had made incomplete.** `session` was still "a fold
+of the events that belong to it", when D7 changed the id to the conversation the request already
+carries and left the gap-window heuristic as the header-less fallback only; `request_id` named the
+key without the three tiers that now resolve it. Both now state the rule and link 008/009. The
+glossary is where an agent looks first for a term, so a definition predating the rule is worse there
+than in any other module.
+
+**A scope note for the next refresh on this machine:** the range for a story is `origin/main..HEAD`,
+not `main..HEAD`. A local `main` that lags the remote silently folds the *previous* story into the
+diff — here, all of GI-7's files appeared under GI-9's range until it was re-scoped.
