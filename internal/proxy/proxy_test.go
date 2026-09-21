@@ -378,11 +378,13 @@ func TestCaptureRecordsUnderPolicyOff(t *testing.T) {
 }
 
 // TestPolicyOffSurvivesAMissingRequestID is the regression the first version of
-// br-GI-7-09 shipped. captureState.requestID hashes st.reqBody to build its
-// fallback key, and under "off" that field is nil -- so any call whose response
+// br-GI-7-09 shipped. The proxy used to hash st.reqBody to build a fallback
+// key, and under "off" that field is nil -- so any call whose response
 // carried no Request-Id panicked on a nil *boundedBuffer. net/http recovers a
 // handler panic and logs it, so the suite stayed green while the row was
-// silently never submitted.
+// silently never submitted. D2 moved key resolution (and the hash) to the
+// consumer, so the proxy no longer has a nil-buffer path to guard here --
+// this test now only pins the surrounding no-panic / no-lost-row behaviour.
 //
 // Both paths are here because they reach the same line and only one of them
 // looks like an error: a 200 with no Request-Id, and an unreachable upstream,
@@ -449,12 +451,6 @@ func TestPolicyOffSurvivesAMissingRequestID(t *testing.T) {
 			call := captureOne(t, sk)
 			if call.Method != http.MethodGet {
 				t.Errorf("Method = %q, want GET", call.Method)
-			}
-			// The synthetic key is the whole reason requestID ran at all, and
-			// an empty one would collapse every off-policy row onto a single
-			// UNIQUE request_id.
-			if !strings.HasPrefix(call.RequestID, "proxy:") {
-				t.Errorf("RequestID = %q, want a proxy: synthetic key", call.RequestID)
 			}
 		})
 	}
@@ -548,6 +544,11 @@ func TestCaptureCompleteCoversBothBodies(t *testing.T) {
 	}
 }
 
+// TestResponseDerivedRequestIDWins asserts the raw upstream header value
+// passes through the proxy unresolved. It is no longer the dedup key
+// itself (D2 moved key resolution to the consumer, which is the only
+// place a parsed body is available) — this test only pins that the proxy
+// still tees the header value onto the sink.CapturedCall it submits.
 func TestResponseDerivedRequestIDWins(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Request-Id", "req_abc123")
@@ -571,40 +572,7 @@ func TestResponseDerivedRequestIDWins(t *testing.T) {
 	resp.Body.Close()
 
 	call := captureOne(t, sk)
-	if call.RequestID != "req_abc123" {
-		t.Errorf("RequestID = %q, want req_abc123", call.RequestID)
-	}
-}
-
-// TestHashFallbackTwoAttemptsProduceDistinctIDs is the proxy half of test
-// 21: a transport failure with no request-id falls back to a synthetic
-// key, and two identical bodies on two attempts must not collapse onto
-// the same key.
-func TestHashFallbackTwoAttemptsProduceDistinctIDs(t *testing.T) {
-	sk := sink.New(16)
-	h, err := New(testConfig("http://127.0.0.1:1"), sk)
-	if err != nil {
-		t.Fatal(err)
-	}
-	proxySrv := proxyServer(t, h)
-	defer proxySrv.Close()
-
-	const body = `{"model":"claude-sonnet-5"}`
-	for i := 0; i < 2; i++ {
-		resp, err := http.Post(proxySrv.URL+"/v1/messages", "application/json", strings.NewReader(body))
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-	}
-
-	first := captureOne(t, sk)
-	second := captureOne(t, sk)
-
-	if !strings.HasPrefix(first.RequestID, "proxy:") || !strings.HasPrefix(second.RequestID, "proxy:") {
-		t.Fatalf("want both fallback IDs prefixed \"proxy:\", got %q and %q", first.RequestID, second.RequestID)
-	}
-	if first.RequestID == second.RequestID {
-		t.Fatalf("two attempts with identical bodies produced the same RequestID %q, want distinct", first.RequestID)
+	if call.RequestIDHeader != "req_abc123" {
+		t.Errorf("RequestIDHeader = %q, want req_abc123", call.RequestIDHeader)
 	}
 }

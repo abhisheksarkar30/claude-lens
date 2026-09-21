@@ -54,11 +54,11 @@ type CapturedCall struct {
 	ReplayOf    string
 	ReplayEdits string
 
-	// RequestID is the cross-source dedup key: the response's request-id
-	// header when a response exists, or a synthetic
-	// proxy:<hash>:<started_at_ns>:<attempt> key for a call that never
-	// produced one.
-	RequestID string
+	// RequestIDHeader is the raw upstream request-id header value, or ""
+	// when the response carried none. It is not itself the dedup key — the
+	// consumer's requestID resolves the key from this, the parsed body's
+	// message id, and a synthetic fallback, in that order (D2).
+	RequestIDHeader string
 
 	Err error
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -54,7 +55,7 @@ func sseBody(model string, inputTokens, outputTokens int) []byte {
 
 func basicCall(requestID string) *sink.CapturedCall {
 	return &sink.CapturedCall{
-		RequestID:       requestID,
+		RequestIDHeader: requestID,
 		StartedAt:       time.Now(),
 		Duration:        10 * time.Millisecond,
 		Method:          "POST",
@@ -604,5 +605,71 @@ func TestConsumerAttachesPeakPricingWarning(t *testing.T) {
 					found, tc.want, ev.CostSource, ev.ModelResolved, tc.at.Format(time.RFC3339))
 			}
 		})
+	}
+}
+
+// TestRequestIDPrecedence is D2's rule, direct: the header wins over the
+// body id, which wins over the synthetic fallback.
+func TestRequestIDPrecedence(t *testing.T) {
+	call := &sink.CapturedCall{RequestIDHeader: "req_header_value", StartedAt: time.Now()}
+	usage := parse.Usage{MessageID: "msg_body_id"}
+
+	if got := requestID(call, usage); got != "req_header_value" {
+		t.Errorf("requestID = %q, want the header value when both are present", got)
+	}
+}
+
+func TestRequestIDBodyIDWinsOverSynthetic(t *testing.T) {
+	call := &sink.CapturedCall{StartedAt: time.Now()}
+	usage := parse.Usage{MessageID: "msg_body_id"}
+
+	if got := requestID(call, usage); got != "msg_body_id" {
+		t.Errorf("requestID = %q, want the body id when no header is present", got)
+	}
+}
+
+func TestRequestIDSyntheticFallbackShape(t *testing.T) {
+	call := &sink.CapturedCall{StartedAt: time.Now(), ReqBody: []byte(`{"model":"m"}`)}
+	usage := parse.Usage{}
+
+	got := requestID(call, usage)
+	if !strings.HasPrefix(got, "proxy:") {
+		t.Errorf("requestID = %q, want a proxy: synthetic key when neither header nor body id is present", got)
+	}
+}
+
+// TestRequestIDSyntheticFallbackNilBodyIsWellFormed is the "off"-policy
+// shape: no header, no body id, and a nil request body (--body-policy off
+// never captures one). The proxy used to guard this with a nil
+// *boundedBuffer check; D2 moved the hash to the consumer, where
+// sha256.Sum256(nil) is simply the hash of zero bytes, so there is nothing
+// to guard.
+func TestRequestIDSyntheticFallbackNilBodyIsWellFormed(t *testing.T) {
+	call := &sink.CapturedCall{StartedAt: time.Now()}
+	usage := parse.Usage{}
+
+	got := requestID(call, usage)
+	if !strings.HasPrefix(got, "proxy:") {
+		t.Errorf("requestID = %q, want a well-formed proxy: key with a nil body", got)
+	}
+}
+
+// TestHashFallbackTwoAttemptsProduceDistinctIDs is test 21's consumer half
+// (moved from internal/proxy with the code it exercises, br-GI-9-02): two
+// byte-identical bodies in one process must not collapse onto the same
+// synthetic key, which would destroy the rate_limited/overloaded signal
+// those attempts exist to record.
+func TestHashFallbackTwoAttemptsProduceDistinctIDs(t *testing.T) {
+	body := []byte(`{"model":"claude-sonnet-5"}`)
+	started := time.Now()
+
+	first := requestID(&sink.CapturedCall{StartedAt: started, ReqBody: body}, parse.Usage{})
+	second := requestID(&sink.CapturedCall{StartedAt: started, ReqBody: body}, parse.Usage{})
+
+	if !strings.HasPrefix(first, "proxy:") || !strings.HasPrefix(second, "proxy:") {
+		t.Fatalf("want both fallback IDs prefixed \"proxy:\", got %q and %q", first, second)
+	}
+	if first == second {
+		t.Fatalf("two attempts with identical bodies produced the same RequestID %q, want distinct", first)
 	}
 }

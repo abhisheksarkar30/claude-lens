@@ -10,14 +10,12 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/config"
@@ -116,14 +114,13 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 		authKind := ClassifyAuthKind(r.Header)
 
 		st := &captureState{
-			start:       time.Now(),
-			method:      r.Method,
-			path:        r.URL.Path,
-			remoteAddr:  r.RemoteAddr,
-			authKind:    authKind,
-			reqHeaders:  redactHeaders(r.Header),
-			sk:          sk,
-			fallbackSeq: fallbackSeqCounter,
+			start:      time.Now(),
+			method:     r.Method,
+			path:       r.URL.Path,
+			remoteAddr: r.RemoteAddr,
+			authKind:   authKind,
+			reqHeaders: redactHeaders(r.Header),
+			sk:         sk,
 		}
 		if captureBodies {
 			reqBuf := newBoundedBuffer(bodyCap)
@@ -141,15 +138,6 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 		rp.ServeHTTP(w, r)
 	}), nil
 }
-
-// fallbackSeqCounter disambiguates hash-fallback RequestIDs across every
-// call this process proxies. It is package-level (not per-New call) so a
-// server that is rebuilt mid-process still never reuses a disambiguator;
-// tests that need a clean sequence construct their own via New, since each
-// call starts its own captureState pointing at the same shared counter is
-// exactly what "never collapse two attempts" requires — the counter's job
-// is uniqueness, not per-server isolation.
-var fallbackSeqCounter = new(uint64)
 
 // ReplayMeta carries a replay's linkage from the handler that re-issues a
 // captured request to the capture path that records it, so a replay
@@ -207,8 +195,7 @@ type captureState struct {
 	reqBody    *boundedBuffer
 	sk         *sink.Sink
 
-	fallbackSeq *uint64
-	noCapture   bool
+	noCapture bool
 
 	// replayOf and replayEdits come from ReplayMeta. replayOf is the
 	// original's row id rendered in decimal -- the same form
@@ -251,43 +238,21 @@ func (st *captureState) submit(status int, respHeaders http.Header, respBody []b
 		CaptureComplete: captureComplete,
 		ReplayOf:        st.replayOf,
 		ReplayEdits:     st.replayEdits,
-		RequestID:       st.requestID(respHeaders),
+		RequestIDHeader: requestIDHeader(respHeaders),
 		Err:             callErr,
 	})
 }
 
-// requestID resolves the cross-source dedup key: the response's
-// request-id header when a response exists, or a synthetic
-// proxy:<hash>:<started_at_ns>:<attempt> key for a call that never
-// produced one. The attempt counter is what keeps two byte-identical
-// bodies (e.g. two retried attempts of the same call) from collapsing onto
-// the same synthetic key, which would destroy the rate_limited/overloaded
-// signal those attempts exist to record — started_at_ns alone is not
-// sufficient, since a fast enough retry could in principle share a
-// nanosecond timestamp.
-func (st *captureState) requestID(respHeaders http.Header) string {
-	if respHeaders != nil {
-		if id := respHeaders.Get("Request-Id"); id != "" {
-			return id
-		}
+// requestIDHeader returns the upstream Request-Id header value, or "" when
+// respHeaders is nil (the ErrorHandler path, which has no response) or the
+// header is absent. The proxy resolves no further than this: the identity
+// rule that falls back to a parsed body id, and then to a synthetic key,
+// lives in the consumer (D2) — the hot path must not parse.
+func requestIDHeader(respHeaders http.Header) string {
+	if respHeaders == nil {
+		return ""
 	}
-	attempt := atomic.AddUint64(st.fallbackSeq, 1)
-	// reqBody is nil under --body-policy off, and the hash of it is a
-	// constant. That costs the key nothing: this branch is already the
-	// fallback for "upstream sent no Request-Id", and the started_at_ns and
-	// attempt fields below are what make the key unique. The hash's only job is
-	// to *separate* two calls whose bodies differ; two calls whose bodies are
-	// alike hash alike, which is why the attempt counter is what keeps them
-	// apart -- and a body we never kept has no hash to contribute either way.
-	// Guarded rather than branched at the call site because this runs on the
-	// ErrorHandler path too, where respHeaders is nil and the early return
-	// above cannot help.
-	var reqBody []byte
-	if st.reqBody != nil {
-		reqBody = st.reqBody.Bytes()
-	}
-	sum := sha256.Sum256(reqBody)
-	return fmt.Sprintf("proxy:%x:%d:%d", sum, st.start.UnixNano(), attempt)
+	return respHeaders.Get("Request-Id")
 }
 
 // boundedBuffer accumulates up to capacity bytes; writes past that are
