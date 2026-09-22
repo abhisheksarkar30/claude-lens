@@ -1867,3 +1867,233 @@ func (s *Store) DanglingReplayOfCount(ctx context.Context) (int, error) {
 	}
 	return n, nil
 }
+
+// PriceComputer is internal/store's local mirror of the pre-insert cost step's
+// seam — internal/consumer's PriceComputer, whose method set both pricing.Table
+// and *pricing.Loader satisfy.
+//
+// The mirror exists so the store can price a stored row without importing
+// internal/pricing: the store is the write authority and the pricing engine
+// stays behind a seam, exactly as internal/proxy depends only on sink and
+// config. The compiler cannot enforce that (an import of internal/pricing here
+// would compile fine), which is why importguard_test.go reads the source and
+// fails instead.
+type PriceComputer interface {
+	Compute(model string, usage parse.Usage, speed, serviceTier string, at time.Time) (usd *float64, costSource string)
+}
+
+// cacheTTLUnknownSource is the one approximate cost_source whose input set is
+// itself recoverable from the label: pricing sets it iff usage.TTLUnknown was
+// true at insert, so the label is the reconstruction key for that bit.
+const cacheTTLUnknownSource = "approximate:cache_ttl_unknown"
+
+// repriceInScope reports whether a stored cost_source names an input set this
+// reprice can rebuild from the row's own columns. It is deliberately an
+// allow-list spelled by reason, not an "approximate:" prefix test:
+// cache_ttl_unknown is reconstructible and is priced like any other row, while
+// any other approximate:<reason> — present or added later — is not, and
+// skipping those is what keeps --yes non-destructive on the rows it cannot
+// price.
+func repriceInScope(costSource string) bool {
+	switch costSource {
+	case "unpriced":
+		// No rate resolved when the row was written, so there is no cost to
+		// correct. Left untouched, and never newly priced even where the model
+		// resolves today: a row whose stored figure is absent is outside the
+		// recompute relation rather than trivially satisfying it.
+		return false
+	case cacheTTLUnknownSource:
+		return true
+	}
+	return !strings.HasPrefix(costSource, "approximate:")
+}
+
+// RepriceCounts is what one RepriceCosts pass did — or, under dryRun, what it
+// would have done. The three buckets partition every row the pass read, so
+// Moved+Unchanged+Skipped is the row count and a caller can account for all of
+// them rather than trusting a total.
+type RepriceCounts struct {
+	Moved     int // the routed cost column or cost_source changed
+	Unchanged int // priced, but the stored figure already agreed
+	Skipped   int // inputs not reconstructible from the stored columns
+}
+
+// repriceCandidate is one event row's cost-relevant columns, read inside the
+// reprice transaction before any write. Recomputing a cost needs exactly the
+// inputs the insert path used, and each of these is a stored column — that is
+// what makes a recompute possible at all.
+type repriceCandidate struct {
+	id int64
+
+	sessionID   string
+	billingMode string
+	model       string
+	costSource  string
+	speed       string
+	serviceTier string
+	startedAt   time.Time
+
+	input, output, cacheWrite5m, cacheWrite1h, cacheRead int
+
+	costUSD              sql.NullFloat64
+	apiEquivalentCostUSD sql.NullFloat64
+}
+
+// usage rebuilds the parse.Usage the row's cost was computed from. TTLUnknown
+// is not a stored column; the cost_source label is the reconstruction key for
+// it, which is what repriceInScope's allow-list admits.
+func (c repriceCandidate) usage() parse.Usage {
+	return parse.Usage{
+		InputTokens:        c.input,
+		OutputTokens:       c.output,
+		CacheWrite5mTokens: c.cacheWrite5m,
+		CacheWrite1hTokens: c.cacheWrite1h,
+		CacheReadTokens:    c.cacheRead,
+		TTLUnknown:         c.costSource == cacheTTLUnknownSource,
+	}
+}
+
+// routed is the figure invariant 5 puts this row's cost in, and whether that
+// is the api-equivalent column: a subscription row populates
+// api_equivalent_cost_usd and leaves cost_usd NULL, any other billing mode is
+// the reverse. It is the same split as the insert-time switch in
+// internal/consumer and reconcileSessionTx's SUM(CASE ...) pair.
+func (c repriceCandidate) routed() (sql.NullFloat64, bool) {
+	if c.billingMode == "subscription" {
+		return c.apiEquivalentCostUSD, true
+	}
+	return c.costUSD, false
+}
+
+// RepriceCosts recomputes the stored cost of every event row it can rebuild
+// and rewrites the rows whose figure moved, in one transaction, re-deriving
+// each affected session's totals before the commit.
+//
+// dryRun computes the same three counts and writes nothing. It is an argument
+// here rather than a CLI-only flag on purpose: the counts a --dry-run reports
+// and the rows --yes changes then come from the same loop, so the preview and
+// the repair cannot drift apart.
+//
+// table is the caller's effective pricing table behind the PriceComputer
+// mirror. The store never builds one and never imports internal/pricing.
+//
+// The whole pass is one BeginTx, and the session rollup goes through the
+// tx-taking reconcileSessionTx. Calling the exported ReconcileSession from in
+// here would open a second BeginTx on a pool pinned to one connection
+// (SetMaxOpenConns(1), see Open) and block with no deadline — a hang, not an
+// error, and no test would report it as a failure rather than a timeout. That
+// reconcileSessionTx is unexported, and so unreachable from internal/cli, is
+// why this loop lives in internal/store at all.
+func (s *Store) RepriceCosts(ctx context.Context, table PriceComputer, dryRun bool) (RepriceCounts, error) {
+	var counts RepriceCounts
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return counts, fmt.Errorf("store: RepriceCosts: begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Read the candidates inside the same transaction as the writes, and drain
+	// the cursor before the first UPDATE: one BeginTx is the contract, and a
+	// snapshot read outside it could price a row version this transaction never
+	// writes back.
+	rows, err := tx.QueryContext(ctx, `
+		SELECT id, session_id, billing_mode, model_resolved, cost_source,
+		       speed, service_tier, started_at,
+		       input_tokens, output_tokens,
+		       cache_write_5m_tokens, cache_write_1h_tokens, cache_read_tokens,
+		       cost_usd, api_equivalent_cost_usd
+		FROM events
+	`)
+	if err != nil {
+		return counts, fmt.Errorf("store: RepriceCosts: select: %w", err)
+	}
+	var candidates []repriceCandidate
+	for rows.Next() {
+		var (
+			c         repriceCandidate
+			startedAt int64
+		)
+		if err := rows.Scan(
+			&c.id, &c.sessionID, &c.billingMode, &c.model, &c.costSource,
+			&c.speed, &c.serviceTier, &startedAt,
+			&c.input, &c.output,
+			&c.cacheWrite5m, &c.cacheWrite1h, &c.cacheRead,
+			&c.costUSD, &c.apiEquivalentCostUSD,
+		); err != nil {
+			rows.Close()
+			return counts, fmt.Errorf("store: RepriceCosts: scan: %w", err)
+		}
+		c.startedAt = timeFromNano(startedAt)
+		candidates = append(candidates, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return counts, fmt.Errorf("store: RepriceCosts: rows: %w", err)
+	}
+
+	// Keyed by the owning session so each is re-derived once, mirroring
+	// InsertEvents' distinct-session loop.
+	sessions := map[string]bool{}
+	for _, c := range candidates {
+		if !repriceInScope(c.costSource) {
+			counts.Skipped++
+			continue
+		}
+
+		usd, source := table.Compute(c.model, c.usage(), c.speed, c.serviceTier, c.startedAt)
+		if usd == nil {
+			// The model no longer resolves against this table. The stored
+			// figure and label are kept rather than nulled, so --yes is not
+			// destructive on exactly the rows it cannot price.
+			counts.Skipped++
+			continue
+		}
+
+		stored, subscription := c.routed()
+		if stored.Valid && stored.Float64 == *usd && source == c.costSource {
+			counts.Unchanged++
+			continue
+		}
+		counts.Moved++
+		if dryRun {
+			continue
+		}
+
+		// Invariant 5, both directions: the new figure goes to the column the
+		// row's billing mode routes to and the other column is left NULL, so a
+		// row cannot end up carrying two billing models at once.
+		if subscription {
+			_, err = tx.ExecContext(ctx, `
+				UPDATE events SET api_equivalent_cost_usd = ?, cost_usd = NULL, cost_source = ?
+				WHERE id = ?
+			`, *usd, source, c.id)
+		} else {
+			_, err = tx.ExecContext(ctx, `
+				UPDATE events SET cost_usd = ?, api_equivalent_cost_usd = NULL, cost_source = ?
+				WHERE id = ?
+			`, *usd, source, c.id)
+		}
+		if err != nil {
+			return counts, fmt.Errorf("store: RepriceCosts: update event %d: %w", c.id, err)
+		}
+		if c.sessionID != "" {
+			sessions[c.sessionID] = true
+		}
+	}
+
+	if dryRun {
+		// The deferred Rollback is the whole of the "writes nothing" guarantee.
+		return counts, nil
+	}
+
+	for sessionID := range sessions {
+		if err := reconcileSessionTx(ctx, tx, sessionID); err != nil {
+			return counts, fmt.Errorf("store: RepriceCosts: reconcile session %s: %w", sessionID, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return counts, fmt.Errorf("store: RepriceCosts: commit: %w", err)
+	}
+	return counts, nil
+}

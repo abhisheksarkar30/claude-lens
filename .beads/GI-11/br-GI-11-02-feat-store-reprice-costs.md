@@ -92,9 +92,17 @@ is the interface above.
 
 ### What this bead does not do
 
-- **No `--dry-run` flag here.** `--dry-run` is a flag on the CLI shell (br-GI-11-03), not an argument
-  to `RepriceCosts`, so it cannot be pinned from `internal/store`; its "changes nothing" case lives in
-  `internal/cli/reprice_test.go`.
+- **No `--dry-run` *flag* here.** The flag, its parsing and its wording are the CLI shell's
+  (br-GI-11-03), and its "changes nothing" case lives in `internal/cli/reprice_test.go`.
+  **Corrected during implementation:** `RepriceCosts` *does* take a `dryRun bool`, contrary to this
+  bead's earlier "not an argument to `RepriceCosts`". The plan's §4 row and this bullet framed a
+  test-placement limitation as a design fact. With `--dry-run` handled entirely in the shell, the
+  pricing loop would have to exist twice — once in the writer and once in whatever produces the
+  preview's counts — and the preview could then drift from what `--yes` does, which is the one thing
+  a `--dry-run` must never do. One loop, one mode: the counts a dry run reports and the rows `--yes`
+  changes come from the same code by construction. The dry run writes nothing because it never issues
+  an `UPDATE` and the deferred `tx.Rollback()` discards the rest, and that is pinned here by
+  `TestRepriceCostsDryRunWritesNothing` as well as by br-GI-11-03's CLI-level case.
 - **No CLI, no dispatch entry, no reporting.** The command is br-GI-11-03; the dispatch registration is
   br-GI-11-09.
 - **No schema change and no marker column.** Every input `Compute` needs — model, the five token
@@ -161,6 +169,13 @@ a plan line range.**
     transaction as the UPDATE.
   - `TestRepriceCostsRoutesSubscriptionToApiEquivalent` — invariant 5: a `subscription` row's new
     figure lands in `api_equivalent_cost_usd` and `cost_usd` stays NULL.
+  - `TestRepriceCostsDryRunWritesNothing` — `dryRun` reports the same `Moved` count a real run would
+    and leaves the in-scope row's cost column, its `cost_source` and its owning session's total
+    untouched (the store-level half of br-GI-11-03's CLI case, added with the `dryRun` argument above).
+  - `TestRepriceCostsIsIdempotent`, folded into `TestRepriceCostsPricesTheExactValue` rather than
+    given its own case: a second run over an already-correct row reports `Moved 0`. The plan's
+    Rationale asserts idempotence, and an asserted-but-untested claim is the pattern eight review
+    rounds removed.
   - `TestRepriceCostsErrorsOnAClosedStore` — the **error path §7 names but §5 leaves uncovered**: close
     the store, call `RepriceCosts`, assert it returns a **non-nil error** and that the in-scope row's
     cost columns are **unchanged** (reopen the same DB path and read the row back). This is the failure
