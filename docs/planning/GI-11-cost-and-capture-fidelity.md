@@ -1,8 +1,8 @@
 # GI-11 — Cost is rounded to a cent per call, and a truncated capture is recorded as complete
 
-<!-- version=10 status=converged -->
+<!-- version=11 status=converged -->
 
-**Issue**: GI#11 (GitHub) · **Branch**: `GI-11-cost-and-capture-fidelity` · **Beads**: `.beads/GI-11/` · **Plan version**: 10 · **Status**: converged
+**Issue**: GI#11 (GitHub) · **Branch**: `GI-11-cost-and-capture-fidelity` · **Beads**: `.beads/GI-11/` · **Plan version**: 11 · **Status**: converged
 
 ## 1. The report
 
@@ -45,7 +45,7 @@ Measured on the live store for 2026-09-21 (`source='proxy'`):
 | once per call | $1.05 |
 | exact | **$3.46** |
 
-2,352 of 2,426 rows stored exactly `$0.000000` while carrying 196.68 M of the day's 201.09 M
+2,327 of 2,426 rows stored exactly `$0.000000` while carrying 196.68 M of the day's 201.09 M
 cache-read tokens. Re-running the same rates, the same peak window and the same rounding in SQL
 reproduces the stored figure to the cent, so this is the whole of the cost gap and not a
 contributor to it.
@@ -732,7 +732,7 @@ SELECT SUM(cost_usd) FROM events
 SELECT COUNT(*), SUM(cache_read_tokens) FROM events
  WHERE source='proxy' AND cost_usd = 0
    AND started_at >= 1789929000000000000 AND started_at < 1790015400000000000;
--- → 2352 rows, 196.68M cache-read tokens
+-- → 2327 rows, 196.68M cache-read tokens
 
 -- RC-B: the flag is laundered only by merges. The predicate is the UNION of the two halves:
 -- `source='proxy'` reaches the UNMERGED proxy rows (their source_refs is ''), while
@@ -812,6 +812,26 @@ SELECT SUM(n > 262144), SUM(n > 1048576), SUM(n > 2097152), MAX(n), CAST(AVG(n) 
 ```
 
 ## Change History
+
+### v11 — Phase 4 polish (author; post-convergence)
+
+- **The stale `2,352` corrected to `2,327`.** §2's RC-A sentence and §8's `COUNT(*)` expected output
+  both carried a row count that was wrong from v1 onward. Round 1's conductor measured the correct
+  value (`2,327`, same 2,426-row population) and reported the delta — and the finding was then closed
+  as moot **without the figure being corrected**, so it survived all eight review rounds and was
+  inherited by `br-GI-11-01`. Re-measured directly against the live store at **2026-09-22T07:58:52Z**:
+  `rows_total` 2,426, `rows_zero_cost` **2,327**, `cache_read_all` 201,085,056, `cache_read_on_zero_rows`
+  196,683,520. The other two figures in the sentence were correct; only the count was not.
+- **Why this is not a design change, and why v10's converged status stands.** The loop converges on
+  BLOCKER/MAJOR *design* findings; this is a figure correction found by the Phase 4 bead-quality pass,
+  applied under §8's own rule that "the reproducible artifact is the **query**, not the number". No
+  reviewed claim, mechanism, file list or acceptance criterion changes — the query at §8 already
+  returned the right rows, only its transcribed output was stale.
+- **The lesson worth keeping:** the review loop can close a *finding* while leaving the *artifact*
+  wrong. Both rounds that touched this number (round 1's report, round 5's re-measurement sweep) were
+  working from figures measured in separate statements against a live store — exactly the hazard §8's
+  snapshot semantics were later introduced to remove. A converged plan is a plan whose *reasoning*
+  has converged; it still needs a pass that re-reads every transcribed figure against its own query.
 
 ### v10 — round-8 review (converged)
 
