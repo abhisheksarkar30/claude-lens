@@ -268,6 +268,94 @@ function setSessionDetail(on) {
 // rendered: the fetch is not cancelled, only its result is.
 let detailSeq = 0;
 
+// ------------------------------------------------------- time-window picker
+
+// The native input each granularity needs. <input type="date"> yields a bare
+// YYYY-MM-DD and <input type="month"> a bare YYYY-MM, and Go's
+// time.Parse(time.RFC3339, s) rejects both -- so a raw control value must never
+// reach the query string, and timeWindow() is what expands it.
+const windowInputType = { hour: 'datetime-local', date: 'date', month: 'month' };
+
+// timeWindow expands a picker value into the half-open [since, until) window it
+// names, as RFC3339 strings carrying the *local* offset. Returns null when
+// there is no picker window to apply, which is the case for "any time" on Calls
+// and for `custom` on Stats.
+//
+// It never calls toISOString(): that emits a trailing Z, e.g.
+// new Date('2026-09-21').toISOString() is 2026-09-21T00:00:00.000Z, and Go
+// accepts the Z as UTC rather than rejecting it. The window then silently
+// shifts by the zone offset -- 5h30m on IST, unix 1789948800 against the
+// intended 1789929000 -- and every figure on screen is for a different day
+// than the one the operator picked. The offset is built by hand from
+// getTimezoneOffset() instead, which returns minutes *behind* UTC, hence the
+// sign flip.
+//
+// The arithmetic runs through the Date constructor rather than adding
+// milliseconds: a DST day is 23 or 25 hours long, so `start + 86_400_000`
+// lands on the wrong instant twice a year, and `new Date(y, m - 1, d + 1)`
+// cannot. For the same reason a month is never assumed to be 30 days -- the
+// next month is built from the components, so February and the Dec->Jan
+// rollover fall out rather than needing a rule.
+function timeWindow(gran, value) {
+  if (!gran || !value) return null;
+  let start, end;
+  if (gran === 'hour') {
+    start = new Date(value);
+    if (isNaN(start)) return null;
+    start.setMinutes(0, 0, 0);
+    end = new Date(start);
+    end.setHours(end.getHours() + 1);
+  } else if (gran === 'date') {
+    const p = value.split('-').map(Number);
+    if (p.length !== 3 || p.some(isNaN)) return null;
+    start = new Date(p[0], p[1] - 1, p[2]);
+    end = new Date(p[0], p[1] - 1, p[2] + 1);
+  } else if (gran === 'month') {
+    const p = value.split('-').map(Number);
+    if (p.length !== 2 || p.some(isNaN)) return null;
+    start = new Date(p[0], p[1] - 1, 1);
+    end = new Date(p[0], p[1], 1);
+  } else {
+    return null;
+  }
+
+  const rfc = (d) => {
+    const pad = (n) => String(n).padStart(2, '0');
+    const off = -d.getTimezoneOffset();
+    const sign = off < 0 ? '-' : '+';
+    const abs = Math.abs(off);
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
+      'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()) +
+      sign + pad(Math.floor(abs / 60)) + ':' + pad(abs % 60);
+  };
+  return { since: rfc(start), until: rfc(end) };
+}
+
+// mountWindowPicker wires one mount of the picker: the granularity select, the
+// native input it reveals, and the free-text labels only `custom` uses (empty
+// on Calls, which has no free-text pair). One implementation, two mounts, so
+// the two tabs cannot disagree about what a picked hour means.
+func mountWindowPicker(granSel, valueInput, freeLabels, onChange) {
+  const sync = () => {
+    const t = windowInputType[granSel.value];
+    if (t) {
+      // Order matters: changing type on an input holding a value the new type
+      // cannot express leaves that value in place in some browsers, so clear it
+      // after the switch. A date is not a valid hour, and reusing one silently
+      // would filter by something the operator never picked.
+      valueInput.type = t;
+      valueInput.value = '';
+      valueInput.hidden = false;
+    } else {
+      valueInput.hidden = true;
+    }
+    for (const l of freeLabels) l.hidden = granSel.value !== 'custom';
+  };
+  granSel.addEventListener('change', () => { sync(); onChange(); });
+  valueInput.addEventListener('change', onChange);
+  sync();
+}
+
 // -------------------------------------------------------------- view: calls
 
 const callState = { offset: 0, limit: 50 };
@@ -280,6 +368,11 @@ function callFilter() {
   if (src) q.set('source', src);
   if (model) q.set('model', model);
   if (billing) q.set('billing_mode', billing);
+  const win = timeWindow($('c-window-gran').value, $('c-window-value').value);
+  if (win) {
+    q.set('since', win.since);
+    q.set('until', win.until);
+  }
   q.set('limit', String(callState.limit));
   q.set('offset', String(callState.offset));
   return q;
@@ -494,8 +587,18 @@ async function loadWarnings() {
 
 async function loadStats() {
   const q = new URLSearchParams();
-  if ($('s-since').value.trim()) q.set('since', $('s-since').value.trim());
-  if ($('s-until').value.trim()) q.set('until', $('s-until').value.trim());
+  const win = timeWindow($('s-window-gran').value, $('s-window-value').value);
+  if (win) {
+    q.set('since', win.since);
+    q.set('until', win.until);
+  } else {
+    // `custom` (and an hour/date/month selection with nothing picked yet): the
+    // retained free-text pair, exactly as this row behaved before the picker.
+    // Keeping it is what stops `24h` and arbitrary RFC3339 ranges from
+    // silently disappearing.
+    if ($('s-since').value.trim()) q.set('since', $('s-since').value.trim());
+    if ($('s-until').value.trim()) q.set('until', $('s-until').value.trim());
+  }
   q.set('granularity', $('s-granularity').value);
 
   const { body } = await api('/api/stats?' + q.toString());
@@ -934,6 +1037,15 @@ $('calls-next').addEventListener('click', () => {
   callState.offset += callState.limit;
   loadCalls();
 });
+// A picker change reloads on its own -- there is nothing to compose, unlike the
+// free-text pair beside it, which keeps the Apply button. Both mounts reset the
+// pager first: page 4 of the old window is not page 4 of the new one.
+mountWindowPicker($('c-window-gran'), $('c-window-value'), [], () => {
+  callState.offset = 0;
+  loadCalls();
+});
+mountWindowPicker($('s-window-gran'), $('s-window-value'),
+  [$('s-since').closest('label'), $('s-until').closest('label')], loadStats);
 $('s-apply').addEventListener('click', loadStats);
 $('q-apply').addEventListener('click', loadQuota);
 

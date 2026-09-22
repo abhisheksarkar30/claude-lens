@@ -549,3 +549,116 @@ func TestAssetsTheBodyRendererEscapes(t *testing.T) {
 		t.Error("transcriptCapMarker is defined but never called from showCall: the marker never renders")
 	}
 }
+
+// TestAssetsTimeWindowBuildsTheOffsetByHand is a source-shape assertion over
+// the picker's one window computation, and the ceiling is the same one
+// TestAssetsTheBodyRendererEscapes states: there is no JS runtime here, so this
+// proves the *source* builds the offset rather than that the emitted string is
+// right. The semantic cases -- that the window denotes the picked local instant,
+// the Dec->Jan rollover, the month's 28-31 day width, and DST -- are manual
+// verification in the PR's test plan.
+//
+// Why it is worth having anyway: the defect it guards is invisible to a parse
+// test. new Date('2026-09-21').toISOString() emits 2026-09-21T00:00:00.000Z,
+// Go's time.Parse(time.RFC3339, s) accepts the trailing Z as UTC rather than
+// rejecting it, and the window silently shifts by the zone offset -- 19,800 s,
+// or 5h30m, on IST: unix 1789948800 against the intended 1789929000. The
+// dashboard would then be reporting a different day than the one picked, which
+// is the very comparison GI-11 exists to make trustworthy.
+func TestAssetsTimeWindowBuildsTheOffsetByHand(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body, ok := funcBody(js, "timeWindow")
+	if !ok {
+		t.Fatal("app.js has no top-level `function timeWindow(`: the window must be computed in one place, so this guard has an anchor to slice")
+	}
+	// The vacuity guard, first: a rename or a restyle that defeats the
+	// extraction would otherwise leave both assertions below passing over an
+	// empty slice -- which is worse than failing, because it reads as green.
+	if strings.TrimSpace(body) == "" {
+		t.Fatal("timeWindow sliced out empty -- the extraction is broken, not the function")
+	}
+
+	// Both halves are scoped to this slice deliberately. A whole-file
+	// !Contains("toISOString") would be a tripwire for any future legitimate use
+	// elsewhere in the dashboard, and a whole-file positive match would pass for
+	// a timeWindow that computed an offset and then never used it.
+	if strings.Contains(body, "toISOString") {
+		t.Error("timeWindow calls toISOString(), which emits a trailing Z that Go reads as UTC: the window silently shifts by the zone offset and shows a different day than the one picked")
+	}
+	if !strings.Contains(body, "getTimezoneOffset") {
+		t.Error("timeWindow never reads getTimezoneOffset(): the ±hh:mm suffix has to be built from the local offset, not assumed")
+	}
+}
+
+// TestAssetsThePickerMountsBothTabs pins the wiring an id-existence check
+// cannot see: that both tabs actually route their bounds through timeWindow,
+// that only Stats offers `custom`, and that Stats keeps its free-text pair.
+//
+// Each of those is an Outcome Definition clause with no other coverage. A
+// picker mounted but never consulted would leave the id guard green and the
+// filter dead; a `custom` option on Calls would be a control offering a
+// capability that tab does not have; and dropping the free-text inputs would
+// silently narrow `24h` and arbitrary RFC3339 ranges out of existence.
+func TestAssetsThePickerMountsBothTabs(t *testing.T) {
+	js := readAsset(t, "app.js")
+	html := readAsset(t, "index.html")
+
+	for _, fn := range []string{"callFilter", "loadStats"} {
+		body, ok := funcBody(js, fn)
+		if !ok {
+			t.Fatalf("app.js has no top-level %s, so its bounds cannot be checked", fn)
+		}
+		if !strings.Contains(body, "timeWindow(") {
+			t.Errorf("%s never calls timeWindow(): the picker is mounted but its window is not applied", fn)
+		}
+	}
+
+	// The option sets, sliced per select so the two cannot be confused.
+	callsOpts, ok := selectOptions(html, "c-window-gran")
+	if !ok {
+		t.Fatal("index.html has no c-window-gran select")
+	}
+	statsOpts, ok := selectOptions(html, "s-window-gran")
+	if !ok {
+		t.Fatal("index.html has no s-window-gran select")
+	}
+	if strings.Contains(callsOpts, `value="custom"`) {
+		t.Error("the Calls picker offers `custom`, but that row has no free-text pair for it to reveal: a selectable entry that filters nothing is a dead control")
+	}
+	if !strings.Contains(statsOpts, `value="custom"`) {
+		t.Error("the Stats picker has no `custom` option, so the retained free-text pair is unreachable")
+	}
+	for _, want := range []string{"hour", "date", "month"} {
+		if !strings.Contains(callsOpts, `value="`+want+`"`) || !strings.Contains(statsOpts, `value="`+want+`"`) {
+			t.Errorf("both pickers must offer %q", want)
+		}
+	}
+
+	// The free-text pair stays mounted: loadStats falls back to it for `custom`.
+	for _, id := range []string{"s-since", "s-until"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("index.html no longer mounts %s: the free-text window is gone, taking `24h` and arbitrary RFC3339 ranges with it", id)
+		}
+		if !strings.Contains(js, "$('"+id+"')") {
+			t.Errorf("app.js no longer reads %s", id)
+		}
+	}
+}
+
+// selectOptions returns the markup between the <select id="id"> tag and its
+// closing </select>, so an option-set assertion is made against one control
+// rather than the whole document -- where a `custom` in the Calls row and a
+// `custom` in the Stats row are indistinguishable.
+func selectOptions(html, id string) (string, bool) {
+	start := strings.Index(html, `id="`+id+`"`)
+	if start < 0 {
+		return "", false
+	}
+	rest := html[start:]
+	end := strings.Index(rest, "</select>")
+	if end < 0 {
+		return "", false
+	}
+	return rest[:end], true
+}
