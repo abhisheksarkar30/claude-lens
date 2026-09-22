@@ -124,17 +124,21 @@ the store from the flag, then `CLENS_DB_PATH`, then the operator's `~/.clens/con
 `~/.clens/lens.db` default. A `D:\` literal in a Go file would be wrong on every machine but one, so
 there is none — grep for `D:\` and the only hits are in these docs.
 
-**On this install `DBPath` is unset, so the store is at the `~/.clens/lens.db` default and the file
-is on `C:`.** The planned destination is `D:/clens/lens.db`, because the GI-11 cap change grows the
-store by roughly a third of a gigabyte and that growth is better spent on `D:`. The move has **not
-been performed** — it is an **operator action, not a migration the repo performs**, and the ordered
-form of it is:
+**Where the store is on any given machine is a question for `clens doctor`, not for this file** — it
+prints the resolved `db_path`, and this file does not restate it. A runbook that asserts a particular
+install's state is a runbook that goes stale the moment the operator follows it, and this one did:
+written first as already moved, corrected to not-yet-moved. So: the reason to move it on a workstation
+is that the GI-11 cap change grows the store by roughly a third of a gigabyte, better spent on a
+non-system volume, and the move is an **operator action, not a migration the repo performs**. The
+ordered form of it is:
 
 1. Stop the running `clens serve`.
 2. **Copy** (never move) `~/.clens/lens.db` to `D:/clens/lens.db` — the original stays as the
    fallback until step 6.
 3. Set `DBPath = "D:/clens/lens.db"` in `~/.clens/config.toml`.
 4. Start `clens serve` and confirm the new path is the one in use: `clens doctor` prints `db_path`.
+   Read `body_cap_bytes` off the same output while you are there — after GI-11 it should read
+   `2097152`, and a smaller number means the running binary predates the cap raise.
 5. Confirm the store is intact and the row count matches the original.
 6. Only then remove the copy on `C:`.
 
