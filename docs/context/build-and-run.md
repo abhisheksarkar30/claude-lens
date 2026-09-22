@@ -124,10 +124,11 @@ the store from the flag, then `CLENS_DB_PATH`, then the operator's `~/.clens/con
 `~/.clens/lens.db` default. A `D:\` literal in a Go file would be wrong on every machine but one, so
 there is none — grep for `D:\` and the only hits are in these docs.
 
-On this install the store was moved off `C:` and `DBPath` now points at `D:/clens/lens.db` — the
-projection being that the cap change grows the store by roughly a third of a gigabyte, which is
-better spent on `D:` than on `C:`. The move is an **operator action, not a migration the repo
-performs**, and the ordered form of it is:
+**On this install `DBPath` is unset, so the store is at the `~/.clens/lens.db` default and the file
+is on `C:`.** The planned destination is `D:/clens/lens.db`, because the GI-11 cap change grows the
+store by roughly a third of a gigabyte and that growth is better spent on `D:`. The move has **not
+been performed** — it is an **operator action, not a migration the repo performs**, and the ordered
+form of it is:
 
 1. Stop the running `clens serve`.
 2. **Copy** (never move) `~/.clens/lens.db` to `D:/clens/lens.db` — the original stays as the
@@ -141,6 +142,13 @@ performs**, and the ordered form of it is:
 write-ahead log, so `lens.db` is self-contained; copying it while `serve` runs would silently drop
 everything still in the `-wal` beside it. It is **destructive only at step 6**, which is why the copy
 is verified before the original is deleted.
+
+**Step 2 moves one file, and `~/.clens/` holds more than that.** `lens.db.pre-migration` (the
+pre-`PRAGMA user_version` copy, see [decisions/007](decisions/007-schema-migrations-by-user-version.md))
+and the `backups/` directory are not part of the move and are not covered by step 6 — so an operator
+who follows the steps literally will find the store relocated and those two still on `C:`. That is
+correct, not an incomplete move: they are history, not the live store, and deleting them is a
+separate decision with its own retention question.
 
 ## The acceptance run
 
