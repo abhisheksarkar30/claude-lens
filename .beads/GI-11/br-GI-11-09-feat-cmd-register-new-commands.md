@@ -38,6 +38,13 @@ F2.9 (the count-drift trap)
 - Update **every** doc comment that names the count: `:10-14` and `:26` both read "the 19 subcommands"
   and both go to 21, so neither is left stale. This is the count-drift trap F1.2a/F2.9 established —
   one comment moved, the other missed. **Both sites move in this one edit.**
+- **Move the composition sentence too, not just the numeral.** `:10-14` names the count *and its own
+  composition* — "doctor and serve, br-GI-1-15's six collectors, br-GI-1-17's ten readers and writers,
+  and br-GI-9-04's rekey" (2 + 6 + 10 + 1 = **19**). Moving only the numeral leaves that sentence
+  claiming **21** while its enumeration still sums to **19** — a third drift site inside the very
+  comment this bead exists to keep true. The sentence therefore **gains `br-GI-11-03`'s `reprice` and
+  `br-GI-11-06`'s `reflag`** (the same two groups `carriedOver` gains), so the comment's count and its
+  own enumeration agree at 21.
 
 **Do not resolve the red test by deleting the length check** (it is what notices a key that exists but
 points at nothing, which would panic at dispatch rather than at build), **and do not resolve it by
@@ -68,7 +75,9 @@ agreement, matching the plan's own framing.
 
 - `commands` maps `"reprice" → cli.Reprice` and `"reflag" → cli.Reflag`.
 - `carriedOver` names both `"reprice"` and `"reflag"`; its length is 21.
-- **Both** doc comments that name the count (`main_test.go:10-14` and `:26`) say 21, not 19.
+- **Both** doc comments that name the count (`main_test.go:10-14` and `:26`) say 21, not 19 — **and
+  `:10-14`'s composition sentence gains `reprice` and `reflag`**, so its enumeration (2 + 6 + 10 + 1)
+  sums to 21 and agrees with its own count.
 - `TestEveryCarriedOverCommandIsDispatched` passes.
 - `clens reprice` and `clens reflag` are dispatched (no "not implemented yet").
 - `go build ./...`, `go vet ./...`, `go test ./cmd/...` pass.
@@ -85,4 +94,5 @@ agreement, matching the plan's own framing.
 
 - `cmd/clens/main.go` (modify — add the two entries to the `commands` map `:16-39`)
 - `cmd/clens/main_test.go` (modify — add `"reprice"` and `"reflag"` to `carriedOver`; move **both**
-  "the 19 subcommands" comments `:10-14` and `:26` to 21)
+  "the 19 subcommands" comments `:10-14` and `:26` to 21, and **extend `:10-14`'s composition sentence**
+  with `br-GI-11-03`'s `reprice` and `br-GI-11-06`'s `reflag`, so its enumeration sums to 21 too)

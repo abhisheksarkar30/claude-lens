@@ -63,13 +63,15 @@ the Docs table), §5 Integration (the proxy cap case and the TTFB gate), §6 (th
 
 ## Rationale
 
-Measured against the client's `Content-Length` across 4,873 proxy rows: **2,845 (58%)** of request
-bodies are over 256 KB, 106 are over 1 MB, **0** are over 2 MB, and the largest request body seen is
-**1,246,222 bytes**. Truncation is the norm, not the exception, and the dominant body is the
-**request** (a Claude Code request carries the system prompt, the full tool schemas and the conversation
-history), not the response the report named — 58% of calls against 12% of responses. A 2 MB cap
-(`2,097,152`) captures every body this install has ever seen, with headroom. Projected growth is
-**~0.35 GB**, which is why the store's move to `D:` (a rollout action, no bead) belongs in this story.
+Measured against the client's `Content-Length` across the **6,088** proxy rows that carry one (a dated
+snapshot, 2026-09-22T09:06Z): **3,554 (58%)** of request bodies are over 256 KB, 117 are over 1 MB,
+**0** are over 2 MB, and the largest request body seen is **1,246,222 bytes**; the responses side is
+**768 of 6,114 stored responses (12.6%)** at the cap. Truncation is the norm, not the exception, and
+the dominant body is the **request** (a Claude Code request carries the system prompt, the full tool
+schemas and the conversation history), not the response the report named — 58% of calls against 12% of
+responses. A 2 MB cap (`2,097,152`) captures every body this install has ever seen, with headroom.
+Projected growth is **~0.35 GB**, which is why the store's move to `D:` (a rollout action, no bead)
+belongs in this story.
 
 ## Outcome Definition
 

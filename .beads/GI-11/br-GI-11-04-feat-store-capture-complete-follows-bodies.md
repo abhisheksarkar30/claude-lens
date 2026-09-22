@@ -88,11 +88,12 @@ later merge's `usageObserved` guard (`:214-224`, `:372-376`) swaps it back.
 
 ## Rationale
 
-Measured across the union predicate's 5,540 rows, **2,865 are false-complete** and every one is a
-**merged** row (2,844 proxy-first + 21 jsonl-first); the unmerged bucket never lies (0 false-complete,
-316 honest truncations). The `||` overwrites the proxy row's original `capture_complete=0` with `true`
-and no stored bit records which side was truncated. The forward fix is this bead; the historical repair
-is `reflag`, because re-merging cannot recover what the `||` destroyed.
+Measured across the union predicate's 5,540 rows (a **dated snapshot**, 2026-09-22T06:49:41Z),
+**2,865 are false-complete** and every one is a **merged** row (2,844 proxy-first + 21 jsonl-first);
+the unmerged bucket never lies (0 false-complete, 316 honest truncations). The `||` overwrites the proxy
+row's original `capture_complete=0` with `true` and no stored bit records which side was truncated. The
+forward fix is this bead; the historical repair is `reflag`, because re-merging cannot recover what the
+`||` destroyed.
 
 ## Outcome Definition
 

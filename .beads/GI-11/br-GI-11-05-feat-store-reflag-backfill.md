@@ -121,7 +121,7 @@ guessing. That is the honest ceiling of a repair from surviving columns.
   `already honest` = `baseline_cc0`, `residual` = `R`) and writes nothing (br-GI-11-06), so the snapshot
   is measured by **the same code that does the repair, at the instant before it runs**. Then run `--yes`
   and compare. Two criteria, both off one snapshot: `cc0_after = baseline_cc0 + W`, and
-  `cc0_before + W + R + H = scope_total` (a **partition**, not four loose numbers).
+  `baseline_cc0 + W + R + H = scope_total` (a **partition**, not four loose numbers).
   **No count here is a target.** The all-time figures (316 / `W` 2,865 / `R` 138 / healthy 2,221,
   closing at 5,540) are a **dated illustration of magnitude and sign**, because a quoted count is stale
   by the time the backfill fires — this past-day count already moved once (2,352 → 2,327) as `jsonlogs`
