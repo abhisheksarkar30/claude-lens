@@ -2097,3 +2097,117 @@ func (s *Store) RepriceCosts(ctx context.Context, table PriceComputer, dryRun bo
 	}
 	return counts, nil
 }
+
+// reflagScope is the population the capture_complete repair considers: every
+// row the proxy had a hand in. The predicate is the UNION of its two halves and
+// either alone narrows wrongly -- source_refs defaults to ” and only the merge
+// ever assigns it, so `instr(source_refs,'proxy') > 0` alone drops every
+// unmerged proxy row, while `source = 'proxy'` alone misses the rows a merge
+// re-sourced.
+const reflagScope = `(source = 'proxy' OR instr(source_refs, 'proxy') > 0)`
+
+// capturePrefixWitness is the one witness predicate: a stored body that is a
+// strict prefix of the client Content-Length it was captured against, on
+// either side.
+//
+// The `length(...) IS NOT NULL` guard is load-bearing, not defensive. A
+// body-less capture_complete=1 row is a real mode here (BodyPolicy "full" or
+// "off"), and without the guard length(req_body) is NULL, the comparison is
+// NULL, NOT witness is NULL, and SUM silently drops the row; swapping in
+// COALESCE(length(req_body),0) instead falsely witnesses it. The guard makes
+// the witness require a stored body, which is what keeps the three buckets
+// partitioning the scope rather than merely summing inside it.
+//
+// The same predicate is acceptance #4's, stated once so the repair and the
+// check cannot drift.
+const capturePrefixWitness = `(
+		(length(req_body)  IS NOT NULL AND COALESCE(CAST(json_extract(req_headers,  '$."Content-Length"[0]') AS INTEGER), 0) > length(req_body))
+		OR
+		(length(resp_body) IS NOT NULL AND COALESCE(CAST(json_extract(resp_headers, '$."Content-Length"[0]') AS INTEGER), 0) > length(resp_body))
+	)`
+
+// ReflagCounts is the three buckets `clens reflag` reports. They describe the
+// state the pass *found*, not what is left afterwards: Flipped rows are the
+// ones it repaired, so a second run over the same store reports Flipped 0 and
+// the other two unchanged.
+type ReflagCounts struct {
+	Flipped       int // capture_complete=1 with a provable prefix witness
+	AlreadyHonest int // capture_complete=0 already
+	Residual      int // capture_complete=1, warned, and no provable witness
+}
+
+// ReflagIncompleteCaptures repairs the capture_complete flags a cross-source
+// merge laundered, using the one witness a merge cannot destroy: a stored body
+// that is a strict prefix of its client Content-Length.
+//
+// Re-merging cannot recover the history: the `||` overwrote the proxy row's
+// original 0 with 1 and no stored bit records which side was truncated, so the
+// surviving columns are the only evidence there is. The repair is idempotent
+// because it only ever narrows 1 -> 0.
+//
+// The residual bucket is the honest ceiling and is reported rather than
+// guessed at: rows the `||` laundered that carry no Content-Length evidence
+// cannot be repaired from what the store holds. Warnings are NOT synthesised
+// to cover them -- capture_complete is the stored fact, stream_incomplete is
+// analyzer output whose inputs are not fully stored, and `clens ingest
+// --rebuild` is already the repo's analysis-refresh path.
+//
+// dryRun computes the same three counts and writes nothing, from the same code
+// that does the repair, so the preview an operator reads and the change --yes
+// makes cannot drift. No session rollup is needed: unlike the cost columns,
+// capture_complete is not folded into `sessions`.
+func (s *Store) ReflagIncompleteCaptures(ctx context.Context, dryRun bool) (ReflagCounts, error) {
+	var counts ReflagCounts
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return counts, fmt.Errorf("store: ReflagIncompleteCaptures: begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	// The buckets are read before the UPDATE and describe the pre-repair
+	// state. The stream_incomplete join is what makes the residual a
+	// measurement of the *laundered* population rather than of healthy
+	// complete rows: the warning is written once at insert and fires iff the
+	// row was streamed and capture_complete was false, so warning + cc=1 is
+	// exactly the rows a merge is suspected of having laundered, which the
+	// witness then splits into repairable and residual.
+	if err := tx.QueryRowContext(ctx, `
+		SELECT
+			COALESCE(SUM(capture_complete = 1 AND `+capturePrefixWitness+`), 0),
+			COALESCE(SUM(capture_complete = 0), 0),
+			COALESCE(SUM(capture_complete = 1 AND NOT `+capturePrefixWitness+`
+				AND EXISTS (SELECT 1 FROM warnings w WHERE w.event_id = events.id AND w.kind = 'stream_incomplete')), 0)
+		FROM events WHERE `+reflagScope,
+	).Scan(&counts.Flipped, &counts.AlreadyHonest, &counts.Residual); err != nil {
+		return counts, fmt.Errorf("store: ReflagIncompleteCaptures: count: %w", err)
+	}
+
+	if dryRun {
+		// The deferred Rollback is the whole of the "writes nothing" guarantee.
+		return counts, nil
+	}
+
+	res, err := tx.ExecContext(ctx, `
+		UPDATE events SET capture_complete = 0
+		WHERE capture_complete = 1 AND `+capturePrefixWitness+` AND `+reflagScope)
+	if err != nil {
+		return counts, fmt.Errorf("store: ReflagIncompleteCaptures: update: %w", err)
+	}
+	// The report and the repair are the same predicate, so they must agree. A
+	// mismatch means one of them is wrong, and rolling back is the only honest
+	// response: a report that describes something other than what happened is
+	// worse than a failed command.
+	flipped, err := res.RowsAffected()
+	if err != nil {
+		return counts, fmt.Errorf("store: ReflagIncompleteCaptures: rows affected: %w", err)
+	}
+	if int(flipped) != counts.Flipped {
+		return counts, fmt.Errorf("store: ReflagIncompleteCaptures: the repair flipped %d row(s) but the report said %d", flipped, counts.Flipped)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return counts, fmt.Errorf("store: ReflagIncompleteCaptures: commit: %w", err)
+	}
+	return counts, nil
+}
