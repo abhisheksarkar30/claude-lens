@@ -34,7 +34,7 @@ Two settings on `--body-policy`, with `full` as the default:
 
 | Policy | Behaviour |
 |---|---|
-| `full` (default) | the body is captured whole, up to the 256 KB cap |
+| `full` (default) | the body is captured whole, up to the 2 MB cap |
 | `off` | no body is captured, but the **call is still recorded**: method, path, status, redacted headers, TTFB and duration, with both body columns NULL (br-GI-7-09) |
 
 **There was a third value, `truncated`, and it is gone.** It was accepted and read nowhere — `full`
@@ -58,7 +58,7 @@ the absence is a policy the operator set uniformly. Which warnings survive on su
 in `br-GI-7-09`; the short version is that the ones keyed on status and credential shape still fire
 and everything keyed on the body does not.
 
-`--body-cap-bytes` (default `262144`, i.e. 256 KB) bounds the capture independently of the policy,
+`--body-cap-bytes` (default `2097152`, i.e. 2 MB) bounds the capture independently of the policy,
 **per body**. `events.capture_complete` records whether what was stored is the whole thing or was
 narrowed — so a reader can tell "this is everything" from "this is what we kept", which is the
 difference between an absent field and a truncated one. It covers **both** bodies: a request body cut
@@ -67,6 +67,19 @@ which of the two was cut, so a surface that needs to say so infers it from the b
 the cap in force — an inference that is only as good as the cap not having changed since, which is
 why the flag is the authoritative half and the length comparison only names the body. The dashboard's
 transcript section carries the same length comparison for the third content column (br-GI-7-09).
+
+**The cap was 256 KB (262,144) before GI-11, and raising it is a privacy decision as much as a
+fidelity one.** It was raised because it was losing data, not because storage was cheap: 58% of this
+workload's request bodies crossed the old cap, and every one of them was stored as a truncated
+conversation history — the system prompt and the files the agent had read, cut mid-way. But the
+trade is real and it is paid in the same currency the decision below describes. The cap is the bound
+on *how much* prompt and file content sits in the database at rest; eight times the cap is eight
+times the exposure per row on a capture that is `full` by default, and the redaction policy
+(credentials, and only credentials) is unchanged. An operator whose threat model made 256 KB
+acceptable should decide again at 2 MB, and lower it with `--body-cap-bytes` if the answer is no. The
+historical rows are unaffected: they keep the bytes they were written with, and the at-cap marker's
+inference about them is weakened by the raise — see the limitation in
+[storage-schema.md](storage-schema.md).
 
 A second kind of content is stored, from a source that is not the wire: **`transcript_content` /
 `transcript_role`**, one assistant message's `content` from a Claude Code transcript
