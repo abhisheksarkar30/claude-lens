@@ -452,6 +452,8 @@ func TestNoCommandPrintsACredential(t *testing.T) {
 		"purge":    func(w io.Writer) error { return runPurge([]string{"--older-than", "1d", "--dry-run"}, w) },
 		"replay":   func(w io.Writer) error { return runReplay([]string{itoa(id), "--dump"}, w) },
 		"rekey":    func(w io.Writer) error { return runRekey([]string{"--dry-run"}, w) },
+		"reprice":  func(w io.Writer) error { return runReprice([]string{"--dry-run"}, w) },
+		"reflag":   func(w io.Writer) error { return runReflag([]string{"--dry-run"}, w) },
 	}
 	for name, run := range runs {
 		var buf bytes.Buffer
@@ -460,6 +462,118 @@ func TestNoCommandPrintsACredential(t *testing.T) {
 		if strings.Contains(out, sessionValue) || strings.Contains(out, adminValue) {
 			t.Fatalf("clens %s leaked a credential value:\n%s", name, out)
 		}
+	}
+}
+
+// TestReflagDryRunChangesNothing: `clens reflag --dry-run` prints the three
+// buckets -- flipped, already honest, residual, in that order -- and flips
+// nothing.
+//
+// All three buckets are seeded so the assertion pins the numbers' meaning and
+// their order, not just that three numbers appeared. The residual row is the
+// one the three-bucket split exists for: it was laundered and carries no
+// Content-Length evidence, so nothing in the store can prove it was cut.
+func TestReflagDryRunChangesNothing(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+	ctx := context.Background()
+
+	// Laundered, with a witness: a stored body that is a strict prefix of the
+	// Content-Length it was captured against.
+	flippable := seedProxyRow(t, st, &store.Event{
+		EventSummary: store.EventSummary{
+			RequestID:       "req-cli-reflag-flip",
+			StartedAt:       time.Now(),
+			CaptureComplete: true,
+		},
+		ReqHeaders: `{"Content-Length":["1000"]}`,
+		ReqBody:    []byte("0123456789"),
+	})
+
+	// Already honest.
+	honest := seedProxyRow(t, st, &store.Event{
+		EventSummary: store.EventSummary{
+			RequestID:       "req-cli-reflag-honest",
+			StartedAt:       time.Now(),
+			CaptureComplete: false,
+		},
+		ReqHeaders: `{"Content-Length":["1000"]}`,
+		ReqBody:    []byte("0123456789"),
+	})
+
+	// Laundered, warned, and unwitnessable: no Content-Length was recorded.
+	residual := seedProxyRow(t, st, &store.Event{
+		EventSummary: store.EventSummary{
+			RequestID:       "req-cli-reflag-residual",
+			StartedAt:       time.Now(),
+			CaptureComplete: true,
+		},
+		ReqHeaders: `{"accept":["application/json"]}`,
+		ReqBody:    []byte("0123456789"),
+	})
+	if err := st.UpsertWarnings(ctx, residual, []store.Warning{{Kind: "stream_incomplete"}}); err != nil {
+		t.Fatalf("UpsertWarnings: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := runReflag([]string{"--dry-run"}, &buf); err != nil {
+		t.Fatalf("runReflag --dry-run: %v\noutput:\n%s", err, buf.String())
+	}
+	want := "would flip 1 row(s) to incomplete; 1 already honest, 1 residual"
+	if !strings.Contains(buf.String(), want) {
+		t.Fatalf("dry-run output = %q, want it to contain %q", buf.String(), want)
+	}
+
+	for _, c := range []struct {
+		name string
+		id   int64
+		want bool
+	}{
+		{"the flippable row", flippable, true},
+		{"the honest row", honest, false},
+		{"the residual row", residual, true},
+	} {
+		got, err := st.GetEvent(ctx, c.id)
+		if err != nil {
+			t.Fatalf("GetEvent: %v", err)
+		}
+		if got.CaptureComplete != c.want {
+			t.Errorf("%s: CaptureComplete = %v, want %v untouched by a dry run", c.name, got.CaptureComplete, c.want)
+		}
+	}
+}
+
+// TestReflagWithoutYesRefuses: neither flag, no rewrite. The default is the
+// opposite of destructive, as it is for purge, rekey and reprice -- and this is
+// the only gate standing between a typo and a rewrite of the flag on every
+// suspected row.
+func TestReflagWithoutYesRefuses(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+
+	id := seedProxyRow(t, st, &store.Event{
+		EventSummary: store.EventSummary{
+			RequestID:       "req-cli-reflag-refuse",
+			StartedAt:       time.Now(),
+			CaptureComplete: true,
+		},
+		ReqHeaders: `{"Content-Length":["1000"]}`,
+		ReqBody:    []byte("0123456789"),
+	})
+
+	var buf bytes.Buffer
+	if err := runReflag(nil, &buf); err == nil {
+		t.Fatalf("runReflag with no flags returned no error\noutput:\n%s", buf.String())
+	} else if !strings.Contains(err.Error(), "--yes") || !strings.Contains(err.Error(), "--dry-run") {
+		t.Errorf("refusal %q should name both flags", err)
+	}
+
+	got, err := st.GetEvent(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	if !got.CaptureComplete {
+		t.Error("CaptureComplete = false: a refused run rewrote the flag")
 	}
 }
 
