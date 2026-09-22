@@ -30,14 +30,14 @@ Three non-stdlib modules and no more: `modernc.org/sqlite` (pure Go, no cgo),
 | [storage-schema.md](storage-schema.md) | before touching a column, a query, or an invariant | conditional — fills the `data-model` role; trigger: `internal/store/schema.sql` |
 | [cost-and-quota.md](cost-and-quota.md) | before touching pricing, quota, reconciliation, or a cost rule | conditional — a domain module (not in the standard catalogue): the cost model is upstream of every feature |
 | [api-surface.md](api-surface.md) | before adding or changing a route | conditional — trigger: route registration in `internal/api` |
-| [cli-and-tooling.md](cli-and-tooling.md) | before adding or changing a subcommand | conditional — trigger: the 19-entry dispatch table in `cmd/clens/main.go` |
+| [cli-and-tooling.md](cli-and-tooling.md) | before adding or changing a subcommand | conditional — trigger: the 21-entry dispatch table in `cmd/clens/main.go` |
 | [workflows.md](workflows.md) | to understand a flow end to end before changing it | conditional — trigger: flows spanning more than one package |
 | [security-and-permissions.md](security-and-permissions.md) | **before touching credentials, redaction, listeners, or an import edge** | conditional — trigger: `internal/secret`, the redactor, the Origin guard |
 | [data-privacy-and-compliance.md](data-privacy-and-compliance.md) | before changing what is captured, or how long it is kept | conditional — trigger: the body policy, the cap, retention, `clens purge` |
-| [testing-and-quality.md](testing-and-quality.md) | before writing a test, or wondering what CI gates on | conditional — trigger: 52 test files |
+| [testing-and-quality.md](testing-and-quality.md) | before writing a test, or wondering what CI gates on | conditional — trigger: 56 test files |
 | [infra-and-deploy.md](infra-and-deploy.md) | before touching a workflow, a hook, or branch policy | conditional — trigger: `.github/workflows/` |
 | [integrations-and-external-services.md](integrations-and-external-services.md) | before changing a collector or adding a dependency | conditional — trigger: four external endpoints, three Go modules |
-| [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 1030 lines of hand-written JS under a hard no-build-step rule |
+| [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 1142 lines of hand-written JS under a hard no-build-step rule |
 | [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — nine genuine forks, each with a rejected alternative a change could reintroduce |
 
 ## Grounding rules for agents

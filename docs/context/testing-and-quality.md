@@ -9,11 +9,15 @@
 | Unit + integration | Go's stdlib `testing` only — no assertion library, no mocking framework | `*_test.go` beside the code | [go.mod](../../go.mod) has no test dependency |
 | End-to-end | none — no suite; one recorded manual run instead | [docs/acceptance.md](../acceptance.md) | the doc states which half could not be run |
 
-**52 test files, 16,634 lines** against 15,526 lines of non-test Go (re-measured on
-`GI-9-merge-jsonl-and-proxy-rows`, which took the count 51 → 52 on one new file —
-[internal/cli/rekey_test.go](../../internal/cli/rekey_test.go); the story's other new cases — the
-identity, session and transcript-key cases in `internal/parse`, `internal/session`,
-`internal/jsonlogs` and `internal/consumer` — went into existing test files). **A count taken
+**56 test files, 18,272 lines** against 16,065 lines of non-test Go (re-measured on
+`GI-11-cost-and-capture-fidelity`, which took the count 52 → 56 on four new files —
+[internal/store/reprice_test.go](../../internal/store/reprice_test.go),
+[internal/cli/reprice_test.go](../../internal/cli/reprice_test.go),
+[internal/store/reflag_test.go](../../internal/store/reflag_test.go) and
+[internal/store/importguard_test.go](../../internal/store/importguard_test.go). `reflag`'s CLI case
+is **not** the fifth: it went into the existing
+[internal/cli/cli_test.go](../../internal/cli/cli_test.go), following the `purge` precedent, and the
+story's other new cases went into existing test files too). **A count taken
 mid-branch is a count of that commit, not of the story** — these were re-measured at the branch's
 final tip. Real components are used
 rather than mocked: tests open a real temp SQLite store, run a real `httptest.Server` upstream, and

@@ -125,7 +125,7 @@ there is nothing for it to integrate.
   never prevents the others from writing. The proxy redacts credentials before insert and never
   makes the call depend on a successful capture.
 - **Credentials never reach the database.** Not in headers (redacted before the tee), not in bodies
-  (policy + 256 KB cap), and `internal/secret` lives in a file outside the DB — protected by POSIX
+  (policy + 2 MB cap), and `internal/secret` lives in a file outside the DB — protected by POSIX
   modes on Unix and an explicit Windows ACL on Windows (`0600` is a no-op there). Full bodies *are*
   stored, so the content — every prompt and every file the agent read — is the asset this repo is
   protecting. Loopback binding and redaction are load-bearing defaults, not conveniences.

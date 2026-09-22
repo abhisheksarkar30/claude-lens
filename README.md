@@ -103,30 +103,62 @@ Two states are first-class and never collapsed to zero:
 | `clens models` | the rate catalogue, and which models have no rate at all |
 | `clens prices` | the effective rate table, plus the edit paths |
 | `clens purge` | delete captured rows by age or by the unpriced predicate |
+| `clens rekey` | the one-off historical id backfill (already run; see its `--dry-run` report) |
+| `clens reprice` | re-price stored rows from the current rate table |
+| `clens reflag` | re-derive `capture_complete` on rows the old merge laundered |
 
-`clens purge` is the one command that destroys data, so its default is the
-opposite of destructive: nothing is deleted without `--yes`, and `--dry-run`
-prints what `--yes` would have deleted.
+Four commands write without `--yes`, and the shared gate is not a shared
+property: **`clens purge` and `clens rekey` delete rows; `clens reprice` and
+`clens reflag` only rewrite columns.** All four default to the opposite of
+destructive — nothing is written without `--yes`, and `--dry-run` prints what
+`--yes` would have written.
 
 ### Re-pricing rows already captured
 
 Editing a rate, or changing which model prefixes bill pay-as-you-go, does
-**not** re-price rows already in the database. `clens ingest --rebuild` is the
-re-pricing path.
+**not** re-price rows already in the database. Re-pricing is `clens reprice`:
 
-`--rebuild` zeroes every JSONL cursor, so the next poll re-reads each transcript
-from byte 0. The re-read is absorbed by the `request_id` UNIQUE constraint as a
-merge, which makes the run **idempotent** — no duplicate rows, no schema change,
-and no separate reprice command to run.
+```
+clens reprice --dry-run     # what would change, and writes nothing
+clens reprice --yes         # recompute cost_usd / api_equivalent_cost_usd / cost_source
+```
+
+It recomputes each row's cost from the row's own stored inputs against the
+current rate table. It inserts nothing and deletes nothing — a wrong run is
+repaired by running it again, not by restoring a backup. Rows whose
+`cost_source` does not name a reconstructible input set (`unpriced`, and any
+`approximate:` reason other than `cache_ttl_unknown`) are skipped and reported
+rather than guessed at, and `--dry-run` prints the moved/unchanged/skipped
+split first.
+
+**`clens ingest --rebuild` cannot do this job**, which is worth stating because
+this section used to say it was the re-pricing path. `--rebuild` zeroes every
+JSONL cursor so the next poll re-reads each transcript from byte 0, and the
+re-read is absorbed by the `request_id` UNIQUE constraint as a merge — which
+makes it **idempotent**, and is why it is safe to run. But a re-ingest produces
+a *JSONL* row, priced with no `speed` and no `serviceTier`, and the merge never
+replaces the proxy's bodies. The rows whose stored cost is wrong are **proxy**
+rows, and a re-ingest cannot reach them. (`--rebuild` is still the right tool
+for its own job: a rewritten transcript makes the byte cursor meaningless, and
+only a from-zero pass is correct.)
+
+`clens reflag` is the matching repair for the second defect class. A stored
+`capture_complete` could be laundered to `1` by the old cross-source merge,
+which destroyed the original bit — so a re-ingest cannot recover it either.
+`reflag` re-derives the flag from a `Content-Length` witness: a stored body that
+is a strict prefix of the length the client declared flips the row to
+`incomplete`. It reports flipped / already honest / **residual**, where a
+residual row is one the merge laundered with no witness left to prove it — not
+repairable, and reported as such rather than guessed at.
 
 Two things to know first:
 
-- **The merge has to be correct before you rely on this.** A re-ingest merges
-  the incoming row over the stored one, and `billing_mode` must move together
-  with the cost columns. On a build older than GI#3 the merge kept the stored
-  `billing_mode` while adopting the incoming cost, which would leave rows marked
-  `subscription` carrying a real `cost_usd` — the pair the billing invariant
-  forbids. Land the merge fix, then rebuild.
+- **The merge has to be correct before you rely on `--rebuild`.** A re-ingest
+  merges the incoming row over the stored one, and `billing_mode` must move
+  together with the cost columns. On a build older than GI#3 the merge kept the
+  stored `billing_mode` while adopting the incoming cost, which would leave rows
+  marked `subscription` carrying a real `cost_usd` — the pair the billing
+  invariant forbids. Land the merge fix, then rebuild.
 - **No config edit is needed for DeepSeek.** The shipped default already treats
   the `deepseek-` prefix as pay-as-you-go, so an unconfigured install routes
   those rows to the `api` account and prices them on its own. Set
@@ -240,7 +272,7 @@ the defaults are chosen to hold that:
 - **Loopback-only.** Both listeners bind `127.0.0.1`. Reaching beyond that
   requires `--allow-remote`, deliberately.
 - **Credentials never reach the database.** Not in headers — redacted before
-  the bytes are teed. Not in bodies — the body policy plus a 256 KB cap. And
+  the bytes are teed. Not in bodies — the body policy plus a 2 MB cap. And
   the credential file itself, `~/.clens/secrets.toml`, lives outside the
   database entirely.
 - **Protected by POSIX modes on Unix and an explicit Windows ACL on

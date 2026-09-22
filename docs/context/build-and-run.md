@@ -82,7 +82,7 @@ Every subcommand accepts the same flag set; precedence is flags > `CLENS_*` > fi
 | `--upstream-url` | `https://api.anthropic.com` | |
 | `--db-path` | `~/.clens/lens.db` | |
 | `--body-policy` | `full` | `full` \| `off`. **`off` keeps the call row and drops only the bodies** (br-GI-7-09). A third value, `truncated`, was accepted and read nowhere; it is now **rejected at startup** rather than silently treated as `full`; see [data-privacy-and-compliance.md](data-privacy-and-compliance.md) |
-| `--body-cap-bytes` | 262144 (256 KB) | |
+| `--body-cap-bytes` | 2097152 (2 MB) | raised from 262144 (256 KB) in GI-11: 58% of this workload's request bodies crossed the old cap and were stored as truncated conversation histories. It bounds **what is stored**, per body, never what is forwarded — and it is the bound on how much prompt and file content sits in the database at rest, so eight times the cap is eight times the exposure per row on a `full` capture. **The store's size grows with it**: the whole reason to raise it was that the bodies were worth keeping, and they are kept in `lens.db`. See [data-privacy-and-compliance.md](data-privacy-and-compliance.md) before lowering or raising it again |
 | `--allow-remote` | off | the footgun flag: without it, `Validate()` rejects a non-loopback bind |
 | `--session-gap-minutes` | — | session boundary heuristic |
 | `--retention-days` | — | drives `clens purge` |
@@ -115,6 +115,32 @@ columns as **more expensive, not less**:
 
 `Validate()` rejects a malformed date (not `YYYY-MM-DD`) and an empty or whitespace-only prefix.
 `clens doctor` prints the resolved state as `N (default)`, `N`, or `none`.
+
+## Where the store lives
+
+`--db-path` / `DBPath` names the SQLite file, and **that setting is the only place the location is
+recorded — the repo does not own it.** Nothing in the source tree hard-codes a path: `clens` resolves
+the store from the flag, then `CLENS_DB_PATH`, then the operator's `~/.clens/config.toml`, then the
+`~/.clens/lens.db` default. A `D:\` literal in a Go file would be wrong on every machine but one, so
+there is none — grep for `D:\` and the only hits are in these docs.
+
+On this install the store was moved off `C:` and `DBPath` now points at `D:/clens/lens.db` — the
+projection being that the cap change grows the store by roughly a third of a gigabyte, which is
+better spent on `D:` than on `C:`. The move is an **operator action, not a migration the repo
+performs**, and the ordered form of it is:
+
+1. Stop the running `clens serve`.
+2. **Copy** (never move) `~/.clens/lens.db` to `D:/clens/lens.db` — the original stays as the
+   fallback until step 6.
+3. Set `DBPath = "D:/clens/lens.db"` in `~/.clens/config.toml`.
+4. Start `clens serve` and confirm the new path is the one in use: `clens doctor` prints `db_path`.
+5. Confirm the store is intact and the row count matches the original.
+6. Only then remove the copy on `C:`.
+
+**Step 1 is what makes step 2 a plain file copy.** A stopped process has checkpointed its
+write-ahead log, so `lens.db` is self-contained; copying it while `serve` runs would silently drop
+everything still in the `-wal` beside it. It is **destructive only at step 6**, which is why the copy
+is verified before the original is deleted.
 
 ## The acceptance run
 

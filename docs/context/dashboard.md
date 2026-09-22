@@ -3,7 +3,7 @@
 # Dashboard
 
 *(Not a module from the skill's standard catalogue — this repo has no npm frontend, so no
-`package.json` trigger fires. It is documented anyway because 1030 lines of hand-written JavaScript
+`package.json` trigger fires. It is documented anyway because 1142 lines of hand-written JavaScript
 with a hard no-build-step rule and a no-CDN rule is exactly what a future change would break.)*
 
 The dashboard is served by the **dashboard listener** (`127.0.0.1:8798`) from
@@ -20,8 +20,8 @@ a transpile step, or a `<script src="https://…">` is a design change, not a re
 
 | File | Lines | Role |
 |---|---|---|
-| [index.html](../../internal/web/index.html) | 148 | the shell: header totals, the proxy-mode badge, the tab nav, one `<section class="view">` per tab |
-| [app.js](../../internal/web/app.js) | 1030 | every fetch, every table render, the three SVG charts, the body/header renderers, and the one SSE subscription |
+| [index.html](../../internal/web/index.html) | 173 | the shell: header totals, the proxy-mode badge, the tab nav, one `<section class="view">` per tab |
+| [app.js](../../internal/web/app.js) | 1142 | every fetch, every table render, the three SVG charts, the body/header renderers, and the one SSE subscription |
 | [style.css](../../internal/web/style.css) | 240 | |
 
 ## The proxy-mode badge
@@ -85,15 +85,41 @@ Tab switching is **not** URL routing — no hash, no history, no deep links. A t
 | Tab (`data-view`) | Shows | Loader → API route |
 |---|---|---|
 | `overview` | totals and the most recent calls | `/api/requests` |
-| `calls` | the call log with filters. Only the **id** cell is a link — there is no row handler, so clicking elsewhere in the row does nothing (D9). The link replaces the list with that call's full request and response, headers and bodies included, under a `‹ all calls` control | `/api/requests`, `/api/requests/{id}` |
+| `calls` | the call log with filters, including a **window picker** (see below). Only the **id** cell is a link — there is no row handler, so clicking elsewhere in the row does nothing (D9). The link replaces the list with that call's full request and response, headers and bodies included, under a `‹ all calls` control | `/api/requests`, `/api/requests/{id}` |
 | `sessions` | one row per run, with **both** cost models labelled side by side. The **session** cell is a link: it replaces the sessions list with that session's detail, its own calls table included, under a `‹ all sessions` control, and switches no tab | `/api/sessions`, `/api/sessions/{id}` |
 | `warnings` | findings by kind, and one row per occurrence | `/api/warnings`, `/api/warnings/summary` |
-| `stats` | totals over a window, charted by day/week/month | `/api/stats` |
+| `stats` | totals over a window, charted by day/week/month. The window and the bucket are **two axes**: `s-window-gran` supplies since/until, `s-granularity` supplies `granularity=`, and they compose — the window select is never wired to `granularity=`, which accepts only day/week/month | `/api/stats` |
 | `sources` | every collector's last success, last error, rows written | `/api/sources` |
 | `quota` | per-account burn against each window, and candidate limits | `/api/quota` |
 | `reconcile` | computed vs billed cost, side by side per day and model | `/api/reconcile` |
 | `models` | the catalogue, plus every model traffic used, priced or not | `/api/models` |
 | `settings` | health, the rate table, and its edit path | `/api/health`, `/api/prices` |
+
+## The time-window picker
+
+Calls and Stats each take a window. It is a granularity select plus one native input whose `type`
+follows the selection (`mountWindowPicker`): `datetime-local` for `hour`, `date`, `month`. Native
+inputs rather than a calendar widget, deliberately — the browser owns the popup, the locale, the
+keyboard handling and the validation, and this is a table row on a loopback dashboard. The select
+sets `valueInput.type` and **clears the value**, because a value left over from `date` is not valid
+for `month`.
+
+The two selects are not the same control, and the difference is load-bearing:
+
+- **Calls offers no `custom`.** It never had a free-text pair, so a `custom` entry there would be a
+  selectable control that filters nothing. Its default is `""` — "any time", which filters nothing
+  and is what the tab did before the picker existed.
+- **Stats offers `custom` and keeps `s-since` / `s-until`**, which remain the only way to ask for
+  `24h` or an arbitrary RFC3339 range. `custom` is its default and reveals them.
+
+`timeWindow(gran, value)` is the single place a window becomes a `{since, until}` pair, and it
+**builds the `±hh:mm` offset by hand from `getTimezoneOffset()`**. It must never call
+`toISOString()`, and that is the defect worth knowing about: `new Date('2026-09-21').toISOString()`
+emits `2026-09-21T00:00:00.000Z`, Go's `time.Parse(time.RFC3339, s)` accepts the trailing `Z` as UTC
+rather than rejecting it, and the window then denotes a different day than the one picked — 19,800 s
+(5h30m) off on IST. `internal/web/assets_test.go`'s `TestAssetsTimeWindowBuildsTheOffsetByHand`
+guards the source shape, because this package has no JS runtime; the semantic cases (local instant,
+the Dec→Jan rollover, the month's 28–31 day width, DST) are manual verification.
 
 ## State management
 
@@ -181,6 +207,8 @@ dropped mount point:
 | `TestAssetsTheBodyRendererEscapes` | the body renderer exists as one top-level function, still calls `esc(`, and its `readPathMarker` checks `BodyCapBytes` **before** `RespBodyCompleteness` (a positional assertion, because that ordering is the defect a string check cannot see). Also asserts both transcript states' strings and that `captureMarker` compares **both** bodies. Its ceiling is stated in the test itself: with no JS runtime in this toolchain it proves the escaping *call is present in the source*, not that the rendered pixels are safe |
 | `TestAssetsTheBadgeIsInTheHeader` | the proxy-mode badge is inside `<header class="app-header">`, so it is on every tab — putting it on the Sources tab would make it depend on the user already suspecting something |
 | `TestAssetsTheCallDetailReplacesTheList` | the two-mode wiring above: both list wrappers exist, both details are declared `hidden`, each setter is two-sided, each detail renders its own back control, and the `[data-call]` branch of the delegated click handler reveals Calls **without** fetching a list. That last assertion is the reported defect, and it is invisible to every other check in this file — the pre-fix `app.js` passed all of them. Its siblings `TestAssetsTheDetailModeFlipFollowsTheFetch` and `TestAssetsShowResetsBothModesUnconditionally` pin the two orderings a refactor would silently reverse (mode flip after the fetch resolves; both resets unconditional) and that a stale response is dropped |
+| `TestAssetsTimeWindowBuildsTheOffsetByHand` | the window picker's one computation is source-shaped, not behaviour-tested: scoped to the `timeWindow` slice, it asserts the `±hh:mm` suffix is built from `getTimezoneOffset()` **and** that `toISOString()` is not called — the trailing `Z` it emits is accepted as UTC by Go rather than rejected, so the window would silently denote a different day. The negative half is scoped to that slice rather than the whole file, so a future legitimate use elsewhere is not a tripwire |
+| `TestAssetsThePickerMountsBothTabs` | both `callFilter` and `loadStats` route their bounds through `timeWindow(`; Calls' select carries no `value="custom"` while Stats' does; both offer hour/date/month; and Stats keeps its `s-since`/`s-until` pair, without which `24h` and arbitrary RFC3339 ranges would silently cease to exist |
 
 A tab that renders a permanently blank panel, or a chart that loses its accessible labels, fails
 here rather than in a browser.
