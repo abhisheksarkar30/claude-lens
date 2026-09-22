@@ -128,7 +128,9 @@ are br-GI-11-05's, in `internal/store/reflag_test.go`.
   - **Leave `TestEveryCarriedOverCommandRunsAgainstATempStore`'s `cases` slice alone** — it is the
     11-entry GI-1 carried-over set and is not extended by later stories.
 - **Integration Tests:** none in-repo; acceptance #3/#4 are manual against a frozen store copy
-  (br-GI-11-05/11).
+  (br-GI-11-05/11) — #3's baseline is **read from this command's own `--dry-run` output**, not a
+  hand-written query, and both criteria are **relations on one snapshot**, never quoted totals; their
+  scope is this command's own, unfiltered (v12, §5).
 
 ## Files to Touch
 

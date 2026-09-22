@@ -171,10 +171,12 @@ a plan line range.**
     the two disagreeing.**
   - In `internal/store/importguard_test.go`: `TestStoreDoesNotImportPricing` — the one-for-one mirror
     of `TestProxyImportsAreNarrow`.
-- **Integration Tests:** none here. §5's acceptance #1 (the IST-day `SUM(cost_usd)` moving 0.82 →
-  3.46 ± 0.05) and acceptance #2 (one affected session's stored total equals its post-reprice `SUM`)
-  are run manually against a **frozen copy** of the live store (see br-GI-11-11 and §5's `VACUUM INTO`
-  note); they are not in-repo tests.
+- **Integration Tests:** none here. §5's acceptance #1 (the rows the run wrote equal the exact
+  recomputation over **those same rows**) and #2 (one affected session's stored total equals its
+  post-reprice `SUM` over its `events`) are run manually against a **frozen copy** of the live store
+  (see br-GI-11-11 and §5's `VACUUM INTO` note); they are not in-repo tests. Both are **relations on
+  one snapshot**, not quoted totals — the plan's 0.82 → 3.46 is a dated illustration, and the invoice
+  agreement is reported, not gated (v12, §5).
 
 ## Files to Touch
 

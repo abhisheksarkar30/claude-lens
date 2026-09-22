@@ -113,21 +113,28 @@ guessing. That is the honest ceiling of a repair from surviving columns.
 - **Idempotent:** a second run flips nothing.
 - A body-less `cc=1` row with no `Content-Length` is **not** witnessed and (absent a warning) is counted
   healthy, not residual — the `IS NOT NULL` guard holds.
-- **§5 acceptance #3 (against a frozen copy of the live store, after `reflag --yes`):** under the union
-  predicate `(source = 'proxy' OR instr(source_refs,'proxy') > 0)`, the number of `capture_complete=0`
-  rows in the IST window `[1789929000000000000, 1790015400000000000)` rises from its **baseline of 128**
-  to **1,304** (128 + 1,176). The 128 is two populations: **20** unmerged proxy rows carrying a
-  `stream_incomplete` warning plus **108** non-stream truncations carrying none. Run the query *before*
-  `reflag` to observe 128 and *after* to observe 1,304.
-- **§5 acceptance #4 (same frozen copy, after `reflag --yes`):** the RC-B invariant query over the union
-  predicate — `capture_complete = 1` while a stored body is a strict prefix of its `Content-Length` —
-  returns **0**, using the **same witness predicate** this bead defines. It is 0 **because the backfill
-  ran**, not because the code fix alone achieves it. The predicate is the prefix relation, **not**
-  `length(req_body) = cap` (599 legitimate at-cap rows exist, and a `= cap` test is cap-bound and
-  vacuous against the new 2 MB default).
-  These figures are **IST-window figures, not the all-time figures**; the all-time snapshot is 2,865 /
-  316 / 138 (2,221 healthy). Every figure is a **dated snapshot of a live store**, and the acceptance
-  figures are the ones measured against the **frozen copy** (§1, §5).
+- **§5 acceptance #3 (against a frozen copy of the live store, after `reflag --yes`) — a relation, with
+  its baseline read from the command.** Under the union predicate `(source = 'proxy' OR
+  instr(source_refs,'proxy') > 0)` and over **the command's own scope — no time filter**, since `reflag`
+  repairs all of history and a windowed acceptance would check a subset of what it did — the baseline is
+  **not measured by hand**: `clens reflag --dry-run` prints exactly the three buckets (`flipped` = `W`,
+  `already honest` = `baseline_cc0`, `residual` = `R`) and writes nothing (br-GI-11-06), so the snapshot
+  is measured by **the same code that does the repair, at the instant before it runs**. Then run `--yes`
+  and compare. Two criteria, both off one snapshot: `cc0_after = baseline_cc0 + W`, and
+  `cc0_before + W + R + H = scope_total` (a **partition**, not four loose numbers).
+  **No count here is a target.** The all-time figures (316 / `W` 2,865 / `R` 138 / healthy 2,221,
+  closing at 5,540) are a **dated illustration of magnitude and sign**, because a quoted count is stale
+  by the time the backfill fires — this past-day count already moved once (2,352 → 2,327) as `jsonlogs`
+  backfilled the day and merges rewrote rows in place (v12, §5). `baseline_cc0` is not 0 and is two
+  populations: unmerged proxy rows carrying a `stream_incomplete` warning plus non-stream truncations
+  carrying none (in the IST day: 20 + 108 of its 128).
+- **§5 acceptance #4 (same frozen copy, after `reflag --yes`) — already a relation, unchanged:** the
+  RC-B invariant query over the union predicate — `capture_complete = 1` while a stored body is a strict
+  prefix of its `Content-Length` — returns **0**, using the **same witness predicate** this bead
+  defines. It is 0 **because the backfill ran**, not because the code fix alone achieves it. The
+  predicate is the prefix relation, **not** `length(req_body) = cap` (a `= cap` test is cap-bound and
+  vacuous against the new 2 MB default; the at-cap rows are legitimate). Every figure in this bead is
+  measured against the **frozen copy**, never the live store.
 - `go build ./...`, `go vet ./...`, `go test ./internal/store/` pass.
 
 ## Test Specifications

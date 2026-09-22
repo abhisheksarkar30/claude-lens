@@ -152,7 +152,9 @@ All in `internal/store/merge_test.go`.
   names in particular the `:873-875` site; a sibling copy missed here is the failure mode
   br-GI-9-04 records.
 - **Integration Tests:** none. The end-to-end statement of RC-B is §5's acceptance #3/#4 (run manually
-  after `reflag` against a frozen store copy; br-GI-11-06/11).
+  after `reflag` against a frozen store copy; br-GI-11-06/11) — #3's baseline is **read from
+  `reflag --dry-run`'s own output** over the command's unfiltered scope, and both criteria are
+  **relations on one snapshot**, never quoted totals (v12, §5).
 
 ## Files to Touch
 

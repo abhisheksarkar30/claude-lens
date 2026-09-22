@@ -114,7 +114,7 @@ All in `internal/cli/reprice_test.go`, mirroring `internal/cli/rekey_test.go`'s 
     a `nil`-form shell fails this. (The store-level pin is br-GI-11-02's; this asserts the shell wires
     `cfg.PeakOffPeakDates` through rather than dropping it.)
 - **Integration Tests:** none here. §5's acceptance #1/#2 are manual, against a frozen store copy
-  (br-GI-11-11).
+  (br-GI-11-11) — run as **relations on one snapshot**, never against a quoted total (v12, §5).
 
 ## Files to Touch
 
