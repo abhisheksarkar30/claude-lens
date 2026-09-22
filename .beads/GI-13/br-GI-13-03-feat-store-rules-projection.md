@@ -42,6 +42,24 @@ Follow the machinery that already exists (`store.go:1289-1309`): `eventColumnNam
   `consumer_test.go:241-242`, and the doc comment at `publishing_store.go:9-25` (both the interface
   list and the "needs no override" note name `SessionEvents`).
 
+### Three rename traps — checked against the tree, not assumed
+
+A full grep of `SessionEvents` finds **21 sites**, and only some of them move. Three traps:
+
+1. **`SessionEvents` is a prefix of `SessionEventsSummary`, so a find-and-replace corrupts the wrong
+   method.** Six sites must **not** move: `api.go:64`, `:621`, `:644`, and `store.go:358`, `:361`,
+   `:369`. `SessionEventsSummary` is a different projection for a different caller (the session
+   route's call list) and is untouched here. **Rename per site — never textually.**
+2. **Two doc comments name the old method and move with it.** `store.go:354` contrasts the two
+   projections ("`SessionEventsSummary` is `SessionEvents` at the list projection") and `store.go:357`
+   says a rule "compares consecutive request bodies and wants `SessionEvents`" — after the rename that
+   second one means `SessionEventsForRules`. The method's own comment at `:329` moves too.
+3. **br-GI-13-02's test calls `SessionEvents`.** `TestMigrateAddsTheCompositeIndexAtVersionTwo` closes
+   by asserting the seeded rows "are still returned by `SessionEvents`" — and this bead deletes that
+   method, so `go build ./...` fails until that call is renamed in the same pass. It is the one place
+   this deletion reaches back into a bead that already landed, which is why it is named here rather
+   than left to the compiler.
+
 `SessionEventsSummary` (`store.go:358`) is **untouched** — it is a different projection for a different
 caller (the session route's call list).
 
@@ -109,7 +127,8 @@ cannot drift.
   call (`:551`) renamed)
 - `internal/consumer/consumer_test.go` (modify — `failingStore.SessionEvents` (`:241-242`))
 - `internal/api/publishing_store.go` (modify — the doc comment (`:9-25`), both mentions)
-- `internal/store/store_test.go` (modify — the store cases above)
+- `internal/store/store_test.go` (modify — the store cases above, **and the `SessionEvents` call inside
+  br-GI-13-02's `TestMigrateAddsTheCompositeIndexAtVersionTwo`** — see trap 3)
 
 **Shared-file note.** `store.go`, `store_test.go` and `consumer.go` are also touched by br-GI-13-01/02
 (which this bead depends on) and `consumer_test.go` also by br-GI-13-05. Keep each edit to its own

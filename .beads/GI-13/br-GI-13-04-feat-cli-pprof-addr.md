@@ -15,9 +15,18 @@
 
 ## Description
 
-The profile that found this bug came from an uncommitted local patch to `internal/cli/serve.go`
-(`:117`, `:425-440`) that reads `os.Getenv("CLENS_PPROF_ADDR")` directly. Make it a real, flag-gated,
-config-resolved feature so the *next* investigation does not re-derive the patch.
+**At HEAD the profiler does not exist.** `internal/cli/serve.go` carries no `net/http/pprof` import and
+no `startPprof` — this bead creates both, from scratch.
+
+The investigation that found this bug ran against an **uncommitted local patch** to that file: it read
+`os.Getenv("CLENS_PPROF_ADDR")` at the `serve` entry point and defined a `startPprof` whose host check
+accepted only `127.0.0.1`, `::1` and `localhost`. That patch is the **model** for this bead, not a
+committed premise — if the working tree no longer carries it, write the code from this description
+rather than hunting for it. Do **not** copy its three-spelling host check verbatim: that check is the
+defect the "one home for what counts as loopback" subsection below exists to fix.
+
+The point is to make it a real, flag-gated, config-resolved feature so the *next* investigation does
+not re-derive the patch.
 
 ### `internal/config/config.go`
 
@@ -58,9 +67,10 @@ of one predicate, this repo's own named defect class. Settle it by extracting
 
 ### `internal/cli/serve.go`
 
-Replace `startPprof(os.Getenv("CLENS_PPROF_ADDR"))` (`:117`) with `startPprof(cfg.PprofAddr)`, and make
-`startPprof`'s host check call `config.IsLoopbackHost`. The refusal stays as the second layer and keeps
-its rationale comment; it now agrees with `Validate` by construction.
+Replace the working patch's `startPprof(os.Getenv("CLENS_PPROF_ADDR"))` call with
+`startPprof(cfg.PprofAddr)`, and make `startPprof`'s host check call `config.IsLoopbackHost`. The
+refusal stays as the second layer and keeps its rationale comment; it now agrees with `Validate` by
+construction.
 
 ### `internal/cli/doctor.go`
 
@@ -126,8 +136,9 @@ tree — no `internal/diagnostics` package, no profile-capture helper.
 - `internal/config/config.go` (modify — `PprofAddr` field + `Default` note, `fieldsByEnv`, `applyKV`,
   `applyFlags`, `Validate`, and the extracted `IsLoopbackHost`; `validateLoopback` refactored to call
   it)
-- `internal/cli/serve.go` (modify — call site `:117`; `startPprof` (`:425-440`) host check →
-  `config.IsLoopbackHost`)
+- `internal/cli/serve.go` (modify — the `serve` entry point gains the `net/http/pprof` import and the
+  `startPprof(cfg.PprofAddr)` call; `startPprof` is added there with its rationale comment and a
+  `config.IsLoopbackHost` host check. Neither the import nor the function exists at HEAD)
 - `internal/cli/doctor.go` (modify — one printed line)
 - `README.md` (modify — profiling subsection)
 - `internal/config/config_test.go`, `internal/cli/serve_test.go`/`doctor_test.go` (modify — the cases
