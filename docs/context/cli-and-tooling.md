@@ -49,7 +49,7 @@ because **the shared gate is not a shared property**:
 | `reflag` | no | `capture_complete` |
 
 `reprice` and `reflag` delete nothing and insert nothing — they recompute a column from the row's own
-stored inputs, which is why a wrong or unwanted run is repaired by running the other one, not by
+stored inputs, which is why a wrong or unwanted run is repaired by running it again, not by
 restoring a backup. The destructive set is still exactly `purge` and `rekey`, and the comments in
 `internal/cli/purge.go` and `internal/cli/rekey.go` say "two" deliberately.
 
