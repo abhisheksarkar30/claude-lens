@@ -107,9 +107,9 @@ Two states are first-class and never collapsed to zero:
 | `clens reprice` | re-price stored rows from the current rate table |
 | `clens reflag` | re-derive `capture_complete` on rows the old merge laundered |
 
-Four commands write without `--yes`, and the shared gate is not a shared
-property: **`clens purge` and `clens rekey` delete rows; `clens reprice` and
-`clens reflag` only rewrite columns.** All four default to the opposite of
+Four commands refuse to write without `--yes`, and the shared gate is not a
+shared property: **`clens purge` and `clens rekey` delete rows; `clens reprice`
+and `clens reflag` only rewrite columns.** All four default to the opposite of
 destructive — nothing is written without `--yes`, and `--dry-run` prints what
 `--yes` would have written.
 
