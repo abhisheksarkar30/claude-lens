@@ -1,8 +1,8 @@
 # GI-11 — Cost is rounded to a cent per call, and a truncated capture is recorded as complete
 
-<!-- version=12 status=converged -->
+<!-- version=15 status=converged -->
 
-**Issue**: GI#11 (GitHub) · **Branch**: `GI-11-cost-and-capture-fidelity` · **Beads**: `.beads/GI-11/` · **Plan version**: 12 · **Status**: converged
+**Issue**: GI#11 (GitHub) · **Branch**: `GI-11-cost-and-capture-fidelity` · **Beads**: `.beads/GI-11/` · **Plan version**: 15 · **Status**: converged
 
 ## 1. The report
 
@@ -23,7 +23,8 @@ one class** — including §5's acceptance figures, which a `VACUUM INTO` snapsh
 but not *permanent*: `jsonlogs` backfills past days and every merge rewrites rows in place, so even a
 fixed past day drifts (this plan watched its own RC-A row count move 2,352 → 2,327). Acceptance is
 therefore written as **relations on a single snapshot** (§5), never as quoted targets. The only figures
-here that are *not* snapshots are DeepSeek's invoice figures, which are fixed for a fixed day.
+here that are *not* snapshots are DeepSeek's invoice figures, which are fixed for a fixed day, and the
+arithmetic derived from the captured tokens themselves.
 
 ## 2. Three root causes
 
@@ -144,16 +145,18 @@ guarantee that a truncated proxy row keeps `capture_complete=0` through a merge.
 bounds **both** bodies ([proxy.go:88](../../internal/proxy/proxy.go#L88) for the response,
 [:126](../../internal/proxy/proxy.go#L126) for the request).
 
-Measured against the client's `Content-Length` across 4,873 proxy rows:
+Measured against the client's `Content-Length` across the **6,088** proxy rows that carry one (a
+**dated snapshot**, 2026-09-22T09:06Z — the 4,873 figure this section used earlier is a different
+population, not this base):
 
 | | |
 |---|---|
-| request bodies over 256 KB | **2,845 (58%)** |
-| request bodies over 1 MB | 106 |
-| request bodies over 2 MB | **0** |
+| request bodies over 256 KB (262,144) | **3,554 (58.4% of 6,088)** |
+| request bodies over 1 MB (1,048,576) | 117 |
+| request bodies over 2 MB (2,097,152) | **0** |
 | largest request body seen | **1,246,222 bytes** |
-| mean request body | 356,659 bytes |
-| responses stored at exactly the cap | 599 |
+| mean request body | 351,394 bytes |
+| responses stored at exactly the cap (262,144) | 768 (of 6,114 stored responses — 12.6%) |
 
 So truncation is the norm, not the exception — and the dominant body is the **request**, not the
 response the report named. A Claude Code request carries the system prompt, the full tool schemas
@@ -166,15 +169,18 @@ of responses.
 
 The **token** gap is not attributable to a bug in clens and is not fixed here.
 
-- The proxy captured 100% of traffic: the day's 2,802 client requests break down as 2,257
-  `/v1/messages` calls, 144 `count_tokens` calls and 401 other rows — 2,257 + 144 + 401 = 2,802 —
-  and 2,257 is exactly the proxy's `/v1/messages` row count.
-- 297,080,674 is an all-source total that includes 407 `claude-sonnet-5` subscription rows from
-  session `90300bd3` (12:21–13:28), which never touched DeepSeek at all. **The DeepSeek
-  comparison is proxy-only: 209,153,629 vs 183,854,144.**
-- The proxy includes 659 calls with no transcript line (32.02 M tokens). A transcript flushes on
-  exit, so a session killed mid-flight loses it permanently while the proxy still captured the
-  traffic; those rows are the only record and must not be dropped.
+- The proxy captured 100% of traffic: on the IST day 2026-09-21 (a **dated snapshot**, 2026-09-22T09:06Z,
+  `events` = 48,675) the day's proxy rows total **2,426**, breaking down as 2,257 `/v1/messages` calls,
+  144 `/v1/messages/count_tokens` calls and 25 other rows (24 `/api/hello` + 1 `/`) — 2,257 + 144 + 25 =
+  2,426 — and 2,257 is exactly the proxy's `/v1/messages` row count, so the day's client requests are
+  100% captured.
+- 297,172,779 is an all-source total (2026-09-22T09:06Z) that includes 407 `claude-sonnet-5`
+  subscription rows from session `90300bd3` (12:21–13:28), which never touched DeepSeek at all. **The
+  DeepSeek comparison is proxy-only: 209,153,629 vs 183,854,144.**
+- The proxy includes 659 `/v1/messages` calls with no transcript line (32.02 M tokens)
+  (2026-09-22T09:06Z). A transcript flushes on exit, so a session killed mid-flight loses it
+  permanently while the proxy still captured the traffic; those rows are the only record and must not
+  be dropped.
 - The residual ~25.3 M is unattributed. Bounding it needs DeepSeek-side per-request data that the
   usage page does not expose (it publishes aggregates only). **No fix without a root cause**, so
   this is a follow-up, not a bead.
@@ -202,7 +208,7 @@ page.
 | [internal/store/reprice_test.go](../../internal/store/reprice_test.go) *(new)* | The **store-level** reprice cases (§5), exercised against `Store.RepriceCosts` (the tx-taking store method): a fixture holding a known-wrong row reprices to the exact value; a `user` row reprices against the effective table (its override rate applies) rather than being skipped; an `approximate:cache_ttl_unknown` row is repriced with its `cost_source` preserved (the label is the reconstruction key, §4) — not skipped; a row priced with a non-default `PeakOffPeakDates` (the `none` spelling) recomputes to a different value than the shipped calendar gives — the case a `nil`-form reprice passes and therefore never catches (§4, F6.1); a row whose `model_resolved` no longer resolves keeps its stored cost/`cost_source` and is counted skipped, never nulled; and the **owning session's** `total_cost_usd` / `total_api_equivalent_cost_usd` move with the row in the same transaction (the F1.1 rollup). The write loop lives here, so the same-transaction rollup is pinned at the store layer, not the CLI one. |
 | [internal/cli/reprice_test.go](../../internal/cli/reprice_test.go) *(new)* | The **CLI shell's** own contract (§5), mirroring `internal/cli/rekey_test.go`'s `--dry-run` cases: `clens reprice --dry-run` reports what `--yes` would change and writes nothing — the in-scope rows' cost columns and their owning sessions' totals are unchanged. `--dry-run` is a flag on the shell, not an argument to `Store.RepriceCosts`, so this case cannot be pinned from the `internal/store` package; it is the one §5 reprice case that lives at the CLI level. |
 | [cmd/clens/main.go](../../cmd/clens/main.go) | Register `"reprice": cli.Reprice` and `"reflag": cli.Reflag` in the command table ([:16-39](../../cmd/clens/main.go#L16-L39)). |
-| [cmd/clens/main_test.go](../../cmd/clens/main_test.go) | The new dispatch entries break `TestEveryCarriedOverCommandIsDispatched`: `carriedOver` is a hand-written allowlist and the test fails hard on any count mismatch ([main_test.go:40-47](../../cmd/clens/main_test.go#L40-L47)). Add **both** `"reprice"` and `"reflag"` to the list — **19 → 21**, since reprice and reflag ship together — and update **every** doc comment that names the count: [:10-14](../../cmd/clens/main_test.go#L10-L14) and [:26](../../cmd/clens/main_test.go#L26) both read "the 19 subcommands" and both go to 21, so neither is left stale. This is the count-drift trap F1.2a/F2.9 established — one comment moved, the other missed. |
+| [cmd/clens/main_test.go](../../cmd/clens/main_test.go) | The new dispatch entries break `TestEveryCarriedOverCommandIsDispatched`: `carriedOver` is a hand-written allowlist and the test fails hard on any count mismatch ([main_test.go:40-47](../../cmd/clens/main_test.go#L40-L47)). Add **both** `"reprice"` and `"reflag"` to the list — **19 → 21**, since reprice and reflag ship together — and update **every** doc comment that names the count: [:10-14](../../cmd/clens/main_test.go#L10-L14) and [:26](../../cmd/clens/main_test.go#L26) both read "the 19 subcommands" and both go to 21, so neither is left stale. **The `:10-14` comment names the count *and its own composition* — "doctor and serve, br-GI-1-15's six collectors, br-GI-1-17's ten readers and writers, and br-GI-9-04's rekey" (2 + 6 + 10 + 1 = 19) — so moving only the numeral leaves that sentence claiming *21* while its own enumeration still sums to *19*: a third drift site inside the very comment this row says must not go stale.** The composition sentence therefore **gains `br-GI-11-03`'s `reprice` and `br-GI-11-06`'s `reflag`** (the same two groups the `carriedOver` list gains), so the comment's count and its enumeration agree at 21. This is the count-drift trap F1.2a/F2.9 established — one comment moved, the other missed. |
 
 ### Why a reprice command is in scope
 
@@ -600,9 +606,11 @@ the copy reports **immediately before** the step runs. Where a figure appears in
 This is §8's own rule ("the reproducible artifact is the query, not the number") applied to acceptance
 as well, and it is the only form that survives a store with a live writer:
 
-**The acceptance window is the local IST day 2026-09-21** — but it applies to **#1 and #2 only**, the
-cost criteria, because that is the day DeepSeek invoiced (§1) and the only thing tying a criterion to a
-date. **#3 and #4 run over the command's own unfiltered scope** (see #3). The window is a half-open
+**The acceptance window is the local IST day 2026-09-21** — the day DeepSeek invoiced (§1), and the
+window the dated illustrations below are drawn over. It bounds **no** criterion: #1 is a per-row
+relation over every row the reprice priced, and #2 is a per-session relation over that session's own
+all-time `SUM`, so both hold regardless of window; **#3 and #4 run over the command's own unfiltered
+scope** (see #3). The window is a half-open
 `started_at` range in unix nanoseconds: `[1789929000000000000, 1790015400000000000)` (start inclusive,
 end exclusive; the two values differ by exactly 86,400 s). Two things this must state plainly: `events`
 has **no `day` column** ([schema.sql:11-66](../../internal/store/schema.sql#L11-L66)); `day` is a
@@ -611,15 +619,24 @@ derived expression, and `clens stats --by day` buckets by **UTC**
 stats --by day` does **not** reproduce these figures. The acceptance query is a **direct `events`
 query, not a shipped subcommand**.
 
-1. **Reprice correctness, as a relation — recompute, don't diff.** For **every row in the reprice's
-   scope** (any row whose `model_resolved` resolves in the effective table, priced or skipped-by-value),
+1. **Reprice correctness, as a relation — recompute, don't diff.** For **every row the reprice priced**,
    the stored figure equals the exact arithmetic recomputation over **that row's own stored token
-   columns** at the table's rates. Check it by recomputing the exact value for every in-scope row of
-   the snapshot and comparing — **not** by asking which rows the run "wrote", which is unanswerable
+   columns** at the table's rates — with one reconstruction: where the row's `cost_source` is
+   `approximate:cache_ttl_unknown`, `usage.TTLUnknown` is *not* a stored column, so the recompute
+   rebuilds it from the label exactly as the reprice does (§4) before computing — the acceptance reuses
+   the reprice's own input-reconstruction rule. *(On the 2026-09-22T09:06Z store this is vacuous —
+   `cost_source` holds only `shipped` (48,477) and `unpriced` (198), zero `approximate:*` rows — but it
+   is stated because a recompute from the stored columns alone would read a correct reprice as a miss the
+   moment an `approximate:cache_ttl_unknown` row exists; that is a correctness gap, not a
+   simplification.)* Check it by recomputing the exact value for every row the reprice priced on the
+   snapshot and comparing — **not** by asking which rows the run "wrote", which is unanswerable
    after the fact: the run only writes rows whose value *moved*, and an untouched row satisfies the
-   relation trivially. This is drift-proof — a row added to the day later was priced at insert and was
-   never in the run's scope, so it cannot move the comparison — and it is the actual claim RC-A's fix
-   makes, stated so it can be checked without quoting a total.
+   relation trivially. **`unpriced` rows are out of scope** for the recompute relation — their inputs
+   cannot be reconstructed, so the clause cannot be evaluated for them; they are checked only for having
+   been **left untouched** (stored cost and `cost_source` unchanged), which is the run's stated carve-out
+   (§"Why a reprice command is in scope"). This is drift-proof — a row added later was priced at insert
+   and was never in the run's scope, so it cannot move the comparison — and it is the actual claim RC-A's
+   fix makes, stated so it can be checked without quoting a total.
    *Dated illustration (2026-09-22 snapshot): the IST day's `SUM(cost_usd)` over `source='proxy'`
    moved 0.82 → 3.46.*
    *Invoice corroboration, reported not gated:* that day's total lands within ~7% of DeepSeek's 3.25
@@ -627,7 +644,7 @@ query, not a shipped subcommand**.
    is **reported as agreement**, not asserted as a bound that a late-arriving row could break.
 2. **Session rollup (same transaction, F1.1):** for every session the reprice touched, its
    `sessions.total_cost_usd` (and `total_api_equivalent_cost_usd`) is re-derived in the reprice's
-   own transaction and moves with the day's `SUM(events.cost_usd)` for that session — assert one
+   own transaction and moves with the session's own all-time `SUM(events.cost_usd)` — assert one
    affected session's stored total equals the post-reprice `SUM` over its `events`, not the pre-fix
    value.
 3. **The honest-truncation count, as a relation — with its baseline taken from the command itself.**
@@ -635,16 +652,19 @@ query, not a shipped subcommand**.
    stated here, not implied, so the step is reproducible — the baseline is **read from the command's
    own `--dry-run`**, not from a hand-written query: `clens reflag --dry-run` prints exactly the three
    buckets (`flipped` = `W`, `already honest` = `baseline_cc0`, `residual` = `R`) and writes nothing
-   (§4, br-GI-11-06). So the snapshot is measured by **the same code that will do the repair, at the
-   instant before it runs** — which is the only way the number cannot be stale, and the reason this
-   criterion needs no literal at all. Run `--dry-run` on the frozen copy to read the baseline, then
-   `--yes` and compare. The criteria are two relations, both readable off one snapshot:
+   (§4, br-GI-11-06). So the **flip relation's** baseline is measured by **the same code that will do the
+   repair, at the instant before it runs** — which is the only way that number cannot be stale, and the
+   reason that criterion needs no literal at all. Run `--dry-run` on the frozen copy to read the
+   baseline, then `--yes` and compare. The criteria are two relations, both readable off one snapshot:
    - **the flip is exact:** `cc0_after = baseline_cc0 + W` — the count rises by precisely the rows the
      witness identifies, no more and no less;
-   - **the buckets partition the scope:** `cc0_before + W + R + H = scope_total`, where `R` is the
+   - **the buckets partition the scope:** `baseline_cc0 + W + R + H = scope_total`, where `R` is the
      residual (`cc=1` ∧ a stored `stream_incomplete` warning ∧ no witness) and `H` the healthy
      remainder — so the report's buckets are a partition of one snapshot, not four loose numbers that
-     happen to be close.
+     happen to be close. **This relation is evaluated with §8's four-bucket query** — the same witness
+     predicate, so the two cannot drift — because the command's `--dry-run` prints only **three**
+     buckets (`flipped`/`already honest`/`residual`) and carries neither `H` nor `scope_total`;
+     `scope_total` is that query's row count over the same union scope.
    **The scope is the command's own** — the union predicate with **no time filter**, because `reflag`
    repairs all of history and an acceptance windowed narrower than the repair would be checking a
    subset of what it did. The IST day is a subset of the scope, not the criterion.
@@ -678,7 +698,7 @@ query, not a shipped subcommand**.
    is the prefix relation, **not** `length(req_body) = cap`. A body captured whole *at exactly* `cap`
    bytes stores `length == cap` with `capture_complete = 1` legitimately — the proxy sets `truncated`
    only when a write must drop bytes
-   ([proxy.go:272-286](../../internal/proxy/proxy.go#L272-L286)), and §2 reports 599 such responses —
+   ([proxy.go:272-286](../../internal/proxy/proxy.go#L272-L286)), and §2 reports 768 such responses —
    so a `length = cap` test is not an invariant the code holds. It is also cap-bound: vacuous against
    the new 2 MB default (historical prefixes are 262,144 bytes) and, run against 262,144, it
    re-introduces the length-vs-cap blindness §4/§6 record as an accepted limitation (F1.8). The
@@ -689,7 +709,7 @@ query, not a shipped subcommand**.
 | Risk | Handling |
 |---|---|
 | **RC-B changes the dashboard's *flags*, not its warning count** — 2,844 proxy-first + 21 jsonl-first = **2,865** rows stop claiming completeness under the union predicate (a dated snapshot, 2026-09-22T06:49:41Z; the count changed when the scope widened from `source='proxy'` to the union — F4.4). The `stream_incomplete` warnings those rows carry are **already stored**: written at insert ([consumer.go:210-214](../../internal/consumer/consumer.go#L210-L214)) and never deleted or re-derived by a merge ([merge.go:139-149](../../internal/store/merge.go#L139-L149) writes only `source_mismatch`). | Nothing re-runs the analyzer on a merge, so the count does **not** jump. RC-B makes the `capture_complete` flag start **agreeing with the warning already attached** to the row, and guarantees a truncated proxy row keeps `cc=0` through a merge going forward. RC-B and RC-C ship together; the cap raise is what actually removes the truncation. The historical rows already laundered are corrected by `clens reflag` (§4 backfill block), which flips flags but synthesises no warnings. |
-| **float64 accumulation** across 2,257 rows in SQLite `REAL`. | Error is ~1e-16 relative per operation; the exact-$3.46 target is asserted to ±$0.05, four orders of magnitude above the noise. `big.Rat` stays the compute type; only the stored value is a float, as today. |
+| **float64 accumulation** across every row the reprice prices, in SQLite `REAL`. | Error is ~1e-16 relative per operation, far below a cent. §5 #1 asserts no total: it re-runs `Compute` per row and compares the exact value with the stored `REAL`, so error at this scale cannot flip the comparison. `big.Rat` stays the compute type; only the stored value is a float, as today. |
 | **`roundHalfUp` deletion** breaks a caller I have not found. | Grepped: its only production reference is [pricing.go:133](../../internal/pricing/pricing.go#L133); the rest are comments. The compiler is the check. |
 | **Reprice rewrites a cost the user deliberately overrode.** | Not a risk once reprice uses the effective table: a user edit overrides a **rate** ([pricing.go:185-189](../../internal/pricing/pricing.go#L185-L189)), not a per-row cost, and reprice prices with the same effective table the insert path uses — `newPriceLoader(cfg).Table()`, the configured off-peak calendar included (§4, and *not* the `nil` form v3's F2.7 wrote) — so a `user` row recomputes to that same override rate. Only `unpriced` rows are skipped; `approximate:cache_ttl_unknown` rows are **reconstructed and repriced**, not skipped (next row). |
 | **`approximate:cache_ttl_unknown` rows — repriced, not skipped.** | `TTLUnknown` is not a stored column, but the **`cost_source` label is** ([schema.sql:45](../../internal/store/schema.sql#L45), [:70](../../internal/store/schema.sql#L70), `idx_events_cost_source`) — and it is the reconstruction **key**: a row carrying `approximate:cache_ttl_unknown` proves `usage.TTLUnknown` was `true` at insert, so reprice sets `TTLUnknown = true`, calls `Compute`, and gets back both the corrected amount and the same label ([pricing.go:138-140](../../internal/pricing/pricing.go#L138-L140)). Those rows are **in scope**. The only skip is a row whose computed inputs cannot be rebuilt — `unpriced` (`model_resolved` absent from the table), plus any future `approximate:<reason>` other than `cache_ttl_unknown` (§4 scoping). |
@@ -855,10 +875,140 @@ WITH x AS (
     FROM events WHERE source='proxy')
 SELECT SUM(n > 262144), SUM(n > 1048576), SUM(n > 2097152), MAX(n), CAST(AVG(n) AS INT)
   FROM x WHERE n IS NOT NULL;
--- → 2845, 106, 0, 1246222, 356659
+-- → 3554, 117, 0, 1246222, 351394
+--   measured 2026-09-22T09:06Z, over the 6,088 proxy rows carrying a Content-Length
+--   (a dated snapshot; the store is live, so the reproducible artifact is the QUERY).
+--   768 of 6,114 stored responses sit at exactly the 262,144 cap.
 ```
 
 ## Change History
+
+### v15 — round-11 review + the convergence stamp (author; **converged**)
+
+Round 11 confirmed on v14 with **0 BLOCKER / 0 MAJOR**. It is the **third** consecutive clean round:
+rounds 9 and 10 were each clean (v13's `O4` and v14's record both say so), so the two-round window
+**closed at rounds 9–10** and round 11 simply confirmed it — no new defect class reopened it. Two small
+findings were raised and both applied.
+
+- **F11.1 (MINOR)** — `.beads/GI-11/br-GI-11-04-feat-store-capture-complete-follows-bodies.md`'s
+  Rationale carried the union-population figures as a **bare** measurement with no dated-snapshot
+  label, while every other carrier of those same figures dates them (plan §2/§6/§8, and the sibling
+  `br-GI-11-05`, which calls its identical numbers "a *dated illustration of magnitude and sign*").
+  The Rationale now carries the same qualifier: the figures are measured across the union predicate's
+  rows **on a dated snapshot, 2026-09-22T06:49:41Z** — the snapshot §2's RC-B table dates. **No figure
+  changed** (5,540 / 2,865 / 2,844 + 21 / 316 / 0 are correct *for that snapshot*); only their
+  snapshot semantics were missing. `.beads/GI-11/br-GI-11-04`.
+- **F11.2 (NIT)** — §4's `cmd/clens/main_test.go` row instructed moving "the 19 subcommands" numeral to
+  **21** in both `:10-14` and `:26`, but `:10-14` names the count **and its own composition** ("doctor
+  and serve, br-GI-1-15's six collectors, br-GI-1-17's ten readers and writers, and br-GI-9-04's
+  rekey" — 2 + 6 + 10 + 1 = 19), so moving only the numeral leaves that sentence claiming *21* while
+  its enumeration sums to *19*. The row now instructs moving **both** the numeral **and** the
+  composition sentence — the enumeration **gains `br-GI-11-03`'s `reprice` and `br-GI-11-06`'s
+  `reflag`** — so the comment's count and its enumeration agree at 21. The same instruction is carried
+  into `.beads/GI-11/br-GI-11-09-feat-cmd-register-new-commands.md` (its two `19 → 21` clauses and its
+  `Files to Touch` line). §4; `.beads/GI-11/br-GI-11-09`.
+- **Convergence.** The header is set to **v15 / `status=converged`** and the `**Status**` field to
+  `converged`, following GI-1's convention (the `<!-- version=N status=converged -->` header marker). The
+  stamp is earned, not asserted this round: the window was already closed by **two consecutive clean
+  reviewed rounds (9 and 10)**, and round 11 is the confirming round — it raised no BLOCKER and no
+  MAJOR, so the window stays closed and the plan is declared converged.
+
+### v14 — round-10 review + conductor overrides (author; review-pending, window 2 of 2)
+
+- **F10.1 (MINOR)** — `.beads/GI-11/br-GI-11-07-fix-config-body-cap-default.md`'s Rationale carried the
+  RC-C population §2 has disowned ("4,873 proxy rows: 2,845 (58%) over 256 KB, 106 over 1 MB"). It now
+  carries §2's dated base and cells: **6,088** proxy rows carrying a `Content-Length`
+  (2026-09-22T09:06Z), **3,554 (58%)** over 256 KB, **117** over 1 MB, **0** over 2 MB, largest
+  **1,246,222 bytes**, and the responses side **768 of 6,114 (12.6%)**; the "58% of calls against 12%
+  of responses" prose is kept unchanged. `.beads/GI-11/br-GI-11-07`.
+- **F10.2 (MINOR → PARTIAL, conductor override OV-1)** — §3's "no transcript line" bullet is
+  **disambiguated**, not renumbered: the population is now named (`/v1/messages` calls with no
+  transcript line), so the **659** figure can be re-measured the same way. The conductor measured the
+  disputed population on the plan's own 2026-09-22T09:06Z snapshot: the `/v1/messages` reading is
+  **659** rows / 32,019,460 tokens (the all-paths reading is 828 rows / the identical 32,019,460
+  tokens — the extra 169 `count_tokens`/`api/hello`/`/` rows carry no tokens). **No number changes;
+  828 is not written into the plan.** §3.
+- **OV-2 (conductor)** — §3's all-source token total is corrected to the snapshot its sentence
+  asserts: **297,080,674 → 297,172,779** (2026-09-22T09:06Z; proxy 209,153,629 + jsonl 88,019,150 over
+  2,864 rows). The `209,153,629` half of the same bullet was measured correct and stands; the
+  `183,854,144` DeepSeek-side figure is external (an invoice number, not a store measurement) and
+  stands; the ~25.3 M residual is the proxy-vs-DeepSeek difference and is unaffected. §3.
+- **F10.3 (NIT)** — `.beads/GI-11/br-GI-11-05-feat-store-reflag-backfill.md` named the retired symbol
+  `cc0_before` in relation 2; it now reads `baseline_cc0 + W + R + H = scope_total`, matching §5 #3's
+  one symbol. The bead's dated all-time illustration (316 / 2,865 / 138 / 2,221 / 5,540 — a labelled
+  *dated illustration of magnitude and sign*) is unchanged. `.beads/GI-11/br-GI-11-05`.
+- **Conductor overrides OV-1–OV-4** were applied verbatim; the reconciliation is recorded in
+  `review/round-10/triage.md`.
+  - **OV-1** — F10.2 is PARTIAL and its number does not change: the plan's **659** is the
+    `/v1/messages` reading of "calls" on the plan's own 2026-09-22T09:06Z snapshot (conductor-measured:
+    659 rows / 32,019,460 tokens); the disambiguation is the only edit, and **828 is not written**.
+  - **OV-2** — §3:177's figure is updated to **297,172,779** so it matches the date the sentence
+    asserts.
+  - **OV-3** — `br-GI-11-07`'s Rationale carries §2's dated base and cells; no other bead touched.
+  - **OV-4** — `br-GI-11-05`'s `cc0_before` is unified to `baseline_cc0`; its dated illustration
+    stands.
+- The header is set to **v14 / `status=review-pending`** (window 2 of 2); no `status=converged` stamp
+  is written — the confirming round is not the author's to run.
+
+### v13 — round-9 review + conductor overrides (author; review-pending, window 1 of 2)
+
+- **F9.1 (MINOR)** — §6's `float64 accumulation` row no longer frames `$3.46` as an acceptance
+  *target*. v12 removed the day-total-as-target class; the row now states the **per-row** comparison
+  (§5 #1 re-runs `Compute` and compares the stored `REAL`), drops the `±$0.05` / "four orders of
+  magnitude" arithmetic (which did not reconcile — float error on a ~$3.46 value is ~1e-15 absolute,
+  ~13 orders below `0.05`), and drops the `2,257`-row scope (the IST day's proxy count) for the
+  reprice's all-time scope. §6.
+- **F9.2 (MINOR)** — the criterion scope is now stated once. §5's preamble and #1/#2 disagreed: the
+  preamble windowed #1 and #2 to the IST day, while #1's subject was the **all-time** reprice scope and
+  #2 read a session's **all-time** `SUM` (`reconcileSessionTx` aggregates with no date predicate,
+  [store.go:731-733](../../internal/store/store.go#L731-L733)). #1 now reads "**every row the reprice
+  priced**" and #2 "the session's own all-time `SUM`"; the preamble states the window **bounds no
+  criterion** and survives only as the window the dated illustrations are drawn over. §5.
+- **F9.3 (MINOR)** — §5 #3's second relation now names its source: it is evaluated with **§8's
+  four-bucket query** (the same witness predicate, so the two cannot drift), and `scope_total` is that
+  query's row count over the same union scope. `clens reflag --dry-run` prints only **three** buckets
+  (`flipped`/`already honest`/`residual`, br-GI-11-05) and carries neither `H` nor `scope_total`, so the
+  three-bucket print is now stated as the **first** (flip) relation's baseline only. One symbol
+  (`baseline_cc0`) is used for the cc=0 count in both relations — it was `cc0_before` in relation 2.
+  §5.
+- **F9.4 (MINOR)** — the plan's own record no longer contradicts §5 #1. The v12 change-history entry
+  described #1 as "the rows the reprice wrote equal the exact recomputation over those same rows" — the
+  *subset* framing §5 explicitly rejects ("not by asking which rows the run wrote, which is unanswerable
+  after the fact"). It is reworded to §5's form (every in-scope row recomputed and compared; a row whose
+  value did not move satisfies the relation trivially). The same framing is repeated downstream in
+  `br-GI-11-02`'s "Integration Tests" bullet and is reworded identically there — leaving it would have
+  let the contradiction survive the plan. §Change History (v12); `.beads/GI-11/br-GI-11-02`.
+- **F9.5 (MINOR)** — §5 #1 states that its recompute reconstructs `usage.TTLUnknown` from the row's
+  `cost_source` label when it is `approximate:cache_ttl_unknown`, i.e. it reuses the reprice's own
+  input-reconstruction rule (§4). Without it, an acceptance recomputing from the stored columns alone
+  would read a correct reprice as a miss on exactly the rows §4 puts in scope. Stated **with its
+  caveat**: the reconstruction is **vacuous on the 2026-09-22T09:06Z store** (`cost_source` is `shipped`
+  48,477 / `unpriced` 198, zero `approximate:*`), but it is a correctness gap that would bite the moment
+  an `approximate:cache_ttl_unknown` row exists — the zero-row fact is **not** a reason to skip it. §5.
+- **F9.6 (NIT)** — §1 and §8 now state the same non-snapshot class list. §1 said "the only figures here
+  that are *not* snapshots are DeepSeek's invoice figures"; §8 (v12) added "and the arithmetic derived
+  from the captured tokens themselves". §1's sentence gains that second class. §1.
+- **Conductor overrides O1–O4** were applied verbatim; the reconciliation is recorded in
+  `review/round-9/triage.md`.
+  - **O1** — #1's recompute scope is "every row the reprice priced"; `unpriced` rows are **out of
+    scope** for the recompute relation (their inputs cannot be reconstructed, so the clause cannot be
+    evaluated for them) and are checked only for having been **left untouched** (stored cost and
+    `cost_source` unchanged). The load-bearing "not the rows the run wrote" reasoning is **kept**.
+  - **O2** — §3's stale `2,802 / 401` decomposition (undated) is replaced by the **2026-09-22T09:06Z**
+    re-measurement of a `VACUUM INTO` copy: the IST day 2026-09-21's proxy rows total **2,426** =
+    2,257 `/v1/messages` + 144 `/v1/messages/count_tokens` + 25 other (24 `/api/hello` + 1 `/`). The
+    load-bearing half — 2,257 `/v1/messages` = the proxy's row count, so the day's client requests are
+    100% captured — stands. §3's other live-store counts are dated to the same snapshot (`events` =
+    48,675).
+  - **O3** — §2's RC-C table is dated (2026-09-22T09:06Z, over the **6,088** proxy rows that carry a
+    `Content-Length`): over-256 KB **3,554** (58.4%), over-1 MB **117**, over-2 MB **0**, largest
+    **1,246,222**, mean **351,394**, responses at the cap **768** (of 6,114 = 12.6%). The counting
+    sentence's base is corrected (**6,088**, not "4,873 proxy rows" — a different population). §5 #4's
+    cross-reference moves **599 → 768**; §8's RC-C query output is re-labelled to the same snapshot.
+  - **O4** — the header is set to **v13 / `status=review-pending`** (window 1 of 2): round 9 was clean,
+    but this round's edits have not been reviewed, so the plan is **not** converged. The
+    `status=converged` stamp is not written this round — it is earned by two consecutive clean reviewed
+    rounds, not by the author.
 
 ### v12 — acceptance becomes a relation, not a literal (author; post-convergence)
 
@@ -876,9 +1026,10 @@ SELECT SUM(n > 262144), SUM(n > 1048576), SUM(n > 2097152), MAX(n), CAST(AVG(n) 
   so an acceptance criterion pinned to a count is a claim about a moving target.
 - **The fix: every acceptance criterion is now a relation between two measurements on one snapshot**,
   checkable without knowing today's numbers, with the baseline measured **immediately before** the step
-  runs. #1 asserts the rows the reprice wrote equal the exact recomputation over those same rows (a row
-  added later was priced at insert and was never in scope, so it cannot move the comparison), with the
-  invoice agreement **reported, not gated**. #3 asserts `cc0_after = baseline_cc0 + W` and that the
+  runs. #1 asserts every in-scope row of the snapshot is recomputed and compared — **not** the rows the
+  run wrote, which is unanswerable after the fact (a row added later was priced at insert and was never
+  in scope, so it cannot move the comparison; a row whose value did not move satisfies the relation
+  trivially), with the invoice agreement **reported, not gated**. #3 asserts `cc0_after = baseline_cc0 + W` and that the
   report's four buckets **partition** the scope total — both readable off one snapshot. §8's own rule
   ("the reproducible artifact is the query, not the number") now explicitly covers §5, and names the
   only figures in the document that are *not* snapshots: DeepSeek's invoice (§1) and the arithmetic
