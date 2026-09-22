@@ -22,7 +22,11 @@ import (
 )
 
 const (
-	defaultBodyCapBytes  = 262144
+	// Matches config.Default().BodyCapBytes. This is the consumer's own
+	// fallback for a Consumer whose cap seam was never wired, so the two must
+	// move together: a fallback that disagreed with config would silently
+	// truncate at a different size than `clens doctor` reports.
+	defaultBodyCapBytes  = 2097152
 	defaultBatchSize     = 50
 	defaultFlushInterval = 250 * time.Millisecond
 	defaultShutdownGrace = 2 * time.Second

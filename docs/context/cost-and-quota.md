@@ -69,16 +69,31 @@ caveat survives into the stored row instead of being rounded away.
 `prices` is append-only — a rate change is a new `(model, effective_from)` row, and the row in
 force for an event is the one with the greatest `effective_from ≤ started_at`.
 
-### Exact money, rounded per token class
+### Exact money, rounded at display
 
 Every rate is an exact `*big.Rat` **dollars per token**, never a float. A class costs
-`tokens × rate`; `batch` halves it and the peak multiplier scales it; then **each class is rounded
-to cents before the sum**
-([pricing.go:112-134](../../internal/pricing/pricing.go#L112-L134)). Multiplying the already-rounded
-total instead would drift — the same hazard `TestComputeBatchRoundsPerClass` guards on the batch
-half. Rates enter the shipped table as decimal USD strings per million tokens
-(`perMTok("0.15")`), which **panics at init** on an unparseable literal rather than silently
-pricing at zero.
+`tokens × rate`; `batch` halves it and the peak multiplier scales it; `Compute` **sums the classes
+exactly and rounds nowhere** ([pricing.go:116-138](../../internal/pricing/pricing.go#L116-L138)).
+The rounding happens at the edges and only there: the stored `REAL` column is a `float64` and is
+therefore approximate by construction, and each display path formats the value it prints
+(`$%.4f` in [internal/cli/format.go](../../internal/cli/format.go), `toFixed(2)` in the dashboard).
+
+**Per-class cent rounding inside `Compute` was the defect GI-11 removed**, and it is worth knowing
+why, because the shape looks reasonable until you count the calls. Four sub-cent classes that each
+round to `$0.00` sum to `$0.00`, so a call whose true cost is `$0.006` was stored as exactly zero —
+and on a DeepSeek workload of small cached calls that is not an edge case, it is the whole tail of
+the distribution. Rounding the *total* instead of each class is the same hazard in a subtler form:
+`TestComputeBatchHalvesExactly` and `TestComputePeakMultipliesExactly` guard the batch and peak
+halves of it, and `TestComputePricesSubCentClassesExactly` is the direct inversion — every class
+priced below a cent, asserting the result is non-zero and exact.
+
+The exactness is also why the peak multiplier is applied per class at
+([pricing.go:130-136](../../internal/pricing/pricing.go#L130-L136)) rather than to the running
+total. With no rounding anywhere, drift is the only remaining risk, and a float accumulation is
+exactly how it would arrive.
+
+Rates enter the shipped table as decimal USD strings per million tokens (`perMTok("0.15")`), which
+**panics at init** on an unparseable literal rather than silently pricing at zero.
 
 ### Peak and off-peak
 
@@ -94,10 +109,11 @@ ones — an unconditional multiply would double every Claude cost
 | Days | Monday–Friday, excluding the off-peak dates |
 | Off-peak dates | the 33 bundled **2026** Chinese public holidays |
 
-`IsPeak(at)` ([:52](../../internal/pricing/pricing.go#L52)) checks in that order: weekend in UTC →
+`IsPeak(at)` ([:59](../../internal/pricing/pricing.go#L59)) checks in that order: weekend in UTC →
 false; date in `OffPeakDates` → false; hour inside a span → true. `Compute` resolves `peak`
-**once per call** and applies it per class immediately before that class's single `roundHalfUp`
-([:106-134](../../internal/pricing/pricing.go#L106-L134)).
+**once per call** and applies it as one exact multiplication on each class's own `big.Rat` cost
+([:114-136](../../internal/pricing/pricing.go#L114-L136)) — never to the running total, and with no
+rounding on either side of it.
 
 Two things to know before touching the date list:
 
@@ -107,7 +123,7 @@ Two things to know before touching the date list:
 - **It is configurable.** The bundled list and the peak hours can be replaced or cleared from
   config — see the config knobs in [build-and-run.md](build-and-run.md).
 
-`PeakComputer` ([:153](../../internal/pricing/pricing.go#L153)) is an **optional** interface —
+`PeakComputer` ([:157](../../internal/pricing/pricing.go#L157)) is an **optional** interface —
 `PeakAt(model, at) bool` — implemented by `Table` and `*Loader` and pinned by a compile-time
 assertion. It is separate from `Compute` so widening the pricing seam does not force every fake
 behind `PriceComputer` to change; a pricer not implementing it simply yields no `peak_pricing`

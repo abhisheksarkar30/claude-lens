@@ -12,12 +12,12 @@ rejected design stores metadata and token counts only, which is safer and cannot
 Storing bodies means the database holds every prompt and every file the agent read. That is the
 whole privacy posture of the tool, and it is a deliberate trade rather than an oversight.
 
-**Decision:** Capture **full request and response bodies by default**, bounded by a 256 KB cap, with
-an explicit policy to narrow it:
+**Decision:** Capture **full request and response bodies by default**, bounded by a 2 MB cap
+(`--body-cap-bytes`, default `2097152`; `262144` before GI-11), with an explicit policy to narrow it:
 
 | `--body-policy` | Behaviour |
 |---|---|
-| `full` (**default**) | body captured whole, up to `--body-cap-bytes` |
+| `full` (**default**) | body captured whole, up to `--body-cap-bytes` (2 MB) |
 | `off` | no body captured; the **call is still recorded** (br-GI-7-09) |
 
 There were three values, and the third was `truncated` — accepted by `Validate` and read nowhere, so

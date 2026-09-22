@@ -152,10 +152,17 @@ These are mechanical properties enforced by tests, not review habits:
 | `internal/api` and `internal/web` never import `internal/secret` **at all** — including test files | [internal/api/importguard_test.go](../../internal/api/importguard_test.go) |
 | …nor `internal/config` or `internal/ingest` (non-test files) | the same guard, plus [internal/cli/serve_test.go](../../internal/cli/serve_test.go) |
 | `internal/proxy` imports only `sink` and `config` | [internal/proxy/importguard_test.go](../../internal/proxy/importguard_test.go) |
+| `internal/store` never imports `internal/pricing` (non-test files; the guard skips `_test.go` on purpose, so a test may use a real rate table) | [internal/store/importguard_test.go](../../internal/store/importguard_test.go) |
 
 A route that must write a credential reaches it through an **injected function-value seam**
 (`SetCredentialWriter` → `secret.Save`), so there is no import edge a future handler could reach one
 back through. An unwired seam answers `503`, never an empty result.
+
+The store/pricing rule is the same seam in the other direction, and it is the one a reader is most
+likely to mistake for an oversight: `Store.RepriceCosts` needs to price rows, and it takes a
+`PriceComputer` argument rather than importing the rate table. The reason is directional — the store
+is the single-writer transaction, the pricing table is a leaf, and an import edge between them would
+make the write path depend on the cost catalogue. See [conventions.md](conventions.md) §Layering.
 
 ## Untrusted rendering (the dashboard)
 

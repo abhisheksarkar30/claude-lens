@@ -181,6 +181,12 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	// it costs nothing in visibility, because a differing pair is still
 	// reported through `mismatch` above. Pinned by a test so a later change
 	// to it is a decision rather than a side effect.
+	//
+	// This comment governs the *pick* and nothing else. The surviving row's
+	// own capture_complete flag is a separate question with a separate rule,
+	// derived from the bodies the row ends up holding (see the derivation
+	// after the body backfill below) -- the pick reading the two input flags
+	// never decides what the merged row reports about its own bodies.
 	winner := existing
 	switch {
 	case existing.CaptureComplete && incoming.CaptureComplete:
@@ -238,7 +244,12 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	merged.ServiceTier = winner.ServiceTier
 	merged.Speed = winner.Speed
 	merged.ModelResolved = winner.ModelResolved
-	merged.CaptureComplete = existing.CaptureComplete || incoming.CaptureComplete
+	// CaptureComplete is deliberately NOT assigned here. It is downstream of
+	// the body backfill below, not of the winner pick, and the two can
+	// legitimately disagree -- where they do, the bodies win. The `||` that
+	// stood on this line turned a truncated proxy capture into a complete one
+	// while the merged row kept the truncated body, which is the laundering
+	// this whole story exists to remove.
 
 	// first_source and session_id are never rewritten by a merge.
 	merged.FirstSource = existing.FirstSource
@@ -320,12 +331,29 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	}
 	merged.ReqHeaders = preferNonEmpty(existing.ReqHeaders, incoming.ReqHeaders)
 	merged.RespHeaders = preferNonEmpty(existing.RespHeaders, incoming.RespHeaders)
+	// Which side supplies each retained body, read as the backfill decides it.
+	// The two bodies are backfilled independently, so the request body's owner
+	// need not be the response body's, and the capture_complete derivation
+	// below needs to know which -- a single row-level bool cannot say *which*
+	// body was cut.
+	bodySides := 0
 	if len(existing.ReqBody) == 0 {
 		merged.ReqBody = incoming.ReqBody
+		if len(incoming.ReqBody) > 0 {
+			bodySides |= bodyFromIncoming
+		}
+	} else {
+		bodySides |= bodyFromExisting
 	}
 	if len(existing.RespBody) == 0 {
 		merged.RespBody = incoming.RespBody
+		if len(incoming.RespBody) > 0 {
+			bodySides |= bodyFromIncoming
+		}
+	} else {
+		bodySides |= bodyFromExisting
 	}
+	merged.CaptureComplete = captureCompleteFromBodies(existing.CaptureComplete, incoming.CaptureComplete, bodySides)
 	// The proxy-only prefix/replay columns the JSONL side structurally cannot
 	// supply (br-GI-9-04, plan §3 F12.2). mergeEvents assigns none of them --
 	// they ride `merged := *existing` -- so on the *live* ordering the proxy
@@ -361,6 +389,42 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	merged.TranscriptRole = preferNonEmpty(existing.TranscriptRole, incoming.TranscriptRole)
 
 	return &merged, mismatch
+}
+
+// The two sides a retained body can come from, as a bit set: a merged row can
+// hold a request body from one side and a response body from the other, so the
+// owners are a set and not a choice. No body at all is the zero value.
+const (
+	bodyFromExisting = 1 << iota
+	bodyFromIncoming
+)
+
+// captureCompleteFromBodies derives the merged row's own flag from the bodies
+// it holds, by the owner(s) that supplied them.
+//
+// A single row-level bool cannot say *which* body was cut, so an exact answer
+// is impossible and the rule has to state which way it errs. It errs toward
+// false deliberately, and the asymmetry is the whole argument: a spurious
+// cc=0 is a visible, honest over-report -- an incomplete flag on a row that
+// was whole -- while a spurious cc=1 is exactly the laundering this replaced,
+// where the `||` turned a truncated proxy capture into a complete one while
+// the row kept the truncated body.
+//
+// When the two retained bodies have different owners the row is complete only
+// if BOTH contributing sides were, hence the `&&` and never the `||`. When the
+// row holds no body at all it keeps existing's flag, which is what keeps the
+// --body-policy off row (no bodies, flag true) honest.
+func captureCompleteFromBodies(existing, incoming bool, bodySides int) bool {
+	switch bodySides {
+	case bodyFromExisting:
+		return existing
+	case bodyFromIncoming:
+		return incoming
+	case bodyFromExisting | bodyFromIncoming:
+		return existing && incoming
+	default:
+		return existing
+	}
 }
 
 // usageObserved reports whether a row carries any measured token count at all.

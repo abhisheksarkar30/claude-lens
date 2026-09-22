@@ -294,8 +294,14 @@ func TestMergePrecedenceTruncatedVsComplete(t *testing.T) {
 	if got.InputTokens != 500 || got.OutputTokens != 250 {
 		t.Errorf("tokens = %+v, want the complete capture's (500/250)", got)
 	}
-	if !got.CaptureComplete {
-		t.Error("CaptureComplete = false after merging in a complete capture, want true")
+	// Inverted by GI-11. This assertion used to read `want true`, pinning the
+	// `||` that laundered the flag. The merged row keeps *existing*'s bodies --
+	// the backfill only fills an empty cell, and existing's are non-empty -- so
+	// the row holds a truncated capture and must say so. The complete capture
+	// still wins the tokens above; the flag is a separate question, answered by
+	// the bodies the row actually ends up holding.
+	if got.CaptureComplete {
+		t.Error("CaptureComplete = true after merging a complete capture into a row that keeps the truncated body, want false")
 	}
 
 	warnings, err := st.EventWarnings(ctx, id1)
@@ -838,15 +844,27 @@ func TestMergeFillsTranscriptColumnsBothWays(t *testing.T) {
 // The write order is load-bearing and is why the proxy row is second: with the
 // jsonl row second both orderings pick it, and the test would pass whether the
 // flag changed or not.
+//
+// The jsonl side carries **no** bodies, which is what a real JSONL row looks
+// like (internal/jsonlogs writes none) and is also what makes this test's flag
+// assertion mean something. `fullEvent` sets both `ReqBody` and `RespBody`, so
+// a fixture built from it gives the transcript bodies no transcript can supply:
+// the merged row would then take *those* bodies, the flag would follow them to
+// existing's `true`, and the assertion below would hold for a reason the
+// production pipeline can never produce. With the seats corrected the proxy's
+// truncated bodies are the ones that survive, and GI-11's rule -- the flag
+// follows the bodies -- reports the row as incomplete.
 func TestMergePrefersTheWhollyCapturedRowOverATruncatedRequest(t *testing.T) {
 	st := newTestStore(t)
 	ctx := context.Background()
 
-	// The transcript's own record of the request: whole.
+	// The transcript's own record of the request: whole, and body-less, as
+	// every jsonl row is.
 	jsonl := fullEvent("req-gi7-merge-trunc")
 	jsonl.Source, jsonl.FirstSource = "jsonl", "jsonl"
 	jsonl.CaptureComplete = true
 	jsonl.InputTokens, jsonl.OutputTokens = 111, 55
+	jsonl.ReqBody, jsonl.RespBody = nil, nil
 	if _, _, err := st.InsertEvent(ctx, jsonl); err != nil {
 		t.Fatalf("InsertEvent jsonl: %v", err)
 	}
@@ -870,8 +888,11 @@ func TestMergePrefersTheWhollyCapturedRowOverATruncatedRequest(t *testing.T) {
 		t.Errorf("tokens = %d/%d, want the wholly-captured row's 111/55: a request-truncated "+
 			"capture must not win the pick", got.InputTokens, got.OutputTokens)
 	}
-	if !got.CaptureComplete {
-		t.Error("merged CaptureComplete = false, want true: one side captured the request whole")
+	if len(got.ReqBody) == 0 {
+		t.Fatal("merged row holds no request body; the fixture no longer puts the proxy's truncated body on the survivor")
+	}
+	if got.CaptureComplete {
+		t.Error("merged CaptureComplete = true, want false: the survivor's body came from the truncated capture")
 	}
 }
 
@@ -1006,5 +1027,187 @@ func TestMergeStillWarnsOnATrueDisagreement(t *testing.T) {
 	if !found {
 		t.Errorf("no source_mismatch for two complete captures that disagree on tokens; "+
 			"got %d warnings", len(warnings))
+	}
+}
+
+// TestMergeCaptureCompleteFollowsTheBodies pins the rule br-GI-11-04 replaced
+// the `||` with, on all seven body-ownership shapes at once.
+//
+// The rule is a statement about the row's own bodies: the surviving flag is the
+// flag of whichever side supplied each body the row retains, and when the two
+// retained bodies have different owners it is the `&&` of the two -- complete
+// only if both contributing sides were. It errs toward false, deliberately: a
+// false zero is a visible over-report, a false one is the laundering this
+// replaced.
+//
+// Three of the seven are also pinned end-to-end through the real insert path,
+// which is the stronger form and where they belong: case 1 and the both-sides
+// case 5 by TestMergePrecedenceTruncatedVsComplete, and case 3, the rekey
+// collision, by TestMergePrefersTheWhollyCapturedRowOverATruncatedRequest.
+// They are repeated here because the rule is one rule and reading it in one
+// table is what makes the other six comprehensible.
+//
+// Case 7 is the one no production path builds: a request_id has exactly one
+// proxy row and a jsonl row carries no body, so nothing hands one body from
+// each side to a single merge. It is pinned anyway, by a direct call on
+// constructed inputs, because the rule is conservative *so that* the shape errs
+// to false if it ever becomes reachable -- and because the two bodies are
+// backfilled independently, which is exactly what would allow it.
+func TestMergeCaptureCompleteFollowsTheBodies(t *testing.T) {
+	body := []byte(`{"a":1}`)
+
+	// side builds a row with the given bodies and flag. A nil body means the
+	// side supplied none for that column.
+	side := func(source string, complete bool, req, resp []byte) *Event {
+		ev := fullEvent("req-bodies")
+		ev.Source, ev.FirstSource = source, source
+		ev.CaptureComplete = complete
+		ev.ReqBody, ev.RespBody = req, resp
+		return ev
+	}
+
+	cases := []struct {
+		name               string
+		existing, incoming *Event
+		want               bool
+	}{
+		{
+			// 1. proxy-first, proxy truncated: the backfill keeps existing's
+			// non-empty bodies, so the row holds a truncated capture.
+			name:     "proxy first, proxy truncated",
+			existing: side("proxy", false, body, body),
+			incoming: side("jsonl", true, nil, nil),
+			want:     false,
+		},
+		{
+			// 2. proxy-first, proxy whole.
+			name:     "proxy first, proxy whole",
+			existing: side("proxy", true, body, body),
+			incoming: side("jsonl", true, nil, nil),
+			want:     true,
+		},
+		{
+			// 3. the rekey collision: existing is the JSONL taker with no
+			// bodies, incoming is the proxy row holding them. This is the
+			// shape the old assignment site got wrong -- it read existing's
+			// pre-merge bodies, found none, and fell through to existing's
+			// flag, the JSONL row's true.
+			name:     "jsonl taker takes the proxy's bodies",
+			existing: side("jsonl", true, nil, nil),
+			incoming: side("proxy", false, body, body),
+			want:     false,
+		},
+		{
+			// 4. --body-policy off: no bodies at all on either side, so the
+			// row keeps existing's flag. Nothing was narrowed, so true is
+			// honest rather than laundering.
+			name:     "body policy off, no bodies either side",
+			existing: side("proxy", true, nil, nil),
+			incoming: side("jsonl", true, nil, nil),
+			want:     true,
+		},
+		{
+			// 4b. The no-body branch's *direction*: with no body to consult,
+			// the row keeps existing's flag rather than adopting the
+			// incoming one. Both rows are complete in case 4, so it cannot
+			// tell the two apart; this pair can, and the choice of survivor
+			// is the same rule the rest of the merge follows -- the
+			// first-written side keeps what it has.
+			name:     "body policy off, the two flags disagree",
+			existing: side("proxy", true, nil, nil),
+			incoming: side("jsonl", false, nil, nil),
+			want:     true,
+		},
+		{
+			// 5. both sides carry bodies: existing's win the backfill, so the
+			// flag follows them.
+			name:     "both sides carry bodies",
+			existing: side("proxy", false, body, body),
+			incoming: side("jsonl", true, body, body),
+			want:     false,
+		},
+		{
+			// 6. an errored proxy row is request-only, not body-less: its
+			// ErrorHandler submits the request body it holds. A single-body
+			// row therefore takes its one body's owner's flag -- a different
+			// shape from case 4, not a restatement of it.
+			name:     "errored proxy row, request only",
+			existing: side("proxy", false, body, nil),
+			incoming: side("jsonl", true, nil, nil),
+			want:     false,
+		},
+		{
+			// 7a. mixed owners, disagreeing: the request body is the whole
+			// side's and the response body the truncated one's, so the `&&`
+			// reports the row incomplete. A `||` would report it complete.
+			name:     "mixed owners, one incomplete",
+			existing: side("proxy", true, body, nil),
+			incoming: side("jsonl", false, nil, body),
+			want:     false,
+		},
+		{
+			// 7b. mixed owners, both complete: the `&&` is not simply "always
+			// false", which the case above alone could not rule out.
+			name:     "mixed owners, both complete",
+			existing: side("proxy", true, body, nil),
+			incoming: side("jsonl", true, nil, body),
+			want:     true,
+		},
+		{
+			// 8. A single owner, complete, whose opposite number was not --
+			// the case that tells the rule apart from a blanket `existing &&
+			// incoming`. Every case above passes under that shortcut; this
+			// one does not, because the incoming side supplied nothing to
+			// consult and its flag must therefore go unread.
+			//
+			// Defensive like case 7: no production path makes a body-less
+			// jsonl row incomplete, since internal/jsonlogs writes no body
+			// and reports true. It is pinned anyway -- a rule that is only
+			// stated where it is reachable is not a rule.
+			name:     "single owner, the other side never contributed",
+			existing: side("proxy", true, body, body),
+			incoming: side("jsonl", false, nil, nil),
+			want:     true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			merged, _ := mergeEvents(c.existing, c.incoming)
+			if merged.CaptureComplete != c.want {
+				t.Errorf("CaptureComplete = %v, want %v", merged.CaptureComplete, c.want)
+			}
+
+			// The invariant the `||` broke, restated as the rule rather than as
+			// a per-case expectation: every retained body came from one side,
+			// and a row reporting itself complete must not be holding a body
+			// whose side was cut. The owner of a column is decided by the
+			// backfill's own test -- existing keeps its body, and only an empty
+			// existing cell takes the incoming side.
+			if !merged.CaptureComplete {
+				return
+			}
+			for _, col := range []struct {
+				name        string
+				existingBdy []byte
+				incomingBdy []byte
+			}{
+				{"req_body", c.existing.ReqBody, c.incoming.ReqBody},
+				{"resp_body", c.existing.RespBody, c.incoming.RespBody},
+			} {
+				var ownerComplete bool
+				switch {
+				case len(col.existingBdy) > 0:
+					ownerComplete = c.existing.CaptureComplete
+				case len(col.incomingBdy) > 0:
+					ownerComplete = c.incoming.CaptureComplete
+				default:
+					continue // the row holds no body in this column
+				}
+				if !ownerComplete {
+					t.Errorf("CaptureComplete = true while %s came from an incomplete capture", col.name)
+				}
+			}
+		})
 	}
 }

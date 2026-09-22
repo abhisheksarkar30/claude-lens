@@ -137,7 +137,11 @@ sequenceDiagram
 - **A disagreement is a finding, not an error:** `source_mismatch` is written and both rows survive
   as one merged row.
 - **Idempotent:** re-ingesting the same JSONL re-merges to the same result. That is what makes
-  `clens ingest --rebuild` the re-pricing path rather than a duplicate-row risk.
+  `clens ingest --rebuild` safe to run rather than a duplicate-row risk — but **it is not the general
+  re-pricing path**, which is what it used to be called here. A re-ingest produces a *JSONL* row,
+  priced with `speed=""` / `serviceTier=""`, and this merge never replaces the proxy's bodies; the
+  rows whose stored cost is wrong are proxy rows, and reaching those is `clens reprice`'s job
+  ([cli-and-tooling.md](cli-and-tooling.md)).
 - **The session a merged row belongs to is the conversation id, not a heuristic group (D7).** The
   proxy now adopts `x-claude-code-session-id` as its stored `session_id` — the id the request already
   carries — instead of the gap-window `s_…` grouping it used before GI#9. A proxy row and its JSONL

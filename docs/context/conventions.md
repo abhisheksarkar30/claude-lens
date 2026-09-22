@@ -26,9 +26,16 @@ The import graph is a set of rules, and each is asserted by a test rather than t
 | `internal/proxy` imports only `sink` and `config` | [internal/proxy/importguard_test.go](../../internal/proxy/importguard_test.go) |
 | `internal/api` and `internal/web` never import `secret` (any file), `config`/`ingest` (non-test files) | [internal/api/importguard_test.go](../../internal/api/importguard_test.go) |
 | The same `config`/`ingest` ban, from the composition root's side | [internal/cli/serve_test.go](../../internal/cli/serve_test.go) |
+| `internal/store` **never** imports `internal/pricing` — it declares its own `PriceComputer` mirror interface and takes a computer as an argument instead (br-GI-11-02) | [internal/store/importguard_test.go](../../internal/store/importguard_test.go) |
 
 The config/ingest half is deliberately asserted in **two** places; the overlap and its justification
 are documented at [internal/api/importguard_test.go:25](../../internal/api/importguard_test.go#L25).
+
+The fourth row is the newest and the one most likely to be "fixed" wrongly: a store method that needs
+to price does **not** get an import. `Store.RepriceCosts` takes a `PriceComputer`, so the write loop
+stays in `internal/store` (where the single-writer transaction is) while the rate table stays in
+`internal/pricing` and the two are joined only at the CLI. The mirror interface is the same seam
+pattern as `SetCredentialWriter` below.
 
 **When the guards fire, the fix is a seam, not an import.** A route that needs `secret` gets
 `SetCredentialWriter`; the composition root does the importing.

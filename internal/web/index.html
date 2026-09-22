@@ -59,6 +59,19 @@
           <option value="api">api</option>
           <option value="subscription">subscription</option>
         </select></label>
+        <!-- The window picker reveals a native input whose type follows the
+             granularity (see mountWindowPicker). "any time" is the default and
+             filters nothing, which is what this tab did before the picker
+             existed. There is deliberately no `custom` option here: this row
+             has no free-text pair for it to reveal, and a selectable entry that
+             filters nothing is a dead control. -->
+        <label>window <select id="c-window-gran" aria-label="window granularity">
+          <option value="">any time</option>
+          <option value="hour">hour</option>
+          <option value="date">date</option>
+          <option value="month">month</option>
+        </select></label>
+        <input id="c-window-value" hidden aria-label="window value">
         <button type="button" id="f-apply">Filter</button>
       </div>
       <div id="calls-table"></div>
@@ -87,6 +100,18 @@
 
   <section class="view" id="view-stats" hidden>
     <div class="row">
+      <!-- Two axes, not one. This select supplies the window (since/until); the
+           `by` select beside it supplies the bucket (granularity=). They
+           compose, and this one is never wired to granularity= -- the API
+           accepts only day|week|month there, so `hour` or `custom` sent as a
+           granularity would 400 on the spot. -->
+      <label>window <select id="s-window-gran" aria-label="window granularity">
+        <option value="custom" selected>custom</option>
+        <option value="hour">hour</option>
+        <option value="date">date</option>
+        <option value="month">month</option>
+      </select></label>
+      <input id="s-window-value" hidden aria-label="window value">
       <label>since <input id="s-since" placeholder="24h or RFC3339"></label>
       <label>until <input id="s-until" placeholder="RFC3339"></label>
       <label>by <select id="s-granularity">

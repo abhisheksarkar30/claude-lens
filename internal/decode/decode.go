@@ -87,9 +87,9 @@ func (c Completeness) String() string {
 // declare an encoding its body no longer has.
 //
 // Decoded output is capped at limit bytes, because the cap internal/proxy
-// applies is on the *compressed* capture: 256KB of brotli can expand to
-// many megabytes, so capping only the encoded form would let the
-// configured per-body cap be exceeded by whatever ratio the upstream chose.
+// applies is on the *compressed* capture: 2MB of brotli can expand to tens of
+// megabytes, so capping only the encoded form would let the configured
+// per-body cap be exceeded by whatever ratio the upstream chose.
 //
 // A body that decodes only partially (the proxy's cap cut the encoded
 // stream short, common for a large streamed response) yields the decoded

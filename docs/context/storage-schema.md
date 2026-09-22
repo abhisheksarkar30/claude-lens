@@ -92,15 +92,58 @@ These are `TEXT` columns, not SQL enums — the valid vocabulary lives in Go and
 | `quota_snapshots.status` | the endpoint's own reported status, stored verbatim | [internal/snapshot](../../internal/snapshot/) |
 | `ingest_state.status` | per-collector outcome; `error` carries the message | [internal/ingest](../../internal/ingest/) |
 
-`events.capture_complete` is a flag rather than an enum: it says whether the capture is whole, or was
-narrowed by the 256 KB cap, or ended without a `message_stop` event. It stays **true** under
-`--body-policy off`, where no body was captured at all — a policy the operator set uniformly is not a
-narrowing, and the flag is what `analyze`'s `stream_incomplete` rule and the merge's precedence both
-key off. **Both bodies count** — a request body cut at the cap clears it just as a response body does (br-GI-7-08). The row
-does *not* record which of the two was cut or which cause applied; a reader that needs to say so
-identifies it by comparing each stored body's length against the cap the process was configured with,
-which the dashboard does and `clens show` does not. `internal/analyze`'s `stream_incomplete` rule
-fires on this flag and therefore states the disjunction rather than naming `message_stop`.
+`events.capture_complete` is a flag rather than an enum: it says whether the capture is whole. It is
+computed from **the two buffers' `truncated` bits alone** —
+`!respBuf.truncated && !st.reqBody.truncated` ([proxy.go:107](../../internal/proxy/proxy.go#L107)) —
+and **both bodies count**: a request body cut at the cap clears it just as a response body does
+(br-GI-7-08). Two consequences follow, and both are easy to get wrong from the outside:
+
+- **It does not encode "the stream ended without a `message_stop` event."** The flag is about teed
+  bytes, not about the SSE framing. `internal/analyze`'s `stream_incomplete` rule fires on
+  `!CaptureComplete && IsStream` ([rules.go:183](../../internal/analyze/rules.go#L183)) and says
+  "truncated, or the stream ended early" because a stored row cannot distinguish the two — that
+  wording is the rule's, not the flag's.
+- **The row does not record which body was cut.** A reader that needs to name one compares each
+  stored body's length against the configured cap, which the dashboard does and `clens show` does
+  not — and that comparison is only as good as the cap not having changed, see the limitation below.
+
+It stays **true** under `--body-policy off`, where no body was captured at all: a policy the operator
+set uniformly is not a narrowing. The flag is what `analyze`'s `stream_incomplete` rule and the
+merge's precedence both key off.
+
+### The merge rule: the flag follows the bodies
+
+`capture_complete` is the one column the cross-source merge cannot simply prefer one side for,
+because the incoming JSONL row's flag describes *a different capture* than the proxy row's. The rule
+([merge.go:417](../../internal/store/merge.go#L417)) is: **the surviving row's flag is the flag of
+the owner(s) of the bodies it actually holds.** One owner's body → that owner's flag. Two owners'
+bodies, one per side → the `&&`, since the row is whole only if both contributing sides were. No body
+at all → `existing`'s flag, which is what keeps the `--body-policy off` row (no bodies, flag true)
+honest.
+
+**The `||` this replaced was RC-B.** It kept an incomplete flag set the moment *either* side was
+complete, so a row could end up carrying the proxy's truncated request body while its flag read
+`true` — a capture that was not whole, recorded as though it were. The direction of the error is
+deliberate: a spurious `false` is a visible, honest over-report on a whole row, while a spurious
+`true` is the laundering itself.
+
+### The marker's known limitation (the cap is not recorded per row)
+
+The at-cap marker compares a stored body's length against **`BodyCapBytes`, the running process's
+configured cap** — not a figure recorded on the row ([api.go:445](../../internal/api/api.go#L445)
+wires it from config into every response, and the dashboard tests `length === e.BodyCapBytes`). So the
+inference is only as good as the cap not having changed.
+
+Raising the default from 262,144 to 2,097,152 therefore silently reclassifies every historical
+at-cap row: a stored body that sat *exactly* at the old cap no longer equals the new one, so the
+marker can no longer name the cap as the cause and falls back to "the row does not record which
+cause" on precisely the rows `clens reflag` has just started flagging honestly. A per-row recorded
+cap would be needed to mark them, and this story does not add one.
+
+**This is a known, accepted limitation, and the authoritative signal is the flag.** The length
+comparison never decides *whether* a capture is complete — `capture_complete` does that, and the
+marker only draws when it is `false`. The comparison decides *which* body to name, and when it cannot,
+the marker degrades to the honest disjunction rather than asserting a cause it cannot see.
 
 ## Token columns
 

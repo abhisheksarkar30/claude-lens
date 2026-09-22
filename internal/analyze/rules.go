@@ -69,9 +69,10 @@ func minimumCacheablePrefixFor(model string) (int, bool) {
 // tools -> system -> messages, so the last breakpoint sits at or before the
 // end), which makes this an over-estimate for an early breakpoint in a long
 // conversation; an over-estimate suppresses the warning rather than
-// inventing one. A truncated body under-estimates, but the 256 KB cap is
-// ~65k tokens, still far above the largest minimum. Swap in a real
-// tokenizer if a genuine prefix ever lands within a few percent of a step.
+// inventing one. A truncated body under-estimates, but even a body cut at the
+// default 2 MB cap is ~520k tokens, still far above the largest minimum.
+// Swap in a real tokenizer if a genuine prefix ever lands within a few percent
+// of a step.
 func markedPrefixTokens(body []byte) int {
 	return len(body) / 4
 }

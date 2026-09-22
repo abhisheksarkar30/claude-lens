@@ -3,7 +3,7 @@
 # CLI & Tooling
 
 One entry point: [cmd/clens/main.go](../../cmd/clens/main.go), a `map[string]func([]string) error`
-of 19 subcommands dispatching into [internal/cli](../../internal/cli/). Every subcommand accepts
+of 21 subcommands dispatching into [internal/cli](../../internal/cli/). Every subcommand accepts
 the same config flag set (`--proxy-addr`, `--dashboard-addr`, `--upstream-url`, `--db-path`,
 `--body-policy`, `--body-cap-bytes`, `--allow-remote`, `--session-gap-minutes`, `--retention-days`,
 `--replay`, `--accounts-path`) — see [build-and-run.md](build-and-run.md).
@@ -16,7 +16,7 @@ An unknown name prints `clens <name>: not implemented yet` and exits non-zero.
 |---|---|---|---|
 | `serve` | `--replay` | **The only long-running command.** proxy + dashboard in one process; owns every goroutine. Blocks until interrupted. | [internal/cli/serve.go](../../internal/cli/serve.go) |
 | `doctor` | — | prints the effective config, the bind addresses, and a PASS/WARN/FAIL per check — including the *observed* protection level of `secrets.toml` and the database's `db_schema` version beside the one this binary knows. `db_schema` reports Open's own outcome, since Open migrates before returning: a skew is refused there, so the check FAILs rather than reporting a mismatch | [internal/cli/doctor.go](../../internal/cli/doctor.go) |
-| `ingest` | `--rebuild` | backfill from Claude Code's JSONL transcripts; `--rebuild` restarts from zero rather than from the byte cursor, which makes it **the re-pricing path** — the re-read merges by `request_id`, so an added rate row or a changed prefix is applied to rows already captured without duplicating them | [internal/cli/ingest.go](../../internal/cli/ingest.go) |
+| `ingest` | `--rebuild` | backfill from Claude Code's JSONL transcripts; `--rebuild` restarts from zero rather than from the byte cursor, so an added rate row or a changed prefix is applied to rows already captured without duplicating them. It is **not** the general re-pricing path (it was described as one before GI-11): a re-read produces a *JSONL* row, priced with `speed=""` / `serviceTier=""`, and the `request_id` merge never replaces the proxy's bodies — so it cannot reach the proxy-only rows. Use `reprice` for stored costs | [internal/cli/ingest.go](../../internal/cli/ingest.go) |
 | `refresh` | — | run every non-proxy collector once. **The cron / Task Scheduler target.** | [internal/cli/refresh.go](../../internal/cli/refresh.go) |
 | `ls` | filters | the call log, newest first | [internal/cli/ls.go](../../internal/cli/ls.go) |
 | `show` | `<id>`, `--body` | one call in full. A `capture` line reads `complete` or `incomplete (truncated, or the stream ended early)` for a proxy row, and `--body` adds the read-path markers: `truncated at the read cap of N bytes`, `decoded only partially: its tail was corrupt`, or `shown raw: it would not decompress`. The wording matches the dashboard's, but the *capture* line does not name which body was cut — the dashboard compares each body's length against the cap, and this line does not. `--body` also prints the request body raw, since no compressed request body is decoded. A row captured under `--body-policy off` reads `complete` and prints no bodies: nothing was narrowed, so there is nothing to mark | [internal/cli/show.go](../../internal/cli/show.go) |
@@ -33,15 +33,32 @@ An unknown name prints `clens <name>: not implemented yet` and exits non-zero.
 | `prices` | — | the effective rate table, plus the edit paths | [internal/cli/prices.go](../../internal/cli/prices.go) |
 | `purge` | `--yes`, `--dry-run` | delete captured rows by age or by the unpriced predicate | [internal/cli/purge.go](../../internal/cli/purge.go) |
 | `rekey` | `--yes`, `--dry-run` | the one-off historical backfill: pass 1 re-keys `proxy:`-synthetic rows from the body id already inside `resp_body`, pass 2 re-attributes proxy rows from the conversation id already inside `req_headers`, pass 3 deletes and re-derives the `jsonl:`-keyed rows whose identity was never stored. `--dry-run` reports N/M/K/L plus the dangling-`replay_of` count and a re-pricing note; run with `clens serve` stopped | [internal/cli/rekey.go](../../internal/cli/rekey.go) |
+| `reprice` | `--yes`, `--dry-run` | re-price stored rows in place from the current rate table: `cost_usd` / `api_equivalent_cost_usd` / `cost_source` are recomputed over **every** event row, and no row is inserted or deleted. Rows whose `cost_source` does not name a reconstructible input set are skipped rather than repriced (`repriceInScope`): `unpriced`, and any `approximate:<reason>` except `cache_ttl_unknown`. The repair for the per-class cent rounding GI-11 fixed — and, unlike `ingest --rebuild`, a path to the proxy-only rows that carry an understated cost. `--dry-run` prints the moved/unchanged/skipped split and writes nothing | [internal/cli/reprice.go](../../internal/cli/reprice.go) |
+| `reflag` | `--yes`, `--dry-run` | re-derive `capture_complete` from a `Content-Length` witness: a stored body that is a strict prefix of the client's declared length flips the flag to `incomplete`. Reports flipped / already honest / residual, where a residual row is one the merge laundered with no witness left to prove it — **not repairable**, and reported rather than guessed at. The matching historical repair for RC-B | [internal/cli/reflag.go](../../internal/cli/reflag.go) |
 
-## The two destructive commands
+## The `--yes`-gated writers: four writers, two destructive
 
-`clens purge` and `clens rekey` delete rows. Both default to the **opposite of destructive**:
+Four subcommands refuse to write without `--yes`, and it is worth keeping the two groups apart,
+because **the shared gate is not a shared property**:
 
-- nothing is deleted without `--yes`
-- `--dry-run` prints what `--yes` would have deleted
+| | Deletes rows? | What it rewrites |
+|---|---|---|
+| `purge` | **yes** | removes captured rows by age or the unpriced predicate |
+| `rekey` | **yes** | pass 3 deletes and re-derives the `jsonl:`-keyed rows |
+| `reprice` | no | `cost_usd` / `api_equivalent_cost_usd` / `cost_source` |
+| `reflag` | no | `capture_complete` |
 
-This is the pattern any future destructive subcommand should follow. `rekey` additionally refuses
+`reprice` and `reflag` delete nothing and insert nothing — they recompute a column from the row's own
+stored inputs, which is why a wrong or unwanted run is repaired by running it again, not by
+restoring a backup. The destructive set is still exactly `purge` and `rekey`, and the comments in
+`internal/cli/purge.go` and `internal/cli/rekey.go` say "two" deliberately.
+
+All four default to the **opposite of destructive**:
+
+- nothing is written without `--yes`
+- `--dry-run` prints what `--yes` would have written
+
+This is the pattern any future subcommand that writes or deletes should follow. `rekey` additionally refuses
 outright (no rows changed, non-zero exit) when its pass-3 precondition fails — every recorded JSONL
 cursor must still name a readable file at least as large as its stored byte offset, and must live
 under the walked root — because pass 3's delete is unconditional over the `jsonl:` prefix and would

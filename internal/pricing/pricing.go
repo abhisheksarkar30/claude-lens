@@ -1,7 +1,14 @@
 // Package pricing computes the per-call cost of a Claude API response.
-// Six token classes are priced independently and rounded per class, then
-// summed — never rounded once on the total — because the per-class figure
-// is the one an invoice line reproduces.
+// Six token classes are priced independently and summed as exact big.Rat
+// values; Compute rounds nowhere. The float64 it returns — the value the
+// cost columns store — is the only approximation, and a caller that wants
+// cents rounds at display time.
+//
+// Rounding inside Compute is what GI-11 removed. A DeepSeek call costs
+// roughly $0.001 split across classes, so rounding each class to a cent on
+// its own priced the whole call at exactly $0.00 however many tokens it
+// carried; on 2026-09-21 that was 2,327 of 2,426 rows. The invoice is a
+// monthly figure, so no per-call cent granularity was ever reproducible.
 package pricing
 
 import (
@@ -69,10 +76,6 @@ func (w *PeakWindow) IsPeak(at time.Time) bool {
 // Table is a rate table keyed by model id.
 type Table map[string]Rate
 
-// centsPerUnit is the rounding granularity Compute uses per class: US
-// cents, matching what an invoice line actually shows.
-var centsPerUnit = big.NewRat(1, 100)
-
 // Compute prices usage against ShippedTable — the convenience entry point
 // matching the plan's literal signature. A caller holding a Loader-backed
 // or edited Table should call Table.Compute directly instead so a user
@@ -104,9 +107,10 @@ func (t Table) Compute(model string, usage parse.Usage, speed, serviceTier strin
 	// documents no per-token Priority rate, so none is asserted here.
 
 	// Peak is resolved once per call and applied per class, in the same place
-	// batch halving sits: two exact multiplications, one rounding. Multiplying
-	// the already-rounded total instead would drift, the same way it would for
-	// batch (TestComputeBatchRoundsPerClass guards that half).
+	// batch halving sits: two exact multiplications on the class's own
+	// big.Rat cost. Multiplying the running total instead would drift, the
+	// same way it would for batch (TestComputeBatchHalvesExactly guards that
+	// half), and with no rounding anywhere drift is now the whole risk.
 	peak := r.Peak != nil && r.Peak.IsPeak(at)
 
 	total := new(big.Rat)
@@ -130,7 +134,7 @@ func (t Table) Compute(model string, usage parse.Usage, speed, serviceTier strin
 		if peak {
 			cost.Mul(cost, r.Peak.Multiplier)
 		}
-		total.Add(total, roundHalfUp(cost, centsPerUnit))
+		total.Add(total, cost)
 	}
 
 	f, _ := total.Float64()
@@ -168,18 +172,6 @@ var (
 func (t Table) PeakAt(model string, at time.Time) bool {
 	r, ok := t[model]
 	return ok && r.Peak != nil && r.Peak.IsPeak(at)
-}
-
-// roundHalfUp rounds r to the nearest multiple of unit (e.g. 1/100 for
-// cents), rounding a tie up. r and unit are always non-negative here (token
-// counts and rates never go negative), so exact-integer round-half-up is
-// floor((2p+q)/(2q)) for scaled = r/unit = p/q in lowest terms.
-func roundHalfUp(r *big.Rat, unit *big.Rat) *big.Rat {
-	scaled := new(big.Rat).Quo(r, unit)
-	p, q := scaled.Num(), scaled.Denom()
-	numerator := new(big.Int).Add(new(big.Int).Lsh(p, 1), q)
-	rounded := new(big.Int).Quo(numerator, new(big.Int).Lsh(q, 1))
-	return new(big.Rat).Mul(new(big.Rat).SetInt(rounded), unit)
 }
 
 // DefaultPath is the user-editable price-override file: a shipped rate

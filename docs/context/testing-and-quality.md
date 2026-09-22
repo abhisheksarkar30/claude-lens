@@ -9,11 +9,15 @@
 | Unit + integration | Go's stdlib `testing` only — no assertion library, no mocking framework | `*_test.go` beside the code | [go.mod](../../go.mod) has no test dependency |
 | End-to-end | none — no suite; one recorded manual run instead | [docs/acceptance.md](../acceptance.md) | the doc states which half could not be run |
 
-**52 test files, 16,634 lines** against 15,526 lines of non-test Go (re-measured on
-`GI-9-merge-jsonl-and-proxy-rows`, which took the count 51 → 52 on one new file —
-[internal/cli/rekey_test.go](../../internal/cli/rekey_test.go); the story's other new cases — the
-identity, session and transcript-key cases in `internal/parse`, `internal/session`,
-`internal/jsonlogs` and `internal/consumer` — went into existing test files). **A count taken
+**56 test files, 18,272 lines** against 16,065 lines of non-test Go (re-measured on
+`GI-11-cost-and-capture-fidelity`, which took the count 52 → 56 on four new files —
+[internal/store/reprice_test.go](../../internal/store/reprice_test.go),
+[internal/cli/reprice_test.go](../../internal/cli/reprice_test.go),
+[internal/store/reflag_test.go](../../internal/store/reflag_test.go) and
+[internal/store/importguard_test.go](../../internal/store/importguard_test.go). `reflag`'s CLI case
+is **not** the fifth: it went into the existing
+[internal/cli/cli_test.go](../../internal/cli/cli_test.go), following the `purge` precedent, and the
+story's other new cases went into existing test files too). **A count taken
 mid-branch is a count of that commit, not of the story** — these were re-measured at the branch's
 final tip. Real components are used
 rather than mocked: tests open a real temp SQLite store, run a real `httptest.Server` upstream, and
@@ -38,7 +42,7 @@ Named for the invariant, not the function — that convention is documented in
 | Readers proceed during a write batch | `TestConcurrentReadersDuringWriteBatch` | [internal/store/store_test.go:623](../../internal/store/store_test.go#L623) |
 | Every warning kind has one spelling, and the README agrees | `internal/analyze/readme_test.go` parses the README's table and compares it to `AllKinds()` | [internal/analyze/readme_test.go](../../internal/analyze/readme_test.go) |
 | Every shipped model has a minimum-cacheable-prefix entry | `TestMinimumCacheablePrefixCoversShippedModels` | [internal/analyze/analyze_test.go](../../internal/analyze/analyze_test.go) |
-| Containment import rules | three guards — see [security-and-permissions.md](security-and-permissions.md) | `internal/{api,proxy}/importguard_test.go`, `internal/cli/serve_test.go` |
+| Containment import rules | four guards — see [security-and-permissions.md](security-and-permissions.md) | `internal/{api,proxy,store}/importguard_test.go`, `internal/cli/serve_test.go` |
 | **The list routes carry no body columns** | `TestListRouteOmitsBodies`, `TestSessionRouteOmitsBodies` — both share `assertNoBodyColumns`, which names all six omitted keys *and* bounds the response at 64 KB, against a 50-row fixture storing 1 MB per blob. The size bound is what makes it non-vacuous | [internal/api/api_test.go](../../internal/api/api_test.go) |
 | **`CaptureComplete` covers both bodies** | `TestCaptureCompleteCoversBothBodies` — request over the cap, request exactly at it, request under it, response over it, and both over it | [internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go) |
 | The migration runner's four paths | `TestMigrateFreshDatabase`, `TestMigrateExistingDatabase`, `TestMigrateHealsAPartialDatabase`, `TestMigrateDoesNotReAddColumnsOnAPartialNewSchema` — see [decisions/007](decisions/007-schema-migrations-by-user-version.md) | [internal/store/store_test.go](../../internal/store/store_test.go) |

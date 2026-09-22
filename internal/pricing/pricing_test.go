@@ -10,16 +10,17 @@ import (
 	"github.com/abhisheksarkar30/claude-lens/internal/parse"
 )
 
-// TestComputeBatchRoundsPerClass (test 7) ports deepseek-lens's
-// TestComputePeakRoundsSumNotTotal to the modifier that actually exists
-// here: batch's x0.5 is applied per class, before rounding, and rounding
-// the discounted total instead gives a different (wrong) answer.
+// TestComputeBatchHalvesExactly is the GI-11 rewrite of the test that used to
+// pin per-class rounding (TestComputeBatchRoundsPerClass). It keeps what that
+// test actually guarded -- the x0.5 lands on each class's own cost, not on the
+// summed total -- and drops the rounding it accidentally also asserted.
 //
-// Fixture: input and output classes each cost exactly $0.01 before the
-// batch discount (1000 tokens x $10/MTok). Halved and rounded per class,
-// each rounds $0.005 up to $0.01, for a sum of $0.02. Halved and rounded
-// once on the $0.02 total instead gives $0.01 -- the two must differ.
-func TestComputeBatchRoundsPerClass(t *testing.T) {
+// Fixture: input and output classes each cost exactly $0.01 before the batch
+// discount (1000 tokens x $10/MTok). Halved, the call is $0.005 + $0.005 =
+// $0.01. Halving the summed total once gives the same $0.01, so the two
+// orderings no longer differ at this size -- what distinguishes them is that
+// the discount is applied at all: undiscounted the fixture is $0.02.
+func TestComputeBatchHalvesExactly(t *testing.T) {
 	table := Table{
 		"test-model": rate("test-model", "10.00", "10.00", "0.20", "shipped"),
 	}
@@ -32,14 +33,42 @@ func TestComputeBatchRoundsPerClass(t *testing.T) {
 	if perClass == nil {
 		t.Fatal("usd = nil, want a priced value")
 	}
-	if *perClass != 0.02 {
-		t.Errorf("per-class-rounded batch total = %v, want 0.02", *perClass)
+	if *perClass != 0.01 {
+		t.Errorf("batch total = %v, want the exact halved 0.01", *perClass)
 	}
 
-	// Rounding the discounted total instead: (0.01 + 0.01) * 0.5 = 0.01,
-	// rounded once -- the value per-class rounding must NOT match.
-	if *perClass == 0.01 {
-		t.Error("per-class rounding produced the same result as rounding the discounted total; fixture no longer distinguishes them")
+	unbatched, _ := table.Compute("test-model", usage, "", "", time.Now())
+	if unbatched == nil || *unbatched != 0.02 {
+		t.Fatalf("unbatched total = %v, want 0.02", unbatched)
+	}
+	if *perClass == *unbatched {
+		t.Error("batch priced identically to no modifier; the x0.5 halving is not being applied")
+	}
+}
+
+// TestComputePricesSubCentClassesExactly is the direct inversion of the
+// behaviour GI-11 removed: a call whose every class is sub-cent must price
+// above zero. 300 tokens x $10/MTok is $0.003 per class, and under the old
+// per-class cent rounding each class became $0.00, so the call stored
+// exactly $0.000000 however many tokens it carried.
+func TestComputePricesSubCentClassesExactly(t *testing.T) {
+	table := Table{
+		"test-model": rate("test-model", "10.00", "10.00", "0.20", "shipped"),
+	}
+	usage := parse.Usage{InputTokens: 300, OutputTokens: 300}
+
+	usd, source := table.Compute("test-model", usage, "", "", time.Now())
+	if source != "shipped" {
+		t.Fatalf("costSource = %q, want shipped", source)
+	}
+	if usd == nil {
+		t.Fatal("usd = nil, want a priced value")
+	}
+	if *usd == 0 {
+		t.Fatal("a call costing $0.003 per class priced at exactly zero; per-class cent rounding is back")
+	}
+	if *usd != 0.006 {
+		t.Errorf("usd = %v, want the exact sum 0.006", *usd)
 	}
 }
 
@@ -430,15 +459,14 @@ func TestIsPeakOffPeakDates(t *testing.T) {
 	}
 }
 
-// T3: the peak analogue of TestComputeBatchRoundsPerClass. The multiplier is
-// applied to the exact per-class cost before the single roundHalfUp, so a
-// fixture where per-class and total-then-multiply disagree must produce the
-// per-class answer.
+// T3, rewritten by GI-11: the peak analogue of TestComputeBatchHalvesExactly.
+// The multiplier is applied to the exact per-class cost, so the peak figure is
+// the exact double of the off-peak one -- and, with no rounding left anywhere,
+// the off-peak call is no longer $0.00.
 //
-// 300 tokens x $10/MTok = $0.003 per class. Doubled before rounding, each
-// class is $0.006 -> $0.01, for $0.02. Doubling the rounded total instead
-// gives round($0.003) x 2 classes x 2 = $0.00 -- the two must differ.
-func TestComputePeakRoundsPerClass(t *testing.T) {
+// 300 tokens x $10/MTok = $0.003 per class. Off peak the call is $0.006;
+// doubled at peak, $0.006 per class, $0.012.
+func TestComputePeakMultipliesExactly(t *testing.T) {
 	table := peakFixtureTable()
 	usage := parse.Usage{InputTokens: 300, OutputTokens: 300}
 
@@ -450,29 +478,33 @@ func TestComputePeakRoundsPerClass(t *testing.T) {
 	if got == nil {
 		t.Fatal("usd = nil, want a priced value")
 	}
-	if *got != 0.02 {
-		t.Errorf("per-class-rounded peak total = %v, want 0.02", *got)
+	if *got != 0.012 {
+		t.Errorf("peak total = %v, want the exact doubled 0.012", *got)
 	}
 
-	// The same call off peak: $0.003 per class rounds to $0.00 each.
+	// The same call off peak: $0.003 per class, summed exactly. The old
+	// per-class cent rounding made this $0.00 -- a priced call stored as free.
 	offAt := fixtureInstant(t, 2026, time.September, 21, 0, 30, time.Monday)
 	off, _ := table.Compute("peak-model", usage, "", "", offAt)
 	if off == nil {
 		t.Fatal("off-peak usd = nil, want a priced value")
 	}
-	if *off != 0.00 {
-		t.Errorf("off-peak total = %v, want 0.00", *off)
+	if *off == 0 {
+		t.Fatal("off-peak total = 0; sub-cent classes are being rounded away again")
+	}
+	if *off != 0.006 {
+		t.Errorf("off-peak total = %v, want the exact 0.006", *off)
 	}
 	if *got == *off {
 		t.Error("peak and off-peak priced identically; the fixture no longer distinguishes them")
 	}
 }
 
-// T3: batch halving and the peak multiplier compose on one call, as two exact
-// multiplications before the single rounding. 600 tokens x $10/MTok = $0.006
-// per class; halving then doubling cancels exactly, leaving $0.006 -> $0.01.
-// Rounding between the two multiplications would give round($0.003) x 2 =
-// $0.00, so this asserts the multiplies are adjacent.
+// T3, rewritten by GI-11: batch halving and the peak multiplier compose on one
+// call, as two exact multiplications on the class's own cost. 600 tokens x
+// $10/MTok = $0.006 per class; halved then doubled cancels exactly, leaving
+// $0.006 -- which is now literally equal to the plain off-peak figure rather
+// than equal only after both sides were rounded to a cent.
 func TestComputePeakAndBatchCompose(t *testing.T) {
 	table := peakFixtureTable()
 	usage := parse.Usage{InputTokens: 600}
@@ -485,8 +517,8 @@ func TestComputePeakAndBatchCompose(t *testing.T) {
 	if batched == nil || plain == nil {
 		t.Fatal("expected priced values")
 	}
-	if *batched != 0.01 {
-		t.Errorf("batch at peak = %v, want 0.01 (a rounding between the two multiplies gives 0.00)", *batched)
+	if *batched != 0.006 {
+		t.Errorf("batch at peak = %v, want 0.006", *batched)
 	}
 	if *batched != *plain {
 		t.Errorf("batch at peak = %v, plain off peak = %v, want equal (halving and doubling cancel exactly)", *batched, *plain)
