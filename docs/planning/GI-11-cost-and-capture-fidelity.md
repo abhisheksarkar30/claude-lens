@@ -1,8 +1,8 @@
 # GI-11 — Cost is rounded to a cent per call, and a truncated capture is recorded as complete
 
-<!-- version=11 status=converged -->
+<!-- version=12 status=converged -->
 
-**Issue**: GI#11 (GitHub) · **Branch**: `GI-11-cost-and-capture-fidelity` · **Beads**: `.beads/GI-11/` · **Plan version**: 11 · **Status**: converged
+**Issue**: GI#11 (GitHub) · **Branch**: `GI-11-cost-and-capture-fidelity` · **Beads**: `.beads/GI-11/` · **Plan version**: 12 · **Status**: converged
 
 ## 1. The report
 
@@ -18,10 +18,12 @@ below is measured, not inferred; the queries are reproduced in §8 so they can b
 while this plan is read — it grew from ~1.47 GB at investigation to ~1.73 GB at the
 **2026-09-22T06:49:41Z** measurement (and keeps growing) — so no count here is eternal fact. The
 **reproducible artifact is the query, not the number**: §8 reproduces every figure, and re-running
-a query on a later day yields that day's number. The figures come in **two classes and must not be
-conflated**: §2/§4/§8's figures below are **live-store snapshots** (orientation), while §5's
-**acceptance** figures are measured against a **frozen copy** at acceptance time and are the ones
-that must hold exactly.
+a query on a later day yields that day's number. **Every figure measured out of the store is in that
+one class** — including §5's acceptance figures, which a `VACUUM INTO` snapshot makes *reproducible*
+but not *permanent*: `jsonlogs` backfills past days and every merge rewrites rows in place, so even a
+fixed past day drifts (this plan watched its own RC-A row count move 2,352 → 2,327). Acceptance is
+therefore written as **relations on a single snapshot** (§5), never as quoted targets. The only figures
+here that are *not* snapshots are DeepSeek's invoice figures, which are fixed for a fixed day.
 
 ## 2. Three root causes
 
@@ -583,41 +585,80 @@ capture main-file pages inconsistent with that WAL. The method, needing **no ser
   three** files — `lens.db`, `lens.db-wal`, `lens.db-shm` — together. Copying the main file alone is
   the trap, and stopping the service is the cost that makes it second choice.
 
-The acceptance figures below are therefore measured against a **consistent snapshot**, which is what
-makes them reproducible at all — and they are the class of number that **must hold exactly**, unlike
-§2/§4/§8's live-store snapshots (§1):
+The acceptance figures below are measured against a **consistent snapshot**, which is what makes them
+reproducible at all. But **the snapshot does not make them hold exactly, and an earlier revision of
+this section claimed it did.** That claim was wrong, and this plan's own history disproves it: the
+RC-A row count over this same *fixed past day* moved from 2,352 to 2,327 during the plan's life. A
+past day is not frozen. `jsonlogs` backfills rows for past days as it ingests transcripts, and every
+cross-source merge rewrites a row in place — `source_refs`, bodies, and (until RC-B lands) the
+completeness flag. So the day's row population is a moving target too.
 
-**The acceptance window is the local IST day 2026-09-21**, written as a half-open `started_at` range
-in unix nanoseconds: `[1789929000000000000, 1790015400000000000)` (start inclusive, end exclusive;
-the two values differ by exactly 86,400 s). Two things this must state plainly: `events` has **no
-`day` column** ([schema.sql:11-66](../../internal/store/schema.sql#L11-L66)); `day` is a derived
-expression, and `clens stats --by day` buckets by **UTC**
+**Every acceptance criterion below is therefore written as a relation between two measurements taken
+on the *same* snapshot**, and is checkable without knowing today's numbers: the baseline is whatever
+the copy reports **immediately before** the step runs. Where a figure appears in parentheses it is the
+**dated illustration** — the magnitude and the sign to expect, §8's class of number, never a target.
+This is §8's own rule ("the reproducible artifact is the query, not the number") applied to acceptance
+as well, and it is the only form that survives a store with a live writer:
+
+**The acceptance window is the local IST day 2026-09-21** — but it applies to **#1 and #2 only**, the
+cost criteria, because that is the day DeepSeek invoiced (§1) and the only thing tying a criterion to a
+date. **#3 and #4 run over the command's own unfiltered scope** (see #3). The window is a half-open
+`started_at` range in unix nanoseconds: `[1789929000000000000, 1790015400000000000)` (start inclusive,
+end exclusive; the two values differ by exactly 86,400 s). Two things this must state plainly: `events`
+has **no `day` column** ([schema.sql:11-66](../../internal/store/schema.sql#L11-L66)); `day` is a
+derived expression, and `clens stats --by day` buckets by **UTC**
 ([store.go:1252](../../internal/store/store.go#L1252) — `DATE(started_at/1e9,'unixepoch')`), so `clens
 stats --by day` does **not** reproduce these figures. The acceptance query is a **direct `events`
 query, not a shipped subcommand**.
 
-1. `SELECT SUM(cost_usd) FROM events WHERE source='proxy' AND started_at >= 1789929000000000000
-   AND started_at < 1790015400000000000` moves from **0.82** to **3.46 ± 0.05**, i.e. within 7% of
-   DeepSeek's 3.25.
+1. **Reprice correctness, as a relation — recompute, don't diff.** For **every row in the reprice's
+   scope** (any row whose `model_resolved` resolves in the effective table, priced or skipped-by-value),
+   the stored figure equals the exact arithmetic recomputation over **that row's own stored token
+   columns** at the table's rates. Check it by recomputing the exact value for every in-scope row of
+   the snapshot and comparing — **not** by asking which rows the run "wrote", which is unanswerable
+   after the fact: the run only writes rows whose value *moved*, and an untouched row satisfies the
+   relation trivially. This is drift-proof — a row added to the day later was priced at insert and was
+   never in the run's scope, so it cannot move the comparison — and it is the actual claim RC-A's fix
+   makes, stated so it can be checked without quoting a total.
+   *Dated illustration (2026-09-22 snapshot): the IST day's `SUM(cost_usd)` over `source='proxy'`
+   moved 0.82 → 3.46.*
+   *Invoice corroboration, reported not gated:* that day's total lands within ~7% of DeepSeek's 3.25
+   (§1's external fact, fixed for a fixed day). It is a magnitude sanity check on a live number, so it
+   is **reported as agreement**, not asserted as a bound that a late-arriving row could break.
 2. **Session rollup (same transaction, F1.1):** for every session the reprice touched, its
    `sessions.total_cost_usd` (and `total_api_equivalent_cost_usd`) is re-derived in the reprice's
    own transaction and moves with the day's `SUM(events.cost_usd)` for that session — assert one
    affected session's stored total equals the post-reprice `SUM` over its `events`, not the pre-fix
    value.
-3. **The honest-truncation count, run after the backfill.** Under the corrected **union** predicate
-   `(source = 'proxy' OR instr(source_refs,'proxy') > 0)` — stated here, not implied, so the step is
-   reproducible — the number of `capture_complete=0` rows in the IST window
-   `[1789929000000000000, 1790015400000000000)` rises from its **baseline of 128** to **1,304**
-   (128 + 1,176) after `clens reflag --yes`. The 128 is *not* 0, and it is **two** populations:
-   **20** unmerged proxy rows that carry a `stream_incomplete` warning (the stream subset §2 counts)
-   **plus 108** non-stream truncations that carry no warning (`ruleStreamIncomplete` requires
-   `IsStream`, [rules.go:182-187](../../internal/analyze/rules.go#L182-L187)) — so the stream subset
-   is not the whole cause. Run the query *before* `reflag` to observe 128 and
-   *after* to observe 1,304. The 1,176 is the count of false-complete rows (`capture_complete=1` yet a
-   stored body that is a strict prefix of its client `Content-Length`) that `reflag` flips; **78 more**
-   were laundered but carry no witness and stay `cc=1` — the honest residual (§4's backfill block).
-   These are the IST-window figures, **not** the all-time figures from §2. This rise is produced by
-   the **backfill**, not by the code fix alone — the code fix only prevents *new* laundering (see #4).
+3. **The honest-truncation count, as a relation — with its baseline taken from the command itself.**
+   Under the corrected **union** predicate `(source = 'proxy' OR instr(source_refs,'proxy') > 0)` —
+   stated here, not implied, so the step is reproducible — the baseline is **read from the command's
+   own `--dry-run`**, not from a hand-written query: `clens reflag --dry-run` prints exactly the three
+   buckets (`flipped` = `W`, `already honest` = `baseline_cc0`, `residual` = `R`) and writes nothing
+   (§4, br-GI-11-06). So the snapshot is measured by **the same code that will do the repair, at the
+   instant before it runs** — which is the only way the number cannot be stale, and the reason this
+   criterion needs no literal at all. Run `--dry-run` on the frozen copy to read the baseline, then
+   `--yes` and compare. The criteria are two relations, both readable off one snapshot:
+   - **the flip is exact:** `cc0_after = baseline_cc0 + W` — the count rises by precisely the rows the
+     witness identifies, no more and no less;
+   - **the buckets partition the scope:** `cc0_before + W + R + H = scope_total`, where `R` is the
+     residual (`cc=1` ∧ a stored `stream_incomplete` warning ∧ no witness) and `H` the healthy
+     remainder — so the report's buckets are a partition of one snapshot, not four loose numbers that
+     happen to be close.
+   **The scope is the command's own** — the union predicate with **no time filter**, because `reflag`
+   repairs all of history and an acceptance windowed narrower than the repair would be checking a
+   subset of what it did. The IST day is a subset of the scope, not the criterion.
+   *Dated illustration (2026-09-22T06:49:41Z snapshot, all-time scope): already honest 316, `W` 2,865,
+   `R` 138, healthy 2,221 — the partition closing at **5,540**. **Re-measure — none of these is a
+   target.***
+   `baseline_cc0` is *not* 0, and it is **two** populations: unmerged proxy rows that carry a
+   `stream_incomplete` warning (the stream subset §2 counts) **plus** non-stream truncations that carry
+   none (`ruleStreamIncomplete` requires `IsStream`,
+   [rules.go:182-187](../../internal/analyze/rules.go#L182-L187)) — so the stream subset is not the
+   whole cause. (Within the IST day those two are 20 + 108 of the day's 128.) `R` is the honest
+   ceiling: rows the `||` laundered that carry no `Content-Length` evidence, **reported rather than
+   guessed** (§4's backfill block). The rise is produced by the **backfill**, not by the code fix
+   alone — the code fix only prevents *new* laundering (see #4).
    The "falls again once the cap is 2 MB" half is **not** runnable against the copied store — a past
    day cannot be re-captured, and §6 says so — so it moves to a check on a **newly captured day** after
    the cap change, in §"Test strategy"'s integration section.
@@ -714,6 +755,12 @@ larger file is not a larger blast radius for secrets.
 Run against a **consistent snapshot** of the live store (`VACUUM INTO`, §5). Read-only; each backs a
 claim above. Every figure below is a **dated snapshot** — the store is live and grows, so the
 reproducible artifact is the **query**, not the number.
+
+**This rule is not confined to this section.** §5's acceptance figures are the same class of number
+and are written as relations on one snapshot for the same reason — a past IST day still moves, because
+`jsonlogs` backfills it and every merge rewrites rows in place. The only figures in this document that
+are *not* snapshots are DeepSeek's invoice figures (§1) and the arithmetic derived from the captured
+tokens themselves; those are fixed. Everything measured out of the store is re-measured, never quoted.
 
 The acceptance window is the **local IST day 2026-09-21**, a half-open `started_at` range in unix
 nanoseconds: `[1789929000000000000, 1790015400000000000)`. There is no `day` column on `events`
@@ -812,6 +859,41 @@ SELECT SUM(n > 262144), SUM(n > 1048576), SUM(n > 2097152), MAX(n), CAST(AVG(n) 
 ```
 
 ## Change History
+
+### v12 — acceptance becomes a relation, not a literal (author; post-convergence)
+
+- **The seam v11 exposed, fixed at its root.** v11 corrected one stale figure. The user's objection is
+  the general form of the same defect: *"that figure will always turn stale — consider the number when
+  we fire the backfill or modify the db, not before."* §5's acceptance criteria were carrying live-store
+  counts as **targets** — `128 → 1,304`, `0.82 → 3.46` — under a preamble claiming they were "the class
+  of number that **must hold exactly**, unlike §2/§4/§8's live-store snapshots". **That claim was
+  false**, and this plan's own history is the disproof: the RC-A row count over the same *fixed past
+  day* moved 2,352 → 2,327 during the plan's life.
+- **Why a past day moves, which is the part that was missing.** The intuition "the window is in the
+  past, so its rows are frozen" is wrong here. `jsonlogs` **backfills** rows for past days as it
+  ingests transcripts, and every cross-source merge **rewrites a row in place** — `source_refs`,
+  bodies, and (until RC-B lands) the completeness flag. The day's row population is a moving target,
+  so an acceptance criterion pinned to a count is a claim about a moving target.
+- **The fix: every acceptance criterion is now a relation between two measurements on one snapshot**,
+  checkable without knowing today's numbers, with the baseline measured **immediately before** the step
+  runs. #1 asserts the rows the reprice wrote equal the exact recomputation over those same rows (a row
+  added later was priced at insert and was never in scope, so it cannot move the comparison), with the
+  invoice agreement **reported, not gated**. #3 asserts `cc0_after = baseline_cc0 + W` and that the
+  report's four buckets **partition** the scope total — both readable off one snapshot. §8's own rule
+  ("the reproducible artifact is the query, not the number") now explicitly covers §5, and names the
+  only figures in the document that are *not* snapshots: DeepSeek's invoice (§1) and the arithmetic
+  derived from captured tokens.
+- **The baseline is now read from the command, not measured by hand.** `clens reflag --dry-run` already
+  prints exactly the three buckets (br-GI-11-06), so acceptance #3 takes its baseline from **the same
+  code that will do the repair, at the instant before it runs** — which is the only form that cannot be
+  stale, and the reason the criterion needs no literal at all.
+- **One acceptance *subject* widens, deliberately, and this is a change:** #3's scope moves from the IST
+  day to **the command's own scope** (the union predicate, no time filter), because `reflag` repairs all
+  of history and an acceptance narrower than the repair would be checking a subset of what it did. The
+  IST day survives as a subset, and as the window for #1, which is the one criterion genuinely tied to a
+  day (DeepSeek's invoice). No mechanism, file list or file changes. v10's convergence stands on the
+  same reasoning as v11: the loop converges on BLOCKER/MAJOR *design* findings, and this is the plan
+  applying its own stated rule to the last place that had escaped it.
 
 ### v11 — Phase 4 polish (author; post-convergence)
 
@@ -966,6 +1048,9 @@ SELECT SUM(n > 262144), SUM(n > 1048576), SUM(n > 2097152), MAX(n), CAST(AVG(n) 
   store** (§1), the **query** is the reproducible artifact (§1, §8), and the two classes of number are
   separated: §2/§4/§8 are live snapshots; §5's **acceptance** figures are measured against a **frozen
   copy** and are the ones that must hold exactly. §1, §2, §4, §5, §6, §8.
+  **Superseded by v12:** the "must hold exactly" half of this was **wrong** — a frozen copy makes an
+  acceptance figure reproducible, not permanent. Even a fixed past day drifts, so §5 is now relations
+  on one snapshot. The rest of F5.3 (snapshot framing, query-as-artifact) stands.
 - **F5.4 (MINOR, conductor directive)** — §4's `merge_test.go` row gains a **seventh, mixed-owner**
   case (request body from one side, response from the other) pinning the **`&&`** (conservative →
   `false`). It is **reachable**: [merge.go:323-328] backfills the two bodies independently, and an
@@ -1035,6 +1120,10 @@ SELECT SUM(n > 262144), SUM(n > 1048576), SUM(n > 2097152), MAX(n), CAST(AVG(n) 
   **because the backfill ran**, never conflating the code fix (prevents new laundering) with the
   backfill (establishes it for history). The "falls again once the cap is 2 MB" half stays on a newly
   captured day. §5.
+  **Superseded by v12:** the *shape* of this rewrite was still wrong — the baseline and target are not
+  literals to re-derive but **relations read off the command's own `--dry-run`**, and #3's scope is now
+  the command's unfiltered scope. The figures above are the v6-era snapshot (compare the later
+  2,865 / 316 / 138): useful history, no longer the definition.
 - **Conductor overrides** for F4.1–F4.6 and the new scope were applied verbatim; the record is in
   `review/round-4/triage.md`.
 
