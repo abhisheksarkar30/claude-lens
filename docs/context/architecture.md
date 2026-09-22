@@ -71,7 +71,12 @@ cold one.
 
 [internal/reconcile](../../internal/reconcile/) compares `proxy`/`jsonl` computed cost against the
 `admin` billed figure; the cross-source merge in [internal/store/merge.go](../../internal/store/merge.go)
-folds a `jsonl` row onto a `proxy` row when they describe the same call.
+folds a `jsonl` row onto a `proxy` row when they describe the same call. It is the only part of the
+ingest pipelines that rewrites an `events` row already written — the other writers of a stored row are
+the two operator repairs, `clens reprice` and `clens reflag`
+([cli-and-tooling.md](cli-and-tooling.md)) — which is why the merge re-derives the row's
+`capture_complete` from the bodies it keeps rather than preferring one side's flag
+(see [storage-schema.md](storage-schema.md) §The merge rule).
 
 Each source runs independently. [internal/ingest](../../internal/ingest/) is the fan-out that
 drives the three **non-proxy** collectors — the proxy is deliberately not one of its collectors,

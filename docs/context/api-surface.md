@@ -69,7 +69,7 @@ full-row reads, and the two SELECTs are derived from one column list so they can
 |---|---|
 | `RespBodyDecoded` | the bytes the view renders — the decoded form when the cap was wired and decoding ran, the raw `RespBody` otherwise. **Equalling `RespBody` does not mean "undecoded"**: that is also true of a body with no `Content-Encoding`. |
 | `RespBodyCompleteness` | `decode.Completeness` as its **integer** value (`0` Complete, `1` TruncatedAtCap, `2` PartialCorrupt, `3` NotDecoded). `app.js` compares those integers; `TestDetailPinsCompletenessWireValue` pins all four spellings. |
-| `BodyCapBytes` | the read cap in force, or **`0` for unwired** — never a zero-byte cap. The view checks this *before* the completeness, so a missing cap cannot manufacture "would not decompress". |
+| `BodyCapBytes` | the read cap in force, or **`0` for unwired** — never a zero-byte cap. The view checks this *before* the completeness, so a missing cap cannot manufacture "would not decompress". It is the **running process's** configured cap, injected on every response and *not* recorded per row — so a view that infers "this body was cut at the cap" by comparing lengths is only as good as the cap not having changed since the row was written. The authoritative signal is `CaptureComplete`; the comparison only names *which* body (see [storage-schema.md](storage-schema.md) §The marker's known limitation). |
 
 Decoding is display-only: nothing here writes back, and replay sends the stored `ReqBody` and
 `RespHeaders` straight from the row.

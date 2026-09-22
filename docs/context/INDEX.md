@@ -208,3 +208,64 @@ than in any other module.
 **A scope note for the next refresh on this machine:** the range for a story is `origin/main..HEAD`,
 not `main..HEAD`. A local `main` that lags the remote silently folds the *previous* story into the
 diff — here, all of GI-7's files appeared under GI-9's range until it was re-scoped.
+
+**2026-09-22 — REFRESH, scoped to `GI-11-cost-and-capture-fidelity`** (beads `br-GI-11-01` … `-11`;
+plan `docs/planning/GI-11-cost-and-capture-fidelity.md` v15). **No module was added or retired and no
+dependency moved** — three Go modules still, ten tabs still, nine ADRs still (see the ADR note below).
+`decisions/` gained no file; 003 was amended in place.
+
+**Two of the eleven beads were docs beads, and between them they moved twelve files** — so this
+refresh's job was the part they did not own. `br-GI-11-10` carried the behaviour docs
+(`cost-and-quota.md` — the rounding section, rewritten and re-linked to
+`TestComputeBatchHalvesExactly`, since the doc linked a test br-GI-11-01 had renamed away;
+`storage-schema.md` — the merge rule and the marker's limitation; `glossary.md`; the privacy doc;
+`decisions/003`). `br-GI-11-11` carried every repeated figure (`cli-and-tooling.md`,
+`testing-and-quality.md`, `INDEX.md`'s three trigger lines, `build-and-run.md`, `dashboard.md`,
+`workflows.md`, `README.md`, `CLAUDE.md`).
+
+**This refresh found three module docs the two beads' own file lists did not reach, all in the same
+class: a rule or figure stated in more than one place, where the beads moved the site they named.**
+
+- **`conventions.md` §Layering and `security-and-permissions.md` §Containment rules both listed the
+  import guards without `internal/store`.** `br-GI-11-02` added the fourth guard — `internal/store`
+  never imports `internal/pricing`, asserted by a new `importguard_test.go` mirroring the proxy's —
+  and neither doc's table gained it, because neither file was in any bead's list. `testing-and-quality.md`
+  still said "**three** guards". All three now say four, and both prose sites state the seam reasoning
+  a reader is most likely to undo: a store method that needs to price takes a `PriceComputer`
+  argument, it does not get an import edge to the rate table.
+- **`architecture.md`'s merge sentence** described the fold without the flag. It now states that the
+  merge re-derives `capture_complete` from the bodies it keeps. Careful reading was required here
+  rather than a wording pass: the obvious phrasing, "the merge is the only path that rewrites an
+  already-written `events` row", **became false during this very story** — `reprice` and `reflag` are
+  two more such writers — which is the failure a refresh would otherwise plant.
+- **`api-surface.md`'s `BodyCapBytes` field** gained the half of its contract the wire carries but the
+  field description omitted: it is the *running* process's cap, injected per response and never
+  recorded per row, so a length comparison against it is only as good as the cap not having changed.
+
+**No new ADR, and the reason is the same one GI-3 gave.** Both of this story's candidate forks —
+exact `big.Rat` arithmetic with rounding only at display, and the merge's flag following the bodies
+with `&&` rather than `||` — have a rejected alternative a future change could reintroduce, which is
+the ADR folder's own test. But neither was a *chosen* fork with a documented alternative: per-class
+cent rounding and the `||` were unexamined defaults that turned out to be defects, and an ADR's value
+is preventing a well-meaning simplification from undoing a deliberate trade. Each rule now has a home
+where its reader already is — `cost-and-quota.md` §Exact money, rounded at display and
+`storage-schema.md` §The merge rule, both naming the rejected side and its cost. Recorded here so the
+next refresh can re-open the question deliberately rather than by accident.
+
+**The story's dominant defect class, worth naming for the next one:** a figure or a rule asserted as a
+constant at more than one site. The subcommand count lived in `cmd/clens`'s test list,
+`cli-and-tooling.md` and `INDEX.md`; the test-file count in `testing-and-quality.md` and `INDEX.md`;
+the JS line count at three sites; the body cap at five. Each was moved by hand, and the only check that
+any of them agree is a grep — nothing in the build can notice. **One class of site deliberately does
+not move:** the dated changelog entries below quote the figures of their day ("19 subcommands",
+"52 test files") and are a record, not a claim about the current tree. Reading those as stale is the
+mistake this note exists to prevent. Two claims were **already false before this story** and were
+corrected in passing rather than carried: `README.md`'s "`clens purge` is the one command that destroys
+data" (false since GI#9's `rekey`), and its command table, which omitted `rekey` entirely.
+
+**Two plan and bead phrasings are deliberately left unsynchronised for the plan's next revision**, and
+both are recorded in the beads rather than here: plan §4's three-option Calls-picker enumeration
+(the mount needs a fourth, neutral `any time`, because a native `<select>` has no unset state and would
+otherwise display a granularity it is not applying) and plan §4/§5's "`--dry-run` is not an argument to
+`Store.RepriceCosts`" (it is). Re-asserting `status=converged` on text no review round has read is
+round 9's finding O4, so the beads carry the corrections instead.
