@@ -130,7 +130,8 @@ func exportCSV(ctx context.Context, w io.Writer, st *store.Store, filter store.E
 		}
 		// The summary projection, not ListEventsFull: rowValues emits the
 		// scalar columns only (see this file's doc comment), so reading the
-		// blobs here would be 256 KB per row to write none of it.
+		// blobs here would be up to a cap per body per row -- 2 MB by default,
+		// twice over -- to write none of it.
 		events, err := st.ListEvents(ctx, page)
 		if err != nil {
 			return fmt.Errorf("export: %w", err)

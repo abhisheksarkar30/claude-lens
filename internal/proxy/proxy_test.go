@@ -79,6 +79,11 @@ func testConfig(upstreamURL string) *config.Config {
 	cfg := config.Default()
 	cfg.UpstreamURL = upstreamURL
 	cfg.BodyPolicy = "full"
+	// Pinned rather than left at config.Default(), so these cases stay
+	// cap-relative: a test that wants the shipped default must ask for it by
+	// name (see TestCaptureCompleteAtTheRealDefaultCap), because otherwise
+	// every proxy assertion would silently change meaning the next time the
+	// default moves.
 	cfg.BodyCapBytes = 262144
 	return cfg
 }
@@ -232,6 +237,67 @@ func TestFailOpenOnUpstreamFailure(t *testing.T) {
 	call := captureOne(t, sk)
 	if call.Err == nil {
 		t.Error("CapturedCall.Err = nil, want the transport failure recorded")
+	}
+}
+
+// TestCaptureCompleteAtTheRealDefaultCap is RC-C's end-to-end form: a request
+// body far past the old cap is captured whole under the shipped default, and
+// the row says so.
+//
+// Built from config.Default() rather than testConfig(), which pins its own cap
+// -- the case is about the value a real install runs with, so overriding it,
+// even to the same number, would make the test agree with itself instead of
+// with the default. RC-C matters because truncation was the norm on the install
+// this story came from: 58% of request bodies exceeded 256 KB and the dominant
+// body is the request, not the response. A revert here shows up as the majority
+// of newly captured calls being flagged incomplete.
+func TestCaptureCompleteAtTheRealDefaultCap(t *testing.T) {
+	// The largest request body the live store holds (measured 2026-09-22T09:06Z),
+	// so the fixture is a real shape rather than a round number.
+	const bodySize = 1_246_222
+
+	// The upstream must read the whole request body before answering, as a real
+	// one does. One that answers immediately makes the reverse proxy stop
+	// relaying the body, so the tee captures a prefix of it -- and because the
+	// cut is not at the cap, bufferTruncated stays false and the row reports
+	// itself complete. The fixture would then be testing the client's pipelining,
+	// not the cap.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Write([]byte(`{"type":"message","usage":{}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := config.Default()
+	cfg.UpstreamURL = upstream.URL
+	cfg.BodyPolicy = "full"
+	if cfg.BodyCapBytes != 2_097_152 {
+		t.Fatalf("the shipped default cap = %d, want 2097152: this case is about the real default", cfg.BodyCapBytes)
+	}
+
+	reqBody := strings.Repeat("x", bodySize)
+	sk := sink.New(16)
+	h, err := New(cfg, sk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxySrv := proxyServer(t, h)
+	defer proxySrv.Close()
+
+	resp, err := http.Post(proxySrv.URL+"/v1/messages", "application/json", strings.NewReader(reqBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	call := captureOne(t, sk)
+	if len(call.ReqBody) != bodySize {
+		t.Errorf("captured ReqBody length = %d, want the whole %d-byte body: a request this size must fit under the default cap",
+			len(call.ReqBody), bodySize)
+	}
+	if !call.CaptureComplete {
+		t.Error("CaptureComplete = false at the real default, want true: nothing was cut")
 	}
 }
 

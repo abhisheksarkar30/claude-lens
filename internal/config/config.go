@@ -28,11 +28,22 @@ type Account struct {
 
 // Config is the effective, fully-resolved configuration for clens.
 type Config struct {
-	ProxyAddr         string
-	DashboardAddr     string
-	UpstreamURL       string
-	DBPath            string
-	BodyPolicy        string // "full" | "off"
+	ProxyAddr     string
+	DashboardAddr string
+	UpstreamURL   string
+	DBPath        string
+	BodyPolicy    string // "full" | "off"
+
+	// BodyCapBytes bounds each of the two bodies independently -- the request
+	// and the response are teed separately, so one cap applies to each.
+	//
+	// It is deliberately generous. The dominant body is the *request*, not the
+	// response: a Claude Code request carries the system prompt, the full tool
+	// schemas and the conversation history, so a cap set for a typical response
+	// truncates the majority of calls rather than the exception. A truncated
+	// body is not merely less detail -- it is the one input the cost and usage
+	// figures cannot be recovered without (GI-11's RC-C). It stays configurable
+	// so it can be lowered without a rebuild.
 	BodyCapBytes      int
 	AllowRemote       bool
 	SessionGapMinutes int
@@ -56,7 +67,7 @@ func Default() *Config {
 		UpstreamURL:       "https://api.anthropic.com",
 		DBPath:            defaultPath("lens.db"),
 		BodyPolicy:        "full",
-		BodyCapBytes:      262144,
+		BodyCapBytes:      2097152,
 		AllowRemote:       false,
 		SessionGapMinutes: 30,
 		RetentionDays:     0,
@@ -219,7 +230,7 @@ func applyFlags(cfg *Config, args []string) error {
 	fs.StringVar(&cfg.UpstreamURL, "upstream-url", cfg.UpstreamURL, "upstream Anthropic API URL")
 	fs.StringVar(&cfg.DBPath, "db-path", cfg.DBPath, "SQLite database path")
 	fs.StringVar(&cfg.BodyPolicy, "body-policy", cfg.BodyPolicy, "body capture policy: full|off")
-	fs.IntVar(&cfg.BodyCapBytes, "body-cap-bytes", cfg.BodyCapBytes, "max bytes captured per body")
+	fs.IntVar(&cfg.BodyCapBytes, "body-cap-bytes", cfg.BodyCapBytes, "max bytes captured per body (default 2097152)")
 	fs.BoolVar(&cfg.AllowRemote, "allow-remote", cfg.AllowRemote, "allow non-loopback bind addresses")
 	fs.IntVar(&cfg.SessionGapMinutes, "session-gap-minutes", cfg.SessionGapMinutes, "minutes of inactivity before a new session")
 	fs.IntVar(&cfg.RetentionDays, "retention-days", cfg.RetentionDays, "purge requests older than this many days; 0 means keep forever")

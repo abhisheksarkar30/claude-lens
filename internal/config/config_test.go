@@ -39,6 +39,47 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
+// TestBodyCapDefaultAndOverrides pins RC-C's default and both override paths.
+//
+// The default moved 262,144 -> 2,097,152 because truncation was the norm rather
+// than the exception on a real install: 58% of request bodies exceeded the old
+// cap, and the dominant body is the request, not the response. A silent revert
+// would be invisible -- it shows up only as a pile of honest `incomplete` flags
+// on newly captured traffic, which is exactly what this story exists to stop
+// being normal. The override half is what keeps the cap configurable, so it can
+// be lowered without a rebuild.
+func TestBodyCapDefaultAndOverrides(t *testing.T) {
+	if got := Default().BodyCapBytes; got != 2097152 {
+		t.Errorf("Default().BodyCapBytes = %d, want 2097152", got)
+	}
+
+	withHome(t)
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.BodyCapBytes != 2097152 {
+		t.Errorf("BodyCapBytes with nothing configured = %d, want the default 2097152", cfg.BodyCapBytes)
+	}
+
+	t.Setenv("CLENS_BODY_CAP_BYTES", "65536")
+	cfg, err = Load(nil)
+	if err != nil {
+		t.Fatalf("Load (env): %v", err)
+	}
+	if cfg.BodyCapBytes != 65536 {
+		t.Errorf("BodyCapBytes from env = %d, want 65536", cfg.BodyCapBytes)
+	}
+
+	cfg, err = Load([]string{"--body-cap-bytes", "131072"})
+	if err != nil {
+		t.Fatalf("Load (flag): %v", err)
+	}
+	if cfg.BodyCapBytes != 131072 {
+		t.Errorf("BodyCapBytes from flag = %d, want 131072 (the flag beats the env var)", cfg.BodyCapBytes)
+	}
+}
+
 func TestResolutionOrderFlagBeatsFileBeatsEnv(t *testing.T) {
 	dir := withHome(t)
 	clensDir := filepath.Join(dir, ".clens")
