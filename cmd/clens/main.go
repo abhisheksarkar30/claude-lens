@@ -36,6 +36,10 @@ var commands = map[string]func([]string) error{
 	"replay":   cli.Replay,
 	"purge":    cli.Purge,
 	"rekey":    cli.Rekey,
+
+	// br-GI-11-03 / br-GI-11-06
+	"reprice": cli.Reprice,
+	"reflag":  cli.Reflag,
 }
 
 func main() {
