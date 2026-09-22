@@ -143,6 +143,19 @@ write-ahead log, so `lens.db` is self-contained; copying it while `serve` runs w
 everything still in the `-wal` beside it. It is **destructive only at step 6**, which is why the copy
 is verified before the original is deleted.
 
+> **⚠️ Stopping `clens serve` cuts the client that is talking through it.** The proxy listener is what
+> `ANTHROPIC_BASE_URL` points at, so every in-flight call loses its connection the moment step 1 runs
+> and does not get it back until step 4 — **including, on a machine where the agent's own traffic is
+> proxied, the session issuing the command.** Stop it from a context that does not route through this
+> process: a second terminal, with the client pointed at `--upstream-url` directly for the duration.
+> This applies to **every** step that says "with `clens serve` stopped", not just the move — `clens
+> rekey`'s pass-3 destructive run, and both of GI-11's repairs.
+>
+> **And the binary cannot be upgraded in place while it runs.** `go install ./cmd/clens` writes
+> `$(go env GOPATH)/bin/clens`, and Windows refuses to overwrite a running image (`Permission
+> denied`), so a new build needs the same stop. Order the two together: stop → `go install` → copy
+> or repoint the store → start → `clens doctor`.
+
 **Step 2 moves one file, and `~/.clens/` holds more than that.** `lens.db.pre-migration` (the
 pre-`PRAGMA user_version` copy, see [decisions/007](decisions/007-schema-migrations-by-user-version.md))
 and the `backups/` directory are not part of the move and are not covered by step 6 — so an operator
