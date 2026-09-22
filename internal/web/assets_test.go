@@ -629,6 +629,27 @@ func TestAssetsThePickerMountsBothTabs(t *testing.T) {
 	if !strings.Contains(statsOpts, `value="custom"`) {
 		t.Error("the Stats picker has no `custom` option, so the retained free-text pair is unreachable")
 	}
+
+	// The defaults, which the bead's three-option phrasing left open and a
+	// review round escalated (br-GI-11-08's "Corrected during implementation"
+	// note records the ratification). Calls' default is the neutral `any time`,
+	// and this is load-bearing rather than cosmetic: a native <select> has no
+	// unset state, so a mount offering only hour|date|month would display `hour`
+	// while timeWindow() returns null -- the value input is empty, and the
+	// function's own `if (!gran || !value) return null` makes that the same
+	// no-window path. The control would be advertising a granularity it is not
+	// applying, which is the dead-option misdescription the Calls mount already
+	// avoids by omitting `custom`. Stats' `custom` is the deliberate exception:
+	// it is what reveals the free-text pair.
+	if strings.Contains(callsOpts, "selected") {
+		t.Error("the Calls picker marks an option `selected`: its default must be the neutral \"any time\" (the first, empty-valued option), or the select displays a granularity that is not being applied")
+	}
+	if !strings.Contains(callsOpts, `value=""`) {
+		t.Error("the Calls picker has no empty-valued option, so its default cannot be \"any time\"")
+	}
+	if !strings.Contains(statsOpts, `value="custom" selected`) {
+		t.Error("the Stats picker's `custom` is not the default, so the retained free-text pair is not the one being used")
+	}
 	for _, want := range []string{"hour", "date", "month"} {
 		if !strings.Contains(callsOpts, `value="`+want+`"`) || !strings.Contains(statsOpts, `value="`+want+`"`) {
 			t.Errorf("both pickers must offer %q", want)

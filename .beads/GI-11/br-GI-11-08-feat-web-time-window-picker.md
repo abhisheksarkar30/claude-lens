@@ -119,6 +119,23 @@ step depends on it.
   retained `s-since`/`s-until`, hidden unless the granularity is `custom`.
 - The Calls `<select>` offers `hour | date | month`; the Stats `<select>` offers all four. No dead
   option on either mount.
+  - **Corrected during implementation (ratified in Phase 5.5's review round 1):** the Calls mount
+    also carries a leading `<option value="">any time</option>`, so the mounts offer **four and
+    four** — the difference between them is the *fourth* value (`any time` on Calls, `custom` on
+    Stats), not the number of options. The literal three-option reading is not implementable: a
+    native `<select>` has no unset state, so `hour | date | month` alone would default-select `hour`
+    while `timeWindow()` returns `null` (the value input is empty, and `if (!gran || !value) return
+    null` makes that the same no-window path) — a control advertising a granularity it is not
+    applying, which is the dead-option misdescription the clause above exists to prevent. `any time`
+    is a neutral default, not a dead option; `custom` remains Calls-excluded.
+  - This is recorded here and **not** in the converged plan: plan §4 carries the same three-option
+    phrasing, and re-asserting `status=converged` on text no review round read is precisely the
+    dishonesty round 9's finding O4 names. The divergence is therefore an open item for the plan's
+    next revision, stated here so it is not silently lost.
+  - `TestAssetsThePickerMountsBothTabs` now pins both defaults — Calls carries no `selected` and an
+    empty-valued first option, Stats' `custom` carries `selected` — so the ratified decision is
+    enforced rather than only documented (mutation-checked: adding `selected` to Calls' `any time`
+    fails the test).
 - `timeWindow()` is a top-level `function timeWindow(...)` (not a `const … => {…}`), taking granularity
   and value and returning `{since, until}` as RFC3339 strings **carrying the local offset**.
 - `callFilter()` and `loadStats()` both route their `since`/`until` through `timeWindow()`; a change
@@ -160,6 +177,15 @@ range.** There is **no executed `timeWindow()` case** — a Go test only asserts
     - The *why* goes in the test comment so nobody simplifies it back: `new Date('2026-09-21').toISOString()`
       emits `2026-09-21T00:00:00.000Z`, Go accepts it as UTC, and that is unix 1789948800 against the
       intended 1789929000, **19,800 s = 5h30m off, silently**.
+  - **The wiring guard — `TestAssetsThePickerMountsBothTabs` (added during implementation; the bead
+    named only the guard above, and it left four Outcome Definition clauses with no coverage at all).**
+    It pins: `callFilter` and `loadStats` **both** call `timeWindow(`; the two `custom` option sets are
+    read **per `<select>`** (via a `selectOptions(html, id)` helper that slices to `</select>`, so a
+    `custom` in one row cannot satisfy an assertion about the other); all three of
+    `hour`/`date`/`month` appear in both; `s-since`/`s-until` stay mounted **and** read; and the two
+    defaults. The default half is the escalation above made enforceable. A picker mounted but never
+    consulted would leave `TestAssetsEveryLookupHasAMount` green with a dead filter — that, not the
+    id existence, is what this guards.
 - **Integration Tests:** none in-repo. The semantic cases (local-instant denotation, Dec→Jan rollover,
   month width, DST) are **manual verification in the PR's test plan** — the ceiling is
   `assets_test.go:409-416`, which is regex and text over the embedded bytes.
