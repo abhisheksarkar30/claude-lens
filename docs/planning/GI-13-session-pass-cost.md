@@ -1,8 +1,20 @@
 # GI-13 — the session-scoped rule pass, and a profiler to find the next one
 
-**Status**: v6, after cross-review rounds 1–5 (round 1: 9 findings; round 2: 4; round 3: 2; round 4: 5;
-round 5: 4 — all applied) and one user decision (D9, the rule fix). Round 4 was clean, round 5 was
-not. Not yet converged; round 6 pending.
+**Status**: **v8, CONVERGED** — cross-review rounds 1–8 complete (findings per round: 9, 4, 2, 5, 4, 1,
+1, 1 — all applied) plus one user decision (D9, the rule fix). Rounds 4, 6, 7 and 8 were clean, so the
+{7,8} window holds and **the plan has converged**. §3.1 is frozen after round 6's recommendation.
+
+**One MINOR is carried open (F8.1), deliberately rather than fixed.** Two sentences in §3.1's class-3
+caveat over-generalize the class-2/class-3 boundary: "when a real row follows the usage-less one … it
+re-anchors forward" is false when that row is a *read* (the walk then aborts and the finding is class
+1), and "class 3 is **exactly** the case with no re-anchored successor" over-reaches because class 1's
+losses also have no successor. **The exact correction — scope "a real row" to "a real row that
+continues the rewrite run", and soften "exactly" to "the case it demonstrates" — is recorded in this
+revision's commit message and in `br-GI-13-05`**, where the classification is actually implemented. No
+further edit was made to §3.1 because three successive edits to that boundary (rounds 6, 7, 8) each
+produced a new finding, and the claims at issue are explanatory — they change no bead, no test and no
+behaviour. Correcting them is a one-commit change at bead time; re-deriving §3.1 for it is the regress
+the freeze exists to stop.
 **Issue**: #13 (`GI#13`). **Branch**: `GI-13-session-pass-cost`, cut from `main` at `9ee53f3`.
 **Provenance**: diagnosed 2026-09-22 by CPU profile of the live process. This plan supersedes
 nothing; it settles the question `docs/planning/GI-9-merge-jsonl-and-proxy-rows.md:1654-1668`
@@ -204,7 +216,8 @@ than a claim of equivalence:
 >    the final state does not support it.
 > 2. **Superseded re-anchorings**, for a rule that anchors on the last row.
 >    `ruleCachePrefixInvalidation` (`rules.go:294-308`) anchors on `rows[len-1]`, so today's per-row
->    passes write the *same true finding* against rows 3…N-1. Each is keyed to a different
+>    passes write the *same true finding* once per **successful pass**, each anchored on that pass's
+>    own last row — a long session can therefore carry one per row. Each is keyed to a different
 >    `event_id`, so each survives the `ON CONFLICT(event_id, kind)` upsert as its own row. Those are
 >    not false positives — one fact recorded once per row it was recomputed against — but they are
 >    duplicates, and a single final pass anchors once. This class is an **anchor moving, not a
@@ -237,29 +250,56 @@ than a claim of equivalence:
 > accumulates across batches and still gets one pass per batch, so this preservation is per-batch, not
 > per-session.
 >
-> **Two comparisons, and they run in opposite directions. Keeping them apart is the point of this
-> paragraph** — an earlier revision ran them together and stated the subset relation unconditionally,
-> which D9 makes false.
->
-> 1. **C1 with the rule held fixed, against today.** The deduped warning set is a **subset** of the
->    current one: every warning the single final pass writes is also written by some prefix pass. The
->    difference is exactly the two benign classes — class 1 is small, class 2 is the largest and most
->    visible, dropping `sessions.warning_count` materially for a prefix-invalidation-heavy session.
->    **This is D1: a deliberate, bounded loss of stale and duplicated warnings.** The subset relation
->    holds *only* with the rule held fixed, because that is the premise both class derivations rest
->    on.
-> 2. **D9's rule change, against today — a second difference, running the other way.** `br-GI-13-05`
->    removes the abort-on-usage-less-row behaviour, so it **adds** findings, and the deduped set is
->    **not** a subset of the current one once both land. Concretely, `[P1,P2,Z,P3]` in `started_at`
->    order with a usage-less `Z`: today the walk aborts at the `(P2,Z)` pair (`rules.go:301`) and the
->    session gets **nothing** — the `len(rows) < 3` guard means the earlier two-row state never fired
->    either — while C1+D9 filters `Z`, walks `[P1,P2,P3]`, and fires on `P3`.
->
-> So the story's two effects on warnings are **independent and opposed**: C1 drops stale and
-> duplicated warnings, D9 adds warnings for sessions a usage-less row had silently disabled. The net
-> direction of `sessions.warning_count` is therefore not predictable from either alone, and D9's
-> addition is an **intended effect of the user's decision**, not a hole in the subset claim. §5's D9
-> and §8 say this; this paragraph previously did not, which is what round 5 caught.
+> **Stated once, with both sides named: with the rule held fixed, C1's cadence writes a subset of
+> what today's cadence writes.** Every warning the single final pass produces is also produced by
+> some prefix pass *under the same rule*. That is the whole guarantee. Which *classes* it drops
+> depends on which rule it is held at, so they are listed below rather than folded into one sentence
+> — an earlier revision folded them and was false for one of the two rules.
+
+**What the change does to warning output.** Three comparisons, each against an explicitly named
+baseline:
+
+| Comparison | Baseline | Direction | Effect |
+|---|---|---|---|
+| C1's cadence alone | today's code, **today's** rule | subset | drops classes **1, 2 and 3** — including class 3, which is not benign |
+| D9's rule alone | today's code, today's rule | superset | **adds** findings, for every session a usage-less row had disabled |
+| **Shipped state (C1 + D9)** | today's code | mixed | drops classes **1 and 2**; class 3 is **net-neutral** — C1 drops it, D9 restores it; plus D9's additions |
+
+"The difference is only the two benign classes" is true of the **shipped** row and of nothing else.
+Attached to the first row it is false, because C1 alone drops class 3 too. That is what round 6
+caught, and it is why these are three rows rather than one narrated pair.
+
+**Class 3's neutrality holds for the shape it demonstrates — and the class-2/class-3 boundary is
+stated here, once, so that class 2's text and D1 read consistently against it.** In `[P1,P2,P3,Z]`
+with a usage-less `Z` **last**: C1 would drop the finding, D9 restores it, and the anchor lands on
+`P3` — the same row today's pass-after-`P3` anchored on, so the shipped output **reproduces** today's.
+That is a preservation, and it is class 3.
+
+When a **real row follows** the usage-less one, the same finding is *not* lost — it **re-anchors
+forward**. In `[P1,P2,P3,Z,P4]` today writes a `P3`-anchored finding and aborts at the `(P3,Z)` pair,
+while the shipped walk filters `Z` and anchors on `P4`: count-neutral 1→1, **row not reproduced**.
+That case is **class 2**, not class 3 — a superseded re-anchoring of a finding the final pass still
+reports, which is D1's phrasing. **Class 3 is therefore exactly the case where the suppressed finding
+has no re-anchored successor**, and the neutrality claim above is scoped to that case rather than
+stated generally. An earlier revision stated it generally, which is what round 7 caught.
+
+D9's own direction, so that it is checkable: `[P1,P2,Z,P3]` in `started_at` order with a usage-less
+`Z`. Today the walk aborts at the `(P2,Z)` pair (`rules.go:301`) and the session gets **nothing** —
+the `len(rows) < 3` guard means the earlier two-row state never fired either. Shipped,
+`rowsWithUsage` filters `Z`, the walk is `[P1,P2,P3]`, and it fires on `P3`.
+
+**For `sessions.warning_count`, which is what a user will actually notice:** the shipped story's two
+effects are **opposed**, so the net direction is not predictable from either alone — some sessions
+gain warnings and some lose them. **Do not describe this change as "fewer warnings".** §5's D9 and §8
+say the same thing.
+
+> **§3.1 is frozen.** This section has been the site of a finding in five of six review rounds: three
+> flaws in the original argument, then damage the *editing* did — a duplicate bullet, and one
+> conclusion left stale by a later change to this same section. The taxonomy itself has survived a
+> dedicated attack, with round 4 walking all six rules against both write paths and folding every
+> candidate into class 1, finding no fourth class. **A further finding here should therefore reopen
+> C1's or D9's design, not add a fourth bullet or another qualifying clause** — which is why the
+> section now ends in a named guarantee and a flat table of effects rather than more prose.
 >
 > The fallback if D1 is unwanted entirely: keep the per-row pass and rely on C2/C3 alone. That is
 > **not** sufficient (§2 — a pass still reads `req_body` for every row), so it would have to be
