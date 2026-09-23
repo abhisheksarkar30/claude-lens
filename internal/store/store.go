@@ -181,22 +181,24 @@ var migrations = []string{
 	// derived on write, not backfilled by this migration -- see
 	// `clens backfill-tool-names` for existing rows.
 	`ALTER TABLE events ADD COLUMN req_tool_names TEXT;`,
-	// 3 -> 4: /api/stats' four aggregate queries (StatsSummary, StatsByModel,
-	// StatsByPeriod, StatsByCostSource) SUM/GROUP BY/filter on columns that
-	// were otherwise unindexed, so each one walked the whole table -- blob
+	// 3 -> 4: three of /api/stats' four aggregate queries (StatsSummary,
+	// StatsByModel, StatsByPeriod) SUM/GROUP BY/filter on columns that were
+	// otherwise unindexed, so each one walked the whole table -- blob
 	// columns included -- to reach the small set of columns it actually
-	// needs. idx_events_cost_source is dropped in the same step: it is now
-	// redundant (idx_events_stats carries cost_source too), and left in
-	// place it out-competes the new index for StatsByCostSource's GROUP BY
-	// even though it still pays a table lookup per row for the columns it
-	// lacks -- verified empirically, not assumed. See schema.sql's comment
-	// on idx_events_stats for the column list and the PurgeUnpriced trade.
+	// needs. idx_events_cost_source is deliberately NOT dropped here: an
+	// earlier version of this migration folded it into idx_events_stats,
+	// verified only against the four SELECTs and not against
+	// PurgeUnpriced's `DELETE FROM events WHERE cost_source = 'unpriced'`,
+	// which regressed from an index seek to a bare, unindexed table scan --
+	// cost_source is not a leading column of idx_events_stats, so it cannot
+	// serve that equality lookup at all. See schema.sql's comments on both
+	// indexes for the full column list and the accepted StatsByCostSource
+	// gap this leaves.
 	`CREATE INDEX IF NOT EXISTS idx_events_stats ON events(
 		input_tokens, output_tokens, cache_write_5m_tokens, cache_write_1h_tokens,
 		cache_read_tokens, thinking_tokens, total_prompt_tokens, model_resolved,
 		billing_mode, cost_source, cost_usd, api_equivalent_cost_usd, started_at
-	);
-	 DROP INDEX IF EXISTS idx_events_cost_source;`,
+	);`,
 }
 
 // eventsTableAbsent reports whether this database has no events table yet,

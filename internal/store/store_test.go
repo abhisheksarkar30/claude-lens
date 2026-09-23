@@ -1344,17 +1344,17 @@ func TestMigrateAddsTheCompositeIndexAtVersionTwo(t *testing.T) {
 	}
 }
 
-// preStatsIndexSchema returns schemaSQL with idx_events_stats swapped back
-// for the idx_events_cost_source it replaces -- the on-disk shape of a
-// database one migration behind schemaVersion (br-GI-13-08's "before").
-// Built from bare schemaSQL, not buildPreChangeDB: that fixture's helper also
+// preStatsIndexSchema returns schemaSQL with idx_events_stats removed -- the
+// on-disk shape of a database one migration behind schemaVersion (br-GI-13-08's
+// "before"). idx_events_cost_source is left alone: it was never dropped, so
+// it already appears in schemaSQL ahead of the block this strips out. Built
+// from bare schemaSQL, not buildPreChangeDB: that fixture's helper also
 // strips req_tool_names (migrations[2]) and the transcript columns
 // (migrations[0]), which a database sitting at user_version = 3 already
 // carries.
 func preStatsIndexSchema(t *testing.T) string {
 	t.Helper()
-	const marker = "-- Covers the four /api/stats aggregate queries"
-	const oldIndex = "CREATE INDEX IF NOT EXISTS idx_events_cost_source ON events(cost_source);\r\n"
+	const marker = "-- Covers three of the four /api/stats aggregate queries"
 	i := strings.Index(schemaSQL, marker)
 	if i < 0 {
 		t.Fatal("schema.sql no longer has the idx_events_stats comment")
@@ -1365,7 +1365,7 @@ func preStatsIndexSchema(t *testing.T) string {
 		t.Fatal("schema.sql's idx_events_stats block has no closing paren")
 	}
 	after := strings.TrimLeft(rest[j+len(");"):], "\r\n")
-	return schemaSQL[:i] + oldIndex + after
+	return schemaSQL[:i] + after
 }
 
 // TestMigrateAddsTheStatsIndexAtVersionFour: a database at user_version = 3
@@ -1400,8 +1400,8 @@ func TestMigrateAddsTheStatsIndexAtVersionFour(t *testing.T) {
 	if !hasIndex(t, st.db, "idx_events_stats") {
 		t.Error("the migration did not create idx_events_stats")
 	}
-	if hasIndex(t, st.db, "idx_events_cost_source") {
-		t.Error("the migration left idx_events_cost_source behind")
+	if !hasIndex(t, st.db, "idx_events_cost_source") {
+		t.Error("the migration dropped idx_events_cost_source, want it kept")
 	}
 
 	n, err := st.CountEvents(context.Background(), EventFilter{})
@@ -1440,8 +1440,8 @@ func TestFreshSchemaMatchesTheMigratedShape(t *testing.T) {
 		if !hasIndex(t, st.db, "idx_events_stats") {
 			t.Errorf("%s: missing idx_events_stats", name)
 		}
-		if hasIndex(t, st.db, "idx_events_cost_source") {
-			t.Errorf("%s: idx_events_cost_source present, want dropped", name)
+		if !hasIndex(t, st.db, "idx_events_cost_source") {
+			t.Errorf("%s: missing idx_events_cost_source", name)
 		}
 	}
 }
@@ -1514,27 +1514,39 @@ func statsFixtureEvents() []*Event {
 	return []*Event{api, sub, unpriced}
 }
 
-// TestStatsQueriesUseTheCoveringIndex (§6, br-GI-13-08): each of the four
-// /api/stats aggregate queries must be served off idx_events_stats rather
-// than a bare table scan, since none of them selects a blob column but the
-// table's B-tree carries them on every page.
+// TestStatsQueriesUseTheCoveringIndex (§6, br-GI-13-08): StatsSummary,
+// StatsByModel, and StatsByPeriod must be served off idx_events_stats as a
+// covering index rather than a bare table scan, since none of them selects a
+// blob column but the table's B-tree carries them on every page.
+// StatsByCostSource is the documented exception: cost_source is not a
+// leading column of idx_events_stats, so SQLite keeps using the narrower
+// idx_events_cost_source for its GROUP BY -- still an index, not a bare
+// scan, but not a covering one either. See schema.sql's comment on both
+// indexes.
 func TestStatsQueriesUseTheCoveringIndex(t *testing.T) {
 	st := newTestStore(t)
 	where, args := EventFilter{}.whereClause()
 
-	queries := []string{
-		statsSelectColumns + " FROM events" + where,
-		"SELECT model_resolved, billing_mode, " + statsSelectColumnsInner +
-			" FROM events" + where + " GROUP BY model_resolved, billing_mode ORDER BY model_resolved",
-		"SELECT " + periodExprs["day"] + " AS period, billing_mode, " + statsSelectColumnsInner +
-			" FROM events" + where + " GROUP BY period, billing_mode ORDER BY period",
-		"SELECT cost_source, COUNT(*), SUM(CASE WHEN billing_mode = 'api' THEN cost_usd END)" +
-			" FROM events" + where + " GROUP BY cost_source ORDER BY cost_source",
+	queries := []struct {
+		query    string
+		covering bool
+	}{
+		{statsSelectColumns + " FROM events" + where, true},
+		{"SELECT model_resolved, billing_mode, " + statsSelectColumnsInner +
+			" FROM events" + where + " GROUP BY model_resolved, billing_mode ORDER BY model_resolved", true},
+		{"SELECT " + periodExprs["day"] + " AS period, billing_mode, " + statsSelectColumnsInner +
+			" FROM events" + where + " GROUP BY period, billing_mode ORDER BY period", true},
+		{"SELECT cost_source, COUNT(*), SUM(CASE WHEN billing_mode = 'api' THEN cost_usd END)" +
+			" FROM events" + where + " GROUP BY cost_source ORDER BY cost_source", false},
 	}
 	for _, q := range queries {
-		plan := strings.ToUpper(explainQueryPlanDetail(t, st.db, q, args...))
-		if strings.Contains(plan, "SCAN EVENTS") && !strings.Contains(plan, "COVERING INDEX IDX_EVENTS_STATS") {
-			t.Errorf("query plan does not use idx_events_stats as a covering index:\nquery: %s\nplan: %s", q, plan)
+		plan := strings.ToUpper(explainQueryPlanDetail(t, st.db, q.query, args...))
+		usesIndex := strings.Contains(plan, "USING INDEX") || strings.Contains(plan, "USING COVERING INDEX")
+		if !usesIndex {
+			t.Errorf("query plan is a bare table scan, want at least an index:\nquery: %s\nplan: %s", q.query, plan)
+		}
+		if q.covering && !strings.Contains(plan, "COVERING INDEX IDX_EVENTS_STATS") {
+			t.Errorf("query plan does not use idx_events_stats as a covering index:\nquery: %s\nplan: %s", q.query, plan)
 		}
 	}
 }
@@ -1617,5 +1629,20 @@ func TestStatsAggregatesAreUnchangedByTheIndex(t *testing.T) {
 	}
 	if !reflect.DeepEqual(byCostSourceBefore, byCostSourceAfter) {
 		t.Errorf("StatsByCostSource changed:\nbefore=%+v\nafter=%+v", byCostSourceBefore, byCostSourceAfter)
+	}
+}
+
+// TestPurgeUnpricedUsesTheCostSourceIndex pins the regression idx_events_stats
+// caused when idx_events_cost_source was dropped alongside it: cost_source
+// sits at position 10 of 13 in idx_events_stats, not a leading column, so a
+// DELETE keyed on cost_source alone got no seek out of it and fell back to a
+// bare SCAN of the whole table. Verified with EXPLAIN QUERY PLAN, not assumed
+// -- see schema.sql's comment on idx_events_cost_source.
+func TestPurgeUnpricedUsesTheCostSourceIndex(t *testing.T) {
+	st := newTestStore(t)
+	plan := strings.ToUpper(explainQueryPlanDetail(t, st.db,
+		"DELETE FROM events WHERE cost_source = 'unpriced'"))
+	if !strings.Contains(plan, "SEARCH EVENTS USING") || !strings.Contains(plan, "IDX_EVENTS_COST_SOURCE") {
+		t.Errorf("PurgeUnpriced's DELETE does not seek via idx_events_cost_source:\nplan: %s", plan)
 	}
 }
