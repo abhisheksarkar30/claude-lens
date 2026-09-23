@@ -140,7 +140,7 @@ func applyMergeTx(ctx context.Context, tx *sql.Tx, existing, incoming *Event) (*
 		w := Warning{
 			Kind:      "source_mismatch",
 			Severity:  "error",
-			Detail:    fmt.Sprintf("sources %s and %s disagree on token counts for request_id %s", existing.Source, incoming.Source, existing.RequestID),
+			Detail:    fmt.Sprintf("sources %s and %s disagree on token counts for request_id %s: %s", existing.Source, incoming.Source, existing.RequestID, diffTokenFields(existing, incoming)),
 			CreatedAt: time.Now(),
 		}
 		if err := upsertWarningsTx(ctx, tx, result.ID, []Warning{w}); err != nil {
@@ -161,16 +161,47 @@ func applyMergeTx(ctx context.Context, tx *sql.Tx, existing, incoming *Event) (*
 // structurally cannot supply (proxy-only capture fields for a JSONL row,
 // and the JSONL-only fields for a proxy row) are backfilled from whichever
 // side actually has them.
+// tokenFields lists every token column a merge compares for disagreement.
+// tokensDiffer and diffTokenFields both iterate this one table so the two
+// can never drift into checking different fields.
+var tokenFields = []struct {
+	name string
+	get  func(*Event) int
+}{
+	{"input_tokens", func(e *Event) int { return e.InputTokens }},
+	{"output_tokens", func(e *Event) int { return e.OutputTokens }},
+	{"cache_write_5m_tokens", func(e *Event) int { return e.CacheWrite5mTokens }},
+	{"cache_write_1h_tokens", func(e *Event) int { return e.CacheWrite1hTokens }},
+	{"cache_read_tokens", func(e *Event) int { return e.CacheReadTokens }},
+	{"thinking_tokens", func(e *Event) int { return e.ThinkingTokens }},
+}
+
+// diffTokenFields returns a human-readable list of exactly the fields in
+// tokenFields where existing and incoming disagree, each as
+// "field existing_value vs incoming_value", comma-separated. It reports
+// nothing for fields that are equal.
+func diffTokenFields(existing, incoming *Event) string {
+	var parts []string
+	for _, f := range tokenFields {
+		ev, iv := f.get(existing), f.get(incoming)
+		if ev != iv {
+			parts = append(parts, fmt.Sprintf("%s %d vs %d", f.name, ev, iv))
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
 func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	merged := *existing
 	merged.SourceRefs = unionStrings(existing.SourceRefs, append([]string{existing.Source}, incoming.Source))
 
-	tokensDiffer := existing.InputTokens != incoming.InputTokens ||
-		existing.OutputTokens != incoming.OutputTokens ||
-		existing.CacheWrite5mTokens != incoming.CacheWrite5mTokens ||
-		existing.CacheWrite1hTokens != incoming.CacheWrite1hTokens ||
-		existing.CacheReadTokens != incoming.CacheReadTokens ||
-		existing.ThinkingTokens != incoming.ThinkingTokens
+	tokensDiffer := false
+	for _, f := range tokenFields {
+		if f.get(existing) != f.get(incoming) {
+			tokensDiffer = true
+			break
+		}
+	}
 
 	// The rule is "prefer the more complete record". Both halves of a capture
 	// count: since br-GI-7-08 CaptureComplete is also false when only the

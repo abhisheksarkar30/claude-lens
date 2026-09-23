@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -1027,6 +1028,104 @@ func TestMergeStillWarnsOnATrueDisagreement(t *testing.T) {
 	if !found {
 		t.Errorf("no source_mismatch for two complete captures that disagree on tokens; "+
 			"got %d warnings", len(warnings))
+	}
+}
+
+// TestDiffTokenFields (br-GI-15-03) pins diffTokenFields to name exactly the
+// fields that differ, with both values, and to say nothing about fields that
+// agree -- a naive implementation that only ever reported one field would
+// pass a single-field-only test, so both shapes are covered here.
+func TestDiffTokenFields(t *testing.T) {
+	base := fullEvent("req-diff-base")
+
+	cases := []struct {
+		name        string
+		mutate      func(*Event)
+		wantContain []string
+		wantAbsent  []string
+	}{
+		{
+			name:        "single field differs",
+			mutate:      func(e *Event) { e.OutputTokens = 999 },
+			wantContain: []string{"output_tokens 50 vs 999"},
+			wantAbsent:  []string{"input_tokens", "cache_read_tokens", "thinking_tokens"},
+		},
+		{
+			name: "multiple fields differ",
+			mutate: func(e *Event) {
+				e.InputTokens = 111
+				e.CacheReadTokens = 77
+			},
+			wantContain: []string{"input_tokens 100 vs 111", "cache_read_tokens 2 vs 77"},
+			wantAbsent:  []string{"output_tokens", "cache_write_5m_tokens", "cache_write_1h_tokens", "thinking_tokens"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			existing := *base
+			incoming := *base
+			tc.mutate(&incoming)
+
+			got := diffTokenFields(&existing, &incoming)
+			for _, want := range tc.wantContain {
+				if !strings.Contains(got, want) {
+					t.Errorf("diffTokenFields = %q, want it to contain %q", got, want)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(got, absent) {
+					t.Errorf("diffTokenFields = %q, want it to NOT mention %q (that field agreed)", got, absent)
+				}
+			}
+		})
+	}
+}
+
+// TestMergeSourceMismatchDetailNamesDifferingFields (br-GI-15-03) is the
+// end-to-end form of TestDiffTokenFields: the persisted warning's Detail,
+// not just the helper's return value, must name what actually differed.
+// TestMergeStillWarnsOnATrueDisagreement above is left unmodified -- it
+// only pins that a source_mismatch fires, not what its Detail says.
+func TestMergeSourceMismatchDetailNamesDifferingFields(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	first := fullEvent("req-gi15-detail")
+	first.Source, first.FirstSource = "proxy", "proxy"
+	first.OutputTokens = 50
+
+	second := fullEvent("req-gi15-detail")
+	second.Source, second.FirstSource = "jsonl", "jsonl"
+	second.OutputTokens = 999
+
+	if _, _, err := st.InsertEvent(ctx, first); err != nil {
+		t.Fatalf("InsertEvent first: %v", err)
+	}
+	if _, _, err := st.InsertEvent(ctx, second); err != nil {
+		t.Fatalf("InsertEvent second (merge): %v", err)
+	}
+
+	warnings, err := st.ListWarnings(ctx, WarningFilter{})
+	if err != nil {
+		t.Fatalf("ListWarnings: %v", err)
+	}
+	var detail string
+	found := false
+	for _, w := range warnings {
+		if w.Kind == "source_mismatch" {
+			found = true
+			detail = w.Detail
+		}
+	}
+	if !found {
+		t.Fatalf("no source_mismatch warning; got %d warnings", len(warnings))
+	}
+	if !strings.Contains(detail, "output_tokens 50 vs 999") {
+		t.Errorf("Detail = %q, want it to name the differing field and both values", detail)
+	}
+	if strings.Contains(detail, "input_tokens") {
+		t.Errorf("Detail = %q, want it to not mention input_tokens (that field agreed)", detail)
 	}
 }
 
