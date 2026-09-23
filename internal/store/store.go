@@ -125,7 +125,7 @@ func Open(dbPath string) (*Store, error) {
 
 // schemaVersion is the current PRAGMA user_version. It must equal
 // len(migrations): migrations[n] upgrades version n to n+1.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // SchemaVersion reports the schema version this binary knows, so a diagnostic
 // can print it beside a database's stored one. Exported rather than duplicated
@@ -162,6 +162,15 @@ var migrations = []string{
 	// wire-capture ones. Nullable and additive, so there is no table rewrite.
 	`ALTER TABLE events ADD COLUMN transcript_content BLOB;
 	 ALTER TABLE events ADD COLUMN transcript_role TEXT;`,
+	// 1 -> 2: a session-scoped read (WHERE session_id = ? ORDER BY
+	// started_at ASC) had no index that satisfied its ORDER BY, so SQLite
+	// materialized the session's rows -- BLOBs included -- and spilled the
+	// sort to a temp file. idx_events_session_id is a strict prefix of the
+	// composite and every session_id-filtered query is served by its
+	// leading column, so it is redundant weight on every insert once the
+	// composite exists.
+	`CREATE INDEX IF NOT EXISTS idx_events_session_started ON events(session_id, started_at);
+	 DROP INDEX IF EXISTS idx_events_session_id;`,
 }
 
 // eventsTableAbsent reports whether this database has no events table yet,

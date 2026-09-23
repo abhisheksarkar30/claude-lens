@@ -957,10 +957,13 @@ func TestMigrateHealsAPartialDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "partial.db")
 	buildPreChangeDB(t, path, "warnings")
 
-	// An index the schema exec re-creates (schema.sql:68), dropped here to
+	// An index the schema exec re-creates (schema.sql:69), dropped here to
 	// stand in for the other half of a first exec that died mid-file: the
 	// missing index heals by the same IF NOT EXISTS mechanism as the table.
-	const idx = "idx_events_session_id"
+	// idx_events_session_id no longer exists in schema.sql (br-GI-13-02
+	// replaced it with the composite idx_events_session_started), so this
+	// must name an index schema.sql still creates.
+	const idx = "idx_events_started_at"
 	db := rawDB(t, path)
 	if _, err := db.Exec("DROP INDEX " + idx); err != nil {
 		t.Fatalf("DROP INDEX %s: %v", idx, err)
@@ -986,6 +989,92 @@ func TestMigrateHealsAPartialDatabase(t *testing.T) {
 	}
 	if got := userVersion(t, st.db); got != schemaVersion {
 		t.Errorf("user_version = %d, want %d", got, schemaVersion)
+	}
+}
+
+// preIndexChangeSchema returns schemaSQL with the composite session index
+// swapped back for the single-column index it replaced -- the on-disk shape
+// of a database one migration behind schemaVersion (br-GI-13-02's "before").
+func preIndexChangeSchema(t *testing.T) string {
+	t.Helper()
+	const oldLine = "CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);"
+	const newLine = "CREATE INDEX IF NOT EXISTS idx_events_session_started ON events(session_id, started_at);"
+	if !strings.Contains(schemaSQL, newLine) {
+		t.Fatal("schema.sql no longer creates idx_events_session_started with the expected text")
+	}
+	return strings.Replace(schemaSQL, newLine, oldLine, 1)
+}
+
+// TestMigrateAddsTheCompositeIndexAtVersionTwo (§6 test 9): a database at
+// user_version = 1 with rows present reaches version 2, holds the composite
+// index, has no idx_events_session_id, and still returns its rows.
+func TestMigrateAddsTheCompositeIndexAtVersionTwo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-index.db")
+	db := rawDB(t, path)
+	if _, err := db.Exec(preIndexChangeSchema(t)); err != nil {
+		t.Fatalf("build a pre-index-change database: %v", err)
+	}
+	const sessionID = "sess-pre-index"
+	if _, err := db.Exec(
+		`INSERT INTO events (request_id, source, first_source, started_at, session_id) VALUES (?, 'proxy', 'proxy', ?, ?)`,
+		"req-pre-index", time.Now().UnixNano(), sessionID,
+	); err != nil {
+		t.Fatalf("seed a row: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA user_version = 1"); err != nil {
+		t.Fatalf("seed user_version: %v", err)
+	}
+	db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a database one migration behind: %v", err)
+	}
+	defer st.Close()
+
+	if got := userVersion(t, st.db); got != schemaVersion {
+		t.Errorf("user_version = %d, want %d", got, schemaVersion)
+	}
+	if !hasIndex(t, st.db, "idx_events_session_started") {
+		t.Error("the migration did not create idx_events_session_started")
+	}
+	if hasIndex(t, st.db, "idx_events_session_id") {
+		t.Error("the migration left idx_events_session_id behind")
+	}
+
+	rows, err := st.SessionEvents(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("SessionEvents: %v", err)
+	}
+	if len(rows) != 1 || rows[0].RequestID != "req-pre-index" {
+		t.Errorf("SessionEvents = %+v, want the seeded row still returned", rows)
+	}
+}
+
+// TestFreshSchemaMatchesTheMigratedShape: a fresh DB reaches the same index
+// set as a migrated one, so a future edit to one home alone fails the other.
+func TestFreshSchemaMatchesTheMigratedShape(t *testing.T) {
+	freshSt, err := Open(filepath.Join(t.TempDir(), "fresh.db"))
+	if err != nil {
+		t.Fatalf("Open fresh: %v", err)
+	}
+	defer freshSt.Close()
+
+	migratedPath := filepath.Join(t.TempDir(), "migrated.db")
+	buildPreChangeDB(t, migratedPath)
+	migratedSt, err := Open(migratedPath)
+	if err != nil {
+		t.Fatalf("Open pre-change: %v", err)
+	}
+	defer migratedSt.Close()
+
+	for name, st := range map[string]*Store{"fresh": freshSt, "migrated": migratedSt} {
+		if !hasIndex(t, st.db, "idx_events_session_started") {
+			t.Errorf("%s: missing idx_events_session_started", name)
+		}
+		if hasIndex(t, st.db, "idx_events_session_id") {
+			t.Errorf("%s: idx_events_session_id present, want dropped", name)
+		}
 	}
 }
 

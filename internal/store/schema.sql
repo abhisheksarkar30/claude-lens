@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS events (
     transcript_role         TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
+CREATE INDEX IF NOT EXISTS idx_events_session_started ON events(session_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_events_started_at ON events(started_at);
 CREATE INDEX IF NOT EXISTS idx_events_cost_source ON events(cost_source);
 
