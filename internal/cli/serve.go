@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -106,6 +107,14 @@ func Serve(args []string) error {
 	// a second cap on the decoded form, a small compressed body would expand
 	// past the configured per-body cap.
 	cons.SetBodyDecoding(cfg.BodyCapBytes)
+
+	// Diagnostic only, and off unless asked for by name. It exists because a
+	// spinning goroutine can only be named from inside a running process:
+	// attaching a debugger suspends the proxy and a SIGBREAK stack dump exits
+	// it, and both would take down the client whose traffic routes through
+	// this process. With PprofAddr unset (--pprof-addr/CLENS_PPROF_ADDR)
+	// nothing starts and the listener set is unchanged.
+	startPprof(cfg.PprofAddr)
 
 	proxySrv, err := proxy.NewServer(cfg, sk)
 	if err != nil {
@@ -403,6 +412,33 @@ func credentialState(name string) api.Credential {
 		c.LastUsed = &used
 	}
 	return c
+}
+
+// startPprof serves net/http/pprof on addr when addr is non-empty. See the
+// call site for why this is gated rather than always on.
+//
+// This is the second layer, not the only one: config.Validate already
+// rejects a non-loopback PprofAddr (even with --allow-remote) before Serve
+// ever reaches here. The check is repeated with config.IsLoopbackHost --
+// the one home for "what counts as loopback" -- rather than trusted away,
+// so a Config built by a caller other than config.Load (a test, a future
+// embedder) cannot open a listener whose heap profile contains whatever is
+// in memory just by skipping Validate.
+func startPprof(addr string) {
+	if addr == "" {
+		return
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || !config.IsLoopbackHost(host) {
+		log.Printf("pprof: refusing %q: a profile carries whatever is in memory, so this listener is loopback-only", addr)
+		return
+	}
+	go func() {
+		log.Printf("pprof: listening on http://%s/debug/pprof/", addr)
+		if err := http.ListenAndServe(addr, nil); err != nil {
+			log.Printf("pprof: %v", err)
+		}
+	}()
 }
 
 // printBanner prints the copy-pasteable ANTHROPIC_BASE_URL line, the dashboard

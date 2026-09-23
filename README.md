@@ -298,6 +298,47 @@ the defaults are chosen to hold that:
 - **Nothing is fetched from the network** by the dashboard: no CDN, no
   webfont, no analytics.
 
+## Profiling
+
+`clens` can serve `net/http/pprof` on its own loopback address for live
+diagnosis — a hang, a CPU spike, a stuck goroutine — without attaching a
+debugger, which would suspend the proxy, or sending it a signal, which would
+kill it: either would take down the client whose traffic routes through this
+process while you were trying to observe it.
+
+It is off by default. Turn it on with `--pprof-addr 127.0.0.1:6060` (or
+`CLENS_PPROF_ADDR`) and `clens doctor` names the flag when it is unset, so
+the feature is discoverable rather than folklore. The address must be
+loopback — `--allow-remote` does not widen this, because a profile is a dump
+of whatever is in memory, which for this process includes prompt and
+response bodies.
+
+The four profiles worth pulling for a hang investigation:
+
+```
+curl "http://127.0.0.1:6060/debug/pprof/profile?seconds=30" -o cpu.pprof   # CPU
+curl "http://127.0.0.1:6060/debug/pprof/heap" -o heap.pprof                # heap
+curl "http://127.0.0.1:6060/debug/pprof/goroutine?debug=2" -o goroutines.txt  # every stack
+curl "http://127.0.0.1:6060/debug/pprof/trace?seconds=5" -o trace.out      # execution trace
+```
+
+`goroutine?debug=2` is the single highest-value one for a hang: it dumps
+every goroutine's stack as text, no `go tool pprof` needed to read it.
+
+**The method that separates contention from a slow disk or a starved
+runtime**: hit a route that touches no database (`/api/health`) alongside
+one that does. If the no-DB route answers in a few milliseconds while every
+DB route takes tens of seconds, that gap is the signature of
+`SetMaxOpenConns(1)` contention on the store's single write connection, not
+a starved runtime or a slow disk — both of those would slow the no-DB route
+too.
+
+**Confirm the process is actually busy before you sample.** Read
+`TotalProcessorTime` twice, ten seconds apart; if it is under roughly 30% of
+a core, the process is idle and a profile taken now will be a near-empty
+file whose top frame is `runtime.(*timers).run` — evidence that reads as "no
+bug" regardless of whether one exists. Wait for the symptom, then capture.
+
 ## Dependencies
 
 Three modules beyond the standard library, and no more:

@@ -57,6 +57,15 @@ type Config struct {
 	// empty list (the `none` sentinel in applyKV).
 	PeakOffPeakDates []string
 	ApiModelPrefixes []string
+
+	// PprofAddr, when set, serves net/http/pprof on this address for the
+	// life of the process -- a diagnostic, not a feature to turn on by
+	// default, so it is deliberately absent from Default() (the same "unset
+	// unless asked for" note PeakOffPeakDates carries above). A profile is a
+	// dump of whatever is in memory, which for this process includes prompt
+	// and response bodies, so Validate rejects a non-loopback value even
+	// when AllowRemote is true (D5).
+	PprofAddr string
 }
 
 // Default returns the built-in defaults.
@@ -115,6 +124,7 @@ var fieldsByEnv = map[string]string{
 	"CLENS_ACCOUNTS_PATH":       "AccountsPath",
 	"CLENS_PEAK_OFF_PEAK_DATES": "PeakOffPeakDates",
 	"CLENS_API_MODEL_PREFIXES":  "ApiModelPrefixes",
+	"CLENS_PPROF_ADDR":          "PprofAddr",
 }
 
 // splitList parses a comma-separated value into a slice, trimming blank
@@ -210,6 +220,8 @@ func applyKV(cfg *Config, kv map[string]string) error {
 			cfg.PeakOffPeakDates = splitList(val)
 		case "ApiModelPrefixes":
 			cfg.ApiModelPrefixes = splitList(val)
+		case "PprofAddr":
+			cfg.PprofAddr = val
 		default:
 			return fmt.Errorf("config: apply: unknown key %q", key)
 		}
@@ -236,6 +248,7 @@ func applyFlags(cfg *Config, args []string) error {
 	fs.IntVar(&cfg.RetentionDays, "retention-days", cfg.RetentionDays, "purge requests older than this many days; 0 means keep forever")
 	fs.BoolVar(&cfg.ReplayEnabled, "replay", cfg.ReplayEnabled, "enable the replay endpoint")
 	fs.StringVar(&cfg.AccountsPath, "accounts-path", cfg.AccountsPath, "accounts file path")
+	fs.StringVar(&cfg.PprofAddr, "pprof-addr", cfg.PprofAddr, "serve net/http/pprof on this loopback address (diagnostic; empty disables it)")
 	return fs.Parse(args)
 }
 
@@ -367,6 +380,16 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("config: validate: ApiModelPrefixes: empty or whitespace-only prefix")
 		}
 	}
+	if c.PprofAddr != "" {
+		// The literal false is the point (D5): validateLoopback returns nil
+		// immediately when allowRemote is true, so passing c.AllowRemote
+		// here would let --allow-remote open a listener whose heap profile
+		// contains whatever is in memory. This listener is loopback-only
+		// and --allow-remote cannot widen it.
+		if err := validateLoopback("PprofAddr", c.PprofAddr, false); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -378,11 +401,27 @@ func validateLoopback(field, addr string, allowRemote bool) error {
 	if allowRemote {
 		return nil
 	}
-	if host == "localhost" {
-		return nil
-	}
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+	if IsLoopbackHost(host) {
 		return nil
 	}
 	return fmt.Errorf("config: validate: %s: non-loopback address %q requires AllowRemote", field, addr)
+}
+
+// IsLoopbackHost reports whether host -- the host part of an address, not a
+// full "host:port" -- names the local machine: "localhost" or any loopback
+// IP (127.0.0.1, ::1, and every other address in the loopback ranges, not
+// just the two conventional ones). It is the one home for that predicate:
+// both validateLoopback above and internal/cli's pprof listener call it, so
+// a legitimately-loopback address like 127.0.0.2 cannot pass Validate and
+// then be refused by a second, stricter spelling of the same check.
+//
+// "localhost" is checked before parsing as an IP because net.ParseIP
+// returns nil for it -- an IP-only check would silently reject a working
+// --proxy-addr localhost.
+func IsLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

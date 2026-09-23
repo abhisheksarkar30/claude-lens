@@ -70,6 +70,17 @@ func effectiveAPIPrefixes(cfg *config.Config) string {
 	}
 }
 
+// effectivePprofAddr names the flag that enables the profiler when it is
+// unset, so the feature is discoverable from doctor's output rather than
+// folklore -- otherwise the only way to learn --pprof-addr exists is to
+// have already read the source that needed it.
+func effectivePprofAddr(addr string) string {
+	if addr == "" {
+		return "unset (enable with --pprof-addr/CLENS_PPROF_ADDR)"
+	}
+	return addr
+}
+
 func runDoctor(args []string, w io.Writer) error {
 	cfg, err := config.Load(args)
 	if err != nil {
@@ -91,6 +102,7 @@ func runDoctor(args []string, w io.Writer) error {
 		{"accounts_configured", fmt.Sprintf("%d", len(cfg.Accounts))},
 		{"peak_off_peak_dates", effectivePeakDates(cfg.PeakOffPeakDates)},
 		{"api_model_prefixes", effectiveAPIPrefixes(cfg)},
+		{"pprof_addr", effectivePprofAddr(cfg.PprofAddr)},
 	}
 	for _, row := range cfgRows {
 		fmt.Fprintf(w, "  %-20s %s\n", row[0], row[1])
