@@ -347,3 +347,24 @@ run mid-story would have captured. Also verified directly against the live 2GB+ 
 unconditional schema exec silently repaired the already-migrated database's missing index with no
 new migration or version bump, and `EXPLAIN QUERY PLAN` there confirmed the same seek this refresh
 documents.
+
+**2026-09-23 — REFRESH, scoped to `GI-15-deepseek-capture-gap`** (beads `br-GI-15-01`, `br-GI-15-02`;
+plan `docs/planning/GI-15-deepseek-capture-gap.md` v6, converged). **No module was added or
+retired, no dependency, route, column, or CLI surface changed.** `decisions/` gained no new ADR —
+the plan's one considered-and-rejected alternative (resizing the sink or adding retry logic) never
+reached the weight of a documented fork; it is a one-line rejection in the plan's own self-review,
+not a design record a future change is likely to reintroduce.
+
+**The five doc-comment corrections needed no doc changes at all** — `storage-schema.md`, `glossary.md`,
+`dashboard.md`, and `workflows.md` already stated `CaptureComplete`'s correct mechanism (driven only
+by the two body-cap truncation bits, nothing about SSE `message_stop` framing); the defect this story
+fixed was five copies of a wrong claim in source comments and one warning-catalogue string, not in
+the context docs, which is why the plan itself concluded no context doc changes were needed. Verified
+that conclusion by grepping every context doc for `CaptureComplete`/`capture_complete`/`message_stop`
+rather than taking the plan's word for it.
+
+**Two module files changed, both narrowly:** `architecture.md`'s Fail-open Evidence line (the "is
+logged" half of rule 1 had no test actually asserting a log line before this story — only that the
+client was unaffected — so `TestSubmitLogsADropWithoutTheBody` is now cited as the first evidence
+of that specific half) and `testing-and-quality.md` (one new row for the same test, matching the
+table's one-invariant-per-row granularity).

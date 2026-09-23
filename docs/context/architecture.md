@@ -117,7 +117,11 @@ Two rules, both load-bearing:
 
 Evidence: `TestFailOpenOnUpstreamFailure`, `TestPolicyOffSurvivesAMissingRequestID` and the
 pass-through tests in [internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go); per-source
-outcome handling in [internal/ingest](../../internal/ingest/).
+outcome handling in [internal/ingest](../../internal/ingest/). The "is logged" half of rule 1 held
+for the consumer's write failures before GI#15 but not for a sink drop under load — `Sink.Submit`'s
+return value was discarded, so the only trace was an in-memory counter that reset on restart.
+`TestSubmitLogsADropWithoutTheBody` is the first test to assert an actual log line, not just that
+the client is unaffected.
 
 Rule 1 is the one a new code path is most likely to break, and it has broken once: under
 `--body-policy off` the capture path hashed a nil request body, and on the transport-failure branch
