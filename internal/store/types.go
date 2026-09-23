@@ -82,6 +82,17 @@ type EventSummary struct {
 	Method string
 	Path   string
 	Status int
+
+	// HasReqBody and ToolNames are the req_tool_names column's two facts, split
+	// out because Go has no "NULL": HasReqBody is req_tool_names IS NOT NULL
+	// (the same test as a stored request body existing at all, by the
+	// column's contract), and ToolNames is that column's JSON-encoded array,
+	// meaningful only when HasReqBody is true. A JSONL-sourced row, or a
+	// proxy row captured under --body-policy off, has HasReqBody false and
+	// ToolNames "". Recorded here (br-GI-13-07) so the session-scoped rules
+	// that compare tool names between calls need not read req_body at all.
+	HasReqBody bool
+	ToolNames  string
 }
 
 // Event is one row in events: one observed turn, from source "proxy" or

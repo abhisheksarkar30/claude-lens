@@ -52,6 +52,13 @@ CREATE TABLE IF NOT EXISTS events (
     method                  TEXT,
     path                    TEXT,
     status                  INTEGER,
+    -- NULL iff the row has no request body (structurally for a JSONL row, or
+    -- because --body-policy dropped it); otherwise the request's tool names
+    -- in body order, JSON-encoded ('[]' when the body declares none). This is
+    -- what lets the session-scoped rules compare tool names between turns
+    -- without reading req_body -- see internal/store/store.go's
+    -- encodeToolNames, the one place this contract is enforced at write time.
+    req_tool_names          TEXT,
     req_headers             TEXT,
     resp_headers            TEXT,
     req_body                BLOB,

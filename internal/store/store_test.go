@@ -867,10 +867,10 @@ func TestSessionEventsForRulesReturnsTheSameRowsInOrder(t *testing.T) {
 		if got.RequestID != want.RequestID || !got.StartedAt.Equal(want.StartedAt) ||
 			got.ModelResolved != want.ModelResolved || got.TotalPromptTokens != want.TotalPromptTokens ||
 			got.PrefixHash == nil || want.PrefixHash == nil || *got.PrefixHash != *want.PrefixHash ||
-			string(got.ReqBody) != string(want.ReqBody) {
+			got.HasReqBody != want.HasReqBody || got.ToolNames != want.ToolNames {
 			t.Errorf("row %d = %+v, want the full-projection fields of %+v", i, got, want)
 		}
-		if got.RespBody != nil || got.ReqHeaders != "" || got.RespHeaders != "" ||
+		if got.ReqBody != nil || got.RespBody != nil || got.ReqHeaders != "" || got.RespHeaders != "" ||
 			got.TranscriptContent != nil || got.TranscriptRole != "" {
 			t.Errorf("row %d retained an omitted blob: %+v", i, got)
 		}
@@ -906,7 +906,7 @@ func TestRulesProjectionNamesEveryColumnTheRulesRead(t *testing.T) {
 	mustRead := []string{
 		"id", "started_at", "ended_at", "total_prompt_tokens",
 		"cache_write_5m_tokens", "cache_write_1h_tokens", "cache_read_tokens",
-		"prefix_hash", "req_body",
+		"prefix_hash", "req_tool_names",
 	}
 	for _, c := range mustRead {
 		if !containsStr(rules, c) {
@@ -920,10 +920,89 @@ func TestRulesProjectionNamesEveryColumnTheRulesRead(t *testing.T) {
 func TestRulesScanMatchesRulesColumns(t *testing.T) {
 	var es EventSummary
 	var v eventScanVals
-	var reqBody []byte
 
-	if got, want := len(v.dest(&es, &reqBody)), len(rulesColumnNames); got != want {
+	if got, want := len(v.dest(&es)), len(rulesColumnNames); got != want {
 		t.Errorf("scanEventForRules takes %d destinations for %d columns", got, want)
+	}
+}
+
+// TestRulesProjectionOmitsRequestBodies (br-GI-13-07): the mirrored check
+// TestSummaryColumnsAreTheFullSetMinusBodies already runs for the summary
+// projection, applied to the rules one -- rulesOmittedColumns is now
+// identical to summaryOmittedColumns, req_body included.
+func TestRulesProjectionOmitsRequestBodies(t *testing.T) {
+	if containsStr(rulesColumnNames, "req_body") {
+		t.Error("rulesColumnNames still selects req_body")
+	}
+	if len(rulesOmittedColumns) != len(summaryOmittedColumns) {
+		t.Fatalf("rulesOmittedColumns = %v, want the same set as summaryOmittedColumns = %v", rulesOmittedColumns, summaryOmittedColumns)
+	}
+	for _, c := range summaryOmittedColumns {
+		if !containsStr(rulesOmittedColumns, c) {
+			t.Errorf("rulesOmittedColumns is missing %q, present in summaryOmittedColumns", c)
+		}
+	}
+}
+
+// TestReqToolNamesIsNullExactlyWhenThereIsNoBody (br-GI-13-07): three rows --
+// a proxy row with tools, a proxy row whose body declares no tools, and a
+// JSONL row with no body -- come back as ["…"], [] and NULL respectively.
+// The middle row is the point: a ''-defaulted column would pass the other
+// two and fail this one.
+func TestReqToolNamesIsNullExactlyWhenThereIsNoBody(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	withTools := fullEvent("req-tools-some")
+	withTools.ToolNames = EncodeToolNames([]string{"bash"})
+	idWithTools, _, err := st.InsertEvent(ctx, withTools)
+	if err != nil {
+		t.Fatalf("InsertEvent withTools: %v", err)
+	}
+
+	noTools := fullEvent("req-tools-none")
+	noTools.ToolNames = EncodeToolNames(nil)
+	idNoTools, _, err := st.InsertEvent(ctx, noTools)
+	if err != nil {
+		t.Fatalf("InsertEvent noTools: %v", err)
+	}
+
+	// A JSONL row: no request body. ToolNames is deliberately set to a
+	// nonsense value here to prove the write derives NULL from len(ReqBody),
+	// not from whatever this field happens to hold.
+	jsonlRow := fullEvent("req-tools-jsonl")
+	jsonlRow.Source = "jsonl"
+	jsonlRow.ReqBody = nil
+	jsonlRow.RespHeaders = ""
+	jsonlRow.ReqHeaders = ""
+	jsonlRow.ToolNames = "garbage"
+	idJSONL, _, err := st.InsertEvent(ctx, jsonlRow)
+	if err != nil {
+		t.Fatalf("InsertEvent jsonlRow: %v", err)
+	}
+
+	got, err := st.GetEvent(ctx, idWithTools)
+	if err != nil {
+		t.Fatalf("GetEvent withTools: %v", err)
+	}
+	if !got.HasReqBody || got.ToolNames != `["bash"]` {
+		t.Errorf("withTools: HasReqBody=%v ToolNames=%q, want true and [\"bash\"]", got.HasReqBody, got.ToolNames)
+	}
+
+	got, err = st.GetEvent(ctx, idNoTools)
+	if err != nil {
+		t.Fatalf("GetEvent noTools: %v", err)
+	}
+	if !got.HasReqBody || got.ToolNames != `[]` {
+		t.Errorf("noTools: HasReqBody=%v ToolNames=%q, want true and []", got.HasReqBody, got.ToolNames)
+	}
+
+	got, err = st.GetEvent(ctx, idJSONL)
+	if err != nil {
+		t.Fatalf("GetEvent jsonlRow: %v", err)
+	}
+	if got.HasReqBody || got.ToolNames != "" {
+		t.Errorf("jsonlRow: HasReqBody=%v ToolNames=%q, want false and \"\"", got.HasReqBody, got.ToolNames)
 	}
 }
 
@@ -1066,7 +1145,32 @@ func eventsSchemaWithoutTranscriptColumns(t *testing.T) string {
 	// resp_body's line keeps its comma up to here; the closing paren may not
 	// follow one.
 	head := strings.TrimSuffix(strings.TrimRight(schemaSQL[:start], " \t\r\n"), ",")
-	return head + "\n);" + schemaSQL[start+end+len("\n);"):]
+	return stripReqToolNamesColumn(t, head+"\n);"+schemaSQL[start+end+len("\n);"):])
+}
+
+// stripReqToolNamesColumn removes the req_tool_names column (br-GI-13-07,
+// migrations[2]) from a schema text, for a fixture standing in for a
+// database at schemaVersion < 3. Shared by eventsSchemaWithoutTranscriptColumns
+// (a database at version 0) and preIndexChangeSchema (a database at version
+// 1): both predate this column, so a fixture built from the *current*
+// schemaSQL text would already carry it, and the ALTER TABLE ADD COLUMN
+// migration this bead adds would then fail "duplicate column name" the
+// moment either fixture's Open runs every migration from its stamped
+// version forward.
+func stripReqToolNamesColumn(t *testing.T, schema string) string {
+	t.Helper()
+	const before = "status                  INTEGER,"
+	const after = "req_headers             TEXT,"
+	i := strings.Index(schema, before)
+	if i < 0 {
+		t.Fatal("schema.sql no longer declares status immediately before req_tool_names")
+	}
+	rest := schema[i+len(before):]
+	j := strings.Index(rest, after)
+	if j < 0 {
+		t.Fatal("schema.sql no longer declares req_headers after req_tool_names")
+	}
+	return schema[:i+len(before)] + rest[j:]
 }
 
 // buildPreChangeDB writes a database in the shape the previous binary left
@@ -1186,7 +1290,11 @@ func preIndexChangeSchema(t *testing.T) string {
 	if !strings.Contains(schemaSQL, newLine) {
 		t.Fatal("schema.sql no longer creates idx_events_session_started with the expected text")
 	}
-	return strings.Replace(schemaSQL, newLine, oldLine, 1)
+	// A database at user_version = 1 also predates req_tool_names
+	// (migrations[2], br-GI-13-07): strip it here too, or Open's forward
+	// migration from 1 hits the same "duplicate column name" this bead's
+	// other pre-change fixture guards against.
+	return stripReqToolNamesColumn(t, strings.Replace(schemaSQL, newLine, oldLine, 1))
 }
 
 // TestMigrateAddsTheCompositeIndexAtVersionTwo (§6 test 9): a database at

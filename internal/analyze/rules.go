@@ -345,7 +345,7 @@ func ruleCacheInvalidatedByTools(rows []*store.Event) []store.Warning {
 		if float64(write) < bigWriteFraction*float64(prev.TotalPromptTokens) {
 			continue
 		}
-		if toolNamesEqual(prev.ReqBody, cur.ReqBody) {
+		if prev.ToolNames == cur.ToolNames {
 			continue
 		}
 		out = append(out, withEventID(cur.ID, warning(KindCacheInvalidatedByTools, SeverityWarn,
@@ -358,11 +358,14 @@ func ruleCacheInvalidatedByTools(rows []*store.Event) []store.Warning {
 // in order. A JSONL-sourced row structurally never carries one (the
 // transcript records no request), so this is what lets a rule that
 // compares consecutive request bodies skip over an interleaved JSONL row
-// rather than treating it as an adjacent, body-less pair.
+// rather than treating it as an adjacent, body-less pair. Since br-GI-13-07
+// the rules projection no longer selects req_body itself, so this reads
+// HasReqBody -- the req_tool_names column's own NULL-iff-no-body contract --
+// rather than a body length.
 func rowsWithRequestBody(rows []*store.Event) []*store.Event {
 	out := make([]*store.Event, 0, len(rows))
 	for _, r := range rows {
-		if len(r.ReqBody) > 0 {
+		if r.HasReqBody {
 			out = append(out, r)
 		}
 	}
@@ -384,20 +387,6 @@ func rowsWithUsage(rows []*store.Event) []*store.Event {
 		}
 	}
 	return out
-}
-
-func toolNamesEqual(a, b []byte) bool {
-	an := parse.ExtractMeta(a, http.Header{}).ToolNames
-	bn := parse.ExtractMeta(b, http.Header{}).ToolNames
-	if len(an) != len(bn) {
-		return false
-	}
-	for i := range an {
-		if an[i] != bn[i] {
-			return false
-		}
-	}
-	return true
 }
 
 // ruleCacheWriteNeverRead fires on a write with no subsequent read of any

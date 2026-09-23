@@ -25,17 +25,6 @@ func warningKinds(warnings []store.Warning) map[string][]int64 {
 	return out
 }
 
-func reqBodyWithTools(names ...string) []byte {
-	toolsJSON := ""
-	for i, n := range names {
-		if i > 0 {
-			toolsJSON += ","
-		}
-		toolsJSON += `{"name":"` + n + `"}`
-	}
-	return []byte(`{"model":"claude-sonnet-5","tools":[` + toolsJSON + `],"messages":[]}`)
-}
-
 // --- cache_prefix_invalidation ------------------------------------------
 
 func TestRuleCachePrefixInvalidationFiresOnInvalidatorLoop(t *testing.T) {
@@ -102,8 +91,8 @@ func TestRuleCachePrefixInvalidationStillDeclinesARealCacheRead(t *testing.T) {
 
 func TestRuleCacheInvalidatedByToolsFiresOnChangedArray(t *testing.T) {
 	rows := []*store.Event{
-		{EventSummary: store.EventSummary{ID: 1, StartedAt: at(0), TotalPromptTokens: 5000}, ReqBody: reqBodyWithTools("bash", "read")},
-		{EventSummary: store.EventSummary{ID: 2, StartedAt: at(1), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900}, ReqBody: reqBodyWithTools("bash", "read", "edit")},
+		{EventSummary: store.EventSummary{ID: 1, StartedAt: at(0), TotalPromptTokens: 5000, HasReqBody: true, ToolNames: store.EncodeToolNames([]string{"bash", "read"})}},
+		{EventSummary: store.EventSummary{ID: 2, StartedAt: at(1), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900, HasReqBody: true, ToolNames: store.EncodeToolNames([]string{"bash", "read", "edit"})}},
 	}
 	found := warningKinds(ruleCacheInvalidatedByTools(rows))
 	if ids := found[string(KindCacheInvalidatedByTools)]; len(ids) != 1 || ids[0] != 2 {
@@ -113,11 +102,33 @@ func TestRuleCacheInvalidatedByToolsFiresOnChangedArray(t *testing.T) {
 
 func TestRuleCacheInvalidatedByToolsSilentOnIdenticalArray(t *testing.T) {
 	rows := []*store.Event{
-		{EventSummary: store.EventSummary{ID: 1, StartedAt: at(0), TotalPromptTokens: 5000}, ReqBody: reqBodyWithTools("bash", "read")},
-		{EventSummary: store.EventSummary{ID: 2, StartedAt: at(1), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900}, ReqBody: reqBodyWithTools("bash", "read")},
+		{EventSummary: store.EventSummary{ID: 1, StartedAt: at(0), TotalPromptTokens: 5000, HasReqBody: true, ToolNames: store.EncodeToolNames([]string{"bash", "read"})}},
+		{EventSummary: store.EventSummary{ID: 2, StartedAt: at(1), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900, HasReqBody: true, ToolNames: store.EncodeToolNames([]string{"bash", "read"})}},
 	}
 	if got := ruleCacheInvalidatedByTools(rows); got != nil {
 		t.Errorf("identical tools raised %v, want nil", got)
+	}
+}
+
+// TestRuleCacheInvalidatedByToolsReadsTheStoredNames (br-GI-13-07): the
+// fixture carries no ReqBody at all, which is what proves the rule no longer
+// parses one -- only the two rows' stored ToolNames decide the outcome.
+func TestRuleCacheInvalidatedByToolsReadsTheStoredNames(t *testing.T) {
+	rows := []*store.Event{
+		{EventSummary: store.EventSummary{ID: 1, StartedAt: at(0), TotalPromptTokens: 5000, HasReqBody: true, ToolNames: store.EncodeToolNames([]string{"bash", "read"})}},
+		{EventSummary: store.EventSummary{ID: 2, StartedAt: at(1), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900, HasReqBody: true, ToolNames: store.EncodeToolNames([]string{"bash", "read", "edit"})}},
+	}
+	found := warningKinds(ruleCacheInvalidatedByTools(rows))
+	if ids := found[string(KindCacheInvalidatedByTools)]; len(ids) != 1 || ids[0] != 2 {
+		t.Errorf("changed tools findings = %v, want exactly [2]", ids)
+	}
+
+	same := []*store.Event{
+		{EventSummary: store.EventSummary{ID: 1, StartedAt: at(0), TotalPromptTokens: 5000, HasReqBody: true, ToolNames: store.EncodeToolNames([]string{"bash", "read"})}},
+		{EventSummary: store.EventSummary{ID: 2, StartedAt: at(1), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900, HasReqBody: true, ToolNames: store.EncodeToolNames([]string{"bash", "read"})}},
+	}
+	if got := ruleCacheInvalidatedByTools(same); got != nil {
+		t.Errorf("identical stored names raised %v, want nil", got)
 	}
 }
 
@@ -129,9 +140,9 @@ func TestRuleCacheInvalidatedByToolsSilentOnIdenticalArray(t *testing.T) {
 // all, and this case would go silent for no reason anyone chose.
 func TestRuleCacheInvalidatedByToolsFiresAcrossInterleavedJSONLRow(t *testing.T) {
 	rows := []*store.Event{
-		{EventSummary: store.EventSummary{ID: 1, Source: "proxy", StartedAt: at(0), TotalPromptTokens: 5000}, ReqBody: reqBodyWithTools("bash", "read")},
-		{EventSummary: store.EventSummary{ID: 2, Source: "jsonl", StartedAt: at(1)}}, // no ReqBody -- structurally, a JSONL row
-		{EventSummary: store.EventSummary{ID: 3, Source: "proxy", StartedAt: at(2), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900}, ReqBody: reqBodyWithTools("bash", "read", "edit")},
+		{EventSummary: store.EventSummary{ID: 1, Source: "proxy", StartedAt: at(0), TotalPromptTokens: 5000, HasReqBody: true, ToolNames: store.EncodeToolNames([]string{"bash", "read"})}},
+		{EventSummary: store.EventSummary{ID: 2, Source: "jsonl", StartedAt: at(1)}}, // HasReqBody false -- structurally, a JSONL row
+		{EventSummary: store.EventSummary{ID: 3, Source: "proxy", StartedAt: at(2), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900, HasReqBody: true, ToolNames: store.EncodeToolNames([]string{"bash", "read", "edit"})}},
 	}
 	found := warningKinds(ruleCacheInvalidatedByTools(rows))
 	if ids := found[string(KindCacheInvalidatedByTools)]; len(ids) != 1 || ids[0] != 3 {

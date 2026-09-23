@@ -488,6 +488,11 @@ func buildEvent(call *sink.CapturedCall, meta parse.Meta, usage parse.Usage) *st
 			Method:             call.Method,
 			Path:               call.Path,
 			Status:             call.Status,
+			// The store derives NULL-vs-value from len(ReqBody) at write time
+			// (reqToolNamesArg), so this is set unconditionally -- meta was
+			// already extracted from call.ReqBody, so it costs no extra parse
+			// whether or not a body ends up stored.
+			ToolNames: store.EncodeToolNames(meta.ToolNames),
 		},
 		ReqBody:  call.ReqBody,
 		RespBody: call.RespBody,

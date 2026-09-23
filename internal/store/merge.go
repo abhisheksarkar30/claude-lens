@@ -22,7 +22,7 @@ const eventWriteColumns = `
 	is_sidechain, session_id, project, git_branch, client_version, cli_entrypoint,
 	cost_usd, api_equivalent_cost_usd, cost_source,
 	prefix_hash, replay_of, replay_edits, capture_complete,
-	method, path, status, req_headers, resp_headers, req_body, resp_body,
+	method, path, status, req_tool_names, req_headers, resp_headers, req_body, resp_body,
 	transcript_content, transcript_role`
 
 func eventWriteArgs(ev *Event) []any {
@@ -37,7 +37,7 @@ func eventWriteArgs(ev *Event) []any {
 		boolToInt(ev.IsSidechain), ev.SessionID, ev.Project, ev.GitBranch, ev.ClientVersion, ev.CliEntrypoint,
 		nullableFloat(ev.CostUSD), nullableFloat(ev.ApiEquivalentCostUSD), ev.CostSource,
 		nullableString(ev.PrefixHash), ev.ReplayOf, ev.ReplayEdits, boolToInt(ev.CaptureComplete),
-		nullEmptyString(ev.Method), nullEmptyString(ev.Path), nullZeroInt(ev.Status), nullEmptyString(ev.ReqHeaders), nullEmptyString(ev.RespHeaders), ev.ReqBody, ev.RespBody,
+		nullEmptyString(ev.Method), nullEmptyString(ev.Path), nullZeroInt(ev.Status), reqToolNamesArg(ev), nullEmptyString(ev.ReqHeaders), nullEmptyString(ev.RespHeaders), ev.ReqBody, ev.RespBody,
 		ev.TranscriptContent, nullEmptyString(ev.TranscriptRole),
 	}
 }
@@ -339,6 +339,15 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	bodySides := 0
 	if len(existing.ReqBody) == 0 {
 		merged.ReqBody = incoming.ReqBody
+		// req_tool_names is a function of whichever body the row ends up
+		// holding (br-GI-13-07), not of whichever side merged := *existing
+		// happened to carry over. Left to existing alone, a merge that
+		// backfills a body from incoming would produce a row with a body and
+		// a stale (or NULL) ToolNames -- the exact "NULL iff no body"
+		// violation the column's contract forbids, and rowsWithRequestBody's
+		// HasReqBody filter would then skip a body-bearing row and the tools
+		// rule would silently decline on it.
+		merged.ToolNames = incoming.ToolNames
 		if len(incoming.ReqBody) > 0 {
 			bodySides |= bodyFromIncoming
 		}
