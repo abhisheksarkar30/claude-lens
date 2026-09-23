@@ -167,17 +167,6 @@ func applyMergeTx(ctx context.Context, tx *sql.Tx, existing, incoming *Event) (*
 	return result, nil
 }
 
-// mergeEvents merges incoming into existing (existing.ID is preserved) and
-// reports whether both sides were complete captures that disagree on
-// tokens.
-//
-// The complete capture wins the token/cost/response-derived columns; an
-// absent or partial side simply has nothing to contribute (a 0-vs-N
-// difference is not a disagreement). source_refs gains the new source;
-// first_source and session_id are never rewritten. The columns one source
-// structurally cannot supply (proxy-only capture fields for a JSONL row,
-// and the JSONL-only fields for a proxy row) are backfilled from whichever
-// side actually has them.
 // tokenFields lists every token column a merge compares for disagreement.
 // tokensDiffer and diffTokenFields both iterate this one table so the two
 // can never drift into checking different fields.
@@ -208,6 +197,17 @@ func diffTokenFields(existing, incoming *Event) string {
 	return strings.Join(parts, ", ")
 }
 
+// mergeEvents merges incoming into existing (existing.ID is preserved) and
+// reports whether both sides were complete captures that disagree on
+// tokens.
+//
+// The complete capture wins the token/cost/response-derived columns; an
+// absent or partial side simply has nothing to contribute (a 0-vs-N
+// difference is not a disagreement). source_refs gains the new source;
+// first_source and session_id are never rewritten. The columns one source
+// structurally cannot supply (proxy-only capture fields for a JSONL row,
+// and the JSONL-only fields for a proxy row) are backfilled from whichever
+// side actually has them.
 func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	merged := *existing
 	merged.SourceRefs = unionStrings(existing.SourceRefs, append([]string{existing.Source}, incoming.Source))
