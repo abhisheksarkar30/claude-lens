@@ -153,8 +153,12 @@ restart clean, and it is the same mechanism a future `clens reload` would need �
     not a zero exit.
 - Integration Tests: none — the two units above plus the manual check below cover the path.
 - Manual (recorded in the PR body): start `clens serve`, run `clens shutdown` from a second shell, and
-  show the serve console's own shutdown log lines — the proxy and dashboard shutdown reports and the
-  consumer drain completing — which a hard kill does not produce.
+  show `clens shutdown`'s own confirmation line plus the serve process exiting cleanly (return code 0,
+  no panic/stack trace on its console) and releasing both ports so a subsequent `clens serve` can bind
+  them immediately — none of which a hard kill gives you, since that leaves the ports and any in-flight
+  write in whatever state they were in. (Corrected from the original wording, which described distinct
+  proxy/dashboard/consumer-drain log lines on the serve console; `serve.go`'s shutdown path only logs on
+  an *error* from `Shutdown()`, so a clean run is silent there and has no such lines to show.)
 
 ## Files to Touch
 
