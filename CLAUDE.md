@@ -19,40 +19,18 @@ default.
 See `docs/planning/GI-1-claude-lens-v1.md` for the converged plan (v6, 7 review rounds). The work
 items are `.beads/GI-1/br-GI-1-01` … `-19`; each bead names its own file list and outcome definition.
 
-**Before touching any code in this repo — including a one-off ad hoc request, not just a
-`/develop-story` run — read `docs/context/INDEX.md` first**, then the specific module doc(s)
-covering the area you're about to change. This is the map to the code — architecture, storage
-schema, cost model, conventions, the CLI and API surfaces, and the decision records. It states the
-*enforced* conventions and the invariants in their shortest form. Treat what it says about the
-specific slice you're changing as a hypothesis, not fact, until you check it against the real
-source; the code wins wherever they disagree.
-
-**The other half of that rule: track the doc, don't stop to fix it mid-change.** Whether the
-staleness turns up mid-read (a doc claim that no longer matches the code) or your own change just
-created it (a new, renamed, or removed entity, endpoint, permission, flow, module, or convention),
-add the specific `docs/context/*.md` file:line claim to a running list as you go rather than
-patching it inline:
-- **Ad hoc edit** — at the end of the task, surface that list to the user as a suggestion (name the
-  file:line and what's now stale) and offer to update it — don't fix it unprompted.
-- **Under `/develop-story`** — append it to a running "Context docs to refresh" list in the story's
-  plan file (`docs/planning/{ticket-id}-{slug}.md`) as you go. Phase 5.6 still does its normal
-  full-PR-diff scoping (new/changed/removed entities, endpoints, permissions, flows, modules,
-  conventions across every commit on the branch) — that list is a guaranteed floor on top of it,
-  not a replacement, so a claim spotted mid-story can't fall out of scope if the later diff-based
-  pass misses it.
-
-Skip only when the change is purely internal to the code (nothing a context doc would claim), and
-say so rather than skipping silently.
+`docs/context/INDEX.md` is this repo's map to the code — architecture, storage schema, cost
+model, conventions, the CLI and API surfaces, and the decision records. It states the *enforced*
+conventions and the invariants in their shortest form. The read-first / track-staleness rule for
+`docs/context/` lives in the user CLAUDE.md; under `/develop-story`, staleness is tracked in the
+story's plan file (`docs/planning/{ticket-id}-{slug}.md`)'s "Context docs to refresh" list.
 
 ## Migrations
 
-Any plan or bead step that runs a schema migration (a `schemaVersion` bump, or any change under
-`internal/store/schema.sql` / `migrations`) — whether Claude executes it directly against a real
-`lens.db` or the plan/bead only states it for the user to run manually — is preceded by an automatic
-backup of the live database file(s) (`lens.db`, `lens.db-wal`, `lens.db-shm`) to a separate path
-before the migration runs. This applies regardless of file size: `cp` is cheap, a bad migration
-against the only copy of months of captured traffic is not recoverable. State the backup path when
-it's made.
+Applies the user CLAUDE.md's backup-before-migration rule to this repo's specifics: back up
+`lens.db`, `lens.db-wal`, and `lens.db-shm` before any `schemaVersion` bump or change under
+`internal/store/schema.sql` / `migrations` — whether Claude runs the migration directly against a
+real `lens.db` or the plan/bead only states it for the user to run manually.
 
 ## Setup
 
@@ -159,11 +137,3 @@ there is nothing for it to integrate.
   modes on Unix and an explicit Windows ACL on Windows (`0600` is a no-op there). Full bodies *are*
   stored, so the content — every prompt and every file the agent read — is the asset this repo is
   protecting. Loopback binding and redaction are load-bearing defaults, not conveniences.
-
-## Compact Instructions
-
-When compacting, always preserve the working state for continuation:
-
-- Keep the current high-level goal and acceptance criteria.
-- Keep the exact list of files modified during this session.
-- Do not preserve verbose terminal outputs or tool logs.
