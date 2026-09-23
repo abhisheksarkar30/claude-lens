@@ -818,6 +818,66 @@ func TestSessionWarningCountMatchesWarningRows(t *testing.T) {
 	}
 }
 
+// TestBatchEndPassWritesTheUsageLessTailFinding (§6 test 5, pipe level): a
+// batch of three full rewrites followed by a usage-less row (an upstream
+// error, so its response never carries usage) writes the
+// cache_prefix_invalidation warning through the single batch-end pass,
+// anchored on the last usage-carrying row. This fails if rowsWithUsage is
+// dropped, if the walk reverts to aborting on a usage-less pair, or if the
+// anchor lands on the usage-less row instead.
+func TestBatchEndPassWritesTheUsageLessTailFinding(t *testing.T) {
+	st := newTestStore(t)
+	resolver := session.New(st, 30)
+	sk := sink.New(sink.DefaultCapacity)
+	c := New(sk, st, nil)
+	c.SetSessionResolver(resolver)
+	c.SetSessionAggregator(resolver)
+	c.SetSessionRule(analyze.Engine{})
+
+	headers := http.Header{}
+	headers.Set("x-clens-session", "sess-usageless-tail")
+
+	p1 := basicCall("req-tail-p1")
+	p1.ReqHeaders = headers
+	p1.RespBody = nonStreamBody("claude-sonnet-5", 5000, 5)
+
+	p2 := basicCall("req-tail-p2")
+	p2.ReqHeaders = headers
+	p2.RespBody = nonStreamBodyWithCacheWrite5m("claude-sonnet-5", 4900)
+
+	p3 := basicCall("req-tail-p3")
+	p3.ReqHeaders = headers
+	p3.RespBody = nonStreamBodyWithCacheWrite5m("claude-sonnet-5", 5000)
+
+	z := basicCall("req-tail-z")
+	z.ReqHeaders = headers
+	z.Err = errors.New("upstream connection reset")
+	z.RespBody = nil
+
+	ctx := context.Background()
+	c.flush(ctx, []*pendingEvent{
+		c.processCall(p1), c.processCall(p2), c.processCall(p3), c.processCall(z),
+	})
+
+	evs, err := st.ListEvents(ctx, store.EventFilter{})
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var p3ID int64
+	for _, e := range evs {
+		if e.RequestID == "req-tail-p3" {
+			p3ID = e.ID
+		}
+	}
+	warnings, err := st.EventWarnings(ctx, p3ID)
+	if err != nil {
+		t.Fatalf("EventWarnings: %v", err)
+	}
+	if !hasWarningKind(warnings, string(analyze.KindCachePrefixInvalidation)) {
+		t.Errorf("p3 missing cache_prefix_invalidation after a usage-less tail row: %v", warnings)
+	}
+}
+
 // -race clean with a concurrent producer.
 func TestConsumerConcurrentProducer(t *testing.T) {
 	st := newTestStore(t)

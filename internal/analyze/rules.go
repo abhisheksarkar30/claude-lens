@@ -291,7 +291,19 @@ const bigWriteFraction = 0.5
 // re-writes roughly the whole prior conversation into the cache instead
 // of reading from it -- a healthy session's writes taper off after the
 // first turn as later turns read the growing prefix instead.
+//
+// The row set is filtered to usage-carrying rows before the walk (D9): a
+// usage-less row (a 429, a truncated body) would otherwise abort the walk
+// as a zero prevTotal or a zero write and permanently drop a real finding
+// -- the walk returns nil on the first violating pair, so one bad row
+// anywhere in the session used to cost the whole session's finding. A real
+// row that continues the rewrite run past a filtered usage-less row still
+// anchors the finding on itself, same as if the usage-less row had never
+// arrived; a real row that instead reads from cache still declines it,
+// same as today -- filtering changes which rows are walked, not the
+// walk's own condition.
 func ruleCachePrefixInvalidation(rows []*store.Event) []store.Warning {
+	rows = rowsWithUsage(rows)
 	if len(rows) < 3 {
 		return nil
 	}
@@ -351,6 +363,23 @@ func rowsWithRequestBody(rows []*store.Event) []*store.Event {
 	out := make([]*store.Event, 0, len(rows))
 	for _, r := range rows {
 		if len(r.ReqBody) > 0 {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// rowsWithUsage returns the subset of rows that actually carry usage, in
+// order -- the sibling filter to rowsWithRequestBody, for a rule that reads
+// token columns rather than bodies. TotalPromptTokens is zero for a
+// usage-less row (a 429 or a truncated body; the store recomputes the
+// column from the token columns), and unlike rowsWithRequestBody this keeps
+// JSONL rows: a transcript line structurally never carries a request body
+// but does carry usage.
+func rowsWithUsage(rows []*store.Event) []*store.Event {
+	out := make([]*store.Event, 0, len(rows))
+	for _, r := range rows {
+		if r.TotalPromptTokens != 0 {
 			out = append(out, r)
 		}
 	}

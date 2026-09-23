@@ -62,6 +62,42 @@ func TestRuleCachePrefixInvalidationSilentOnHealthyLoop(t *testing.T) {
 	}
 }
 
+// TestRuleCachePrefixInvalidationSurvivesAUsageLessTail (§6 test 5, D9): a
+// usage-less row (a 429 or a truncated body leaves TotalPromptTokens at
+// zero) trailing three full rewrites must not abort the whole session's
+// finding -- rowsWithUsage filters it out before the walk, and the finding
+// still anchors on the last usage-carrying row, the same row today's
+// per-row pass would have anchored on.
+func TestRuleCachePrefixInvalidationSurvivesAUsageLessTail(t *testing.T) {
+	rows := []*store.Event{
+		{EventSummary: store.EventSummary{ID: 1, StartedAt: at(0), TotalPromptTokens: 5000}},
+		{EventSummary: store.EventSummary{ID: 2, StartedAt: at(1), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900}},
+		{EventSummary: store.EventSummary{ID: 3, StartedAt: at(2), TotalPromptTokens: 5200, CacheWrite5mTokens: 5000}},
+		{EventSummary: store.EventSummary{ID: 4, StartedAt: at(3), TotalPromptTokens: 0}}, // usage-less
+	}
+	found := warningKinds(ruleCachePrefixInvalidation(rows))
+	ids := found[string(KindCachePrefixInvalidation)]
+	if len(ids) != 1 || ids[0] != 3 {
+		t.Errorf("usage-less tail findings = %v, want exactly [3] (the last usage-carrying row)", ids)
+	}
+}
+
+// TestRuleCachePrefixInvalidationStillDeclinesARealCacheRead (§6 test 5):
+// the write < 0.5*prevTotal disjunct is the rule's actual condition and must
+// survive the rowsWithUsage filter. The fixture carries three
+// usage-carrying rows so the case is decided by that disjunct, not by the
+// len(rows) < 3 guard firing first.
+func TestRuleCachePrefixInvalidationStillDeclinesARealCacheRead(t *testing.T) {
+	rows := []*store.Event{
+		{EventSummary: store.EventSummary{ID: 1, StartedAt: at(0), TotalPromptTokens: 5000}},
+		{EventSummary: store.EventSummary{ID: 2, StartedAt: at(1), TotalPromptTokens: 5100, CacheWrite5mTokens: 4900}},
+		{EventSummary: store.EventSummary{ID: 3, StartedAt: at(2), TotalPromptTokens: 5200, CacheReadTokens: 5000}},
+	}
+	if got := ruleCachePrefixInvalidation(rows); got != nil {
+		t.Errorf("a real cache read raised %v, want nil", got)
+	}
+}
+
 // --- cache_invalidated_by_tools ------------------------------------------
 
 func TestRuleCacheInvalidatedByToolsFiresOnChangedArray(t *testing.T) {
