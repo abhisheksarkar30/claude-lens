@@ -245,8 +245,8 @@ func (f *failingStore) UpsertWarnings(ctx context.Context, eventID int64, warnin
 	return f.inner.UpsertWarnings(ctx, eventID, warnings)
 }
 
-func (f *failingStore) SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error) {
-	return f.inner.SessionEvents(ctx, sessionID)
+func (f *failingStore) SessionEventsForRules(ctx context.Context, sessionID string) ([]*store.Event, error) {
+	return f.inner.SessionEventsForRules(ctx, sessionID)
 }
 
 // A store error on one call does not stop processing subsequent calls.
@@ -517,7 +517,7 @@ func TestConsumerSessionRuleAttachesFindingToEarlierRow(t *testing.T) {
 	}
 }
 
-// countingStore wraps a Store and counts SessionEvents calls, so a test can
+// countingStore wraps a Store and counts SessionEventsForRules calls, so a test can
 // assert the session-scoped pass runs once per distinct session in a batch,
 // not once per row (C1, br-GI-13-01).
 type countingStore struct {
@@ -525,9 +525,9 @@ type countingStore struct {
 	sessionEventsCalls atomic.Int32
 }
 
-func (c *countingStore) SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error) {
+func (c *countingStore) SessionEventsForRules(ctx context.Context, sessionID string) ([]*store.Event, error) {
 	c.sessionEventsCalls.Add(1)
-	return c.Store.SessionEvents(ctx, sessionID)
+	return c.Store.SessionEventsForRules(ctx, sessionID)
 }
 
 // countingAggregator wraps a SessionAggregator and counts RecordCall calls,
@@ -584,7 +584,7 @@ func TestFlushFoldsAndPassesOncePerSession(t *testing.T) {
 	c.flush(ctx, batch)
 
 	if got := cst.sessionEventsCalls.Load(); got != 1 {
-		t.Errorf("SessionEvents calls = %d, want 1 (once per distinct session, not once per row)", got)
+		t.Errorf("SessionEventsForRules calls = %d, want 1 (once per distinct session, not once per row)", got)
 	}
 	if got := agg.recordCallCalls.Load(); got != 1 {
 		t.Errorf("RecordCall calls = %d, want 1 (once per distinct session, not once per row)", got)

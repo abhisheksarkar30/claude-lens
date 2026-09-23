@@ -7,7 +7,7 @@ import (
 )
 
 // PublishingStore wraps a *store.Store and satisfies internal/consumer's
-// narrow Store interface (InsertEvent, UpsertWarnings, SessionEvents),
+// narrow Store interface (InsertEvent, UpsertWarnings, SessionEventsForRules),
 // publishing a Broker event after each successful write.
 //
 // consumer.New's Store parameter is already a narrow interface anything
@@ -20,7 +20,7 @@ import (
 // using the bare *store.Store directly, so a read can never trigger a
 // publish.
 //
-// SessionEvents needs no override: it is a read call consumer.Store
+// SessionEventsForRules needs no override: it is a read call consumer.Store
 // requires (for the session-scoped analyzer pass) and is promoted
 // unchanged from the embedded *store.Store.
 type PublishingStore struct {

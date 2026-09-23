@@ -743,6 +743,190 @@ func TestSummaryScanMatchesSummaryColumns(t *testing.T) {
 	}
 }
 
+// explainQueryPlanDetail runs EXPLAIN QUERY PLAN over query and concatenates
+// every row's columns into one string a test can substring-match against.
+func explainQueryPlanDetail(t *testing.T, db *sql.DB, query string, args ...any) string {
+	t.Helper()
+	rows, err := db.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN columns: %v", err)
+	}
+	var out strings.Builder
+	for rows.Next() {
+		dest := make([]any, len(cols))
+		for i := range dest {
+			dest[i] = new(sql.RawBytes)
+		}
+		if err := rows.Scan(dest...); err != nil {
+			t.Fatalf("EXPLAIN QUERY PLAN scan: %v", err)
+		}
+		for _, d := range dest {
+			out.Write(*d.(*sql.RawBytes))
+			out.WriteByte(' ')
+		}
+		out.WriteByte('\n')
+	}
+	return out.String()
+}
+
+// TestSessionEventsForRulesUsesTheIndexWithoutASort (§6 test 1) is the
+// runnable check for the whole story: the session-scoped SELECT the rules
+// pass runs must be served by the composite index, not a materialize-and-sort.
+func TestSessionEventsForRulesUsesTheIndexWithoutASort(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	q := rulesSelectColumns + " FROM events WHERE session_id = ? ORDER BY started_at ASC"
+
+	// (a) no temp b-tree sort in the plan.
+	plan := explainQueryPlanDetail(t, st.db, q, "sess-explain")
+	if strings.Contains(strings.ToUpper(plan), "USE TEMP B-TREE FOR ORDER BY") {
+		t.Errorf("query plan uses a temp b-tree sort: %s", plan)
+	}
+
+	// (b) textual: the query string still carries its own ORDER BY. Once the
+	// composite index exists, WHERE session_id = ? returns started_at order
+	// off the index even with no ORDER BY at all, so (a) alone would also
+	// pass with the ORDER BY silently removed.
+	if !strings.Contains(q, "ORDER BY started_at") {
+		t.Errorf("session-scoped SELECT lost its ORDER BY started_at: %q", q)
+	}
+
+	// (c) a fixture whose rowid order and started_at order disagree still
+	// comes back in started_at order, catching a direction flip or a
+	// hand-built reordering that (a) and (b) alone would miss.
+	base := time.Unix(1700000000, 0)
+	newer := fullEvent("req-plan-newer")
+	newer.SessionID = "sess-plan-order"
+	newer.StartedAt = base.Add(time.Hour)
+	older := fullEvent("req-plan-older")
+	older.SessionID = "sess-plan-order"
+	older.StartedAt = base
+	if _, _, err := st.InsertEvent(ctx, newer); err != nil {
+		t.Fatalf("InsertEvent newer: %v", err)
+	}
+	if _, _, err := st.InsertEvent(ctx, older); err != nil {
+		t.Fatalf("InsertEvent older: %v", err)
+	}
+
+	rows, err := st.SessionEventsForRules(ctx, "sess-plan-order")
+	if err != nil {
+		t.Fatalf("SessionEventsForRules: %v", err)
+	}
+	if len(rows) != 2 || rows[0].RequestID != "req-plan-older" || rows[1].RequestID != "req-plan-newer" {
+		t.Fatalf("rows = %+v, want [req-plan-older, req-plan-newer] in started_at order", rows)
+	}
+}
+
+// TestSessionEventsForRulesReturnsTheSameRowsInOrder (§6 test 2): compared
+// against GetEvent's full-projection fields on a fixture, so the rules
+// projection cannot silently drop a column the rules use.
+func TestSessionEventsForRulesReturnsTheSameRowsInOrder(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	first := fullEvent("req-rules-first")
+	first.SessionID = "sess-rules"
+	first.StartedAt = time.Unix(1700000000, 0)
+	second := fullEvent("req-rules-second")
+	second.SessionID = "sess-rules"
+	second.StartedAt = time.Unix(1700000100, 0)
+
+	id1, _, err := st.InsertEvent(ctx, first)
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+	id2, _, err := st.InsertEvent(ctx, second)
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+
+	want1, err := st.GetEvent(ctx, id1)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	want2, err := st.GetEvent(ctx, id2)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+
+	rows, err := st.SessionEventsForRules(ctx, "sess-rules")
+	if err != nil {
+		t.Fatalf("SessionEventsForRules: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	for i, want := range []*Event{want1, want2} {
+		got := rows[i]
+		if got.RequestID != want.RequestID || !got.StartedAt.Equal(want.StartedAt) ||
+			got.ModelResolved != want.ModelResolved || got.TotalPromptTokens != want.TotalPromptTokens ||
+			got.PrefixHash == nil || want.PrefixHash == nil || *got.PrefixHash != *want.PrefixHash ||
+			string(got.ReqBody) != string(want.ReqBody) {
+			t.Errorf("row %d = %+v, want the full-projection fields of %+v", i, got, want)
+		}
+		if got.RespBody != nil || got.ReqHeaders != "" || got.RespHeaders != "" ||
+			got.TranscriptContent != nil || got.TranscriptRole != "" {
+			t.Errorf("row %d retained an omitted blob: %+v", i, got)
+		}
+	}
+}
+
+// TestRulesProjectionNamesEveryColumnTheRulesRead (§6 test 3), two
+// assertions: (i) the mirrored full-minus-omitted check TestSummary...
+// already runs for the summary projection, applied to the rules one; and
+// (ii) the nine columns the rules actually read (§2), named explicitly --
+// rulesOmittedColumns derives from summaryOmittedColumns, whose membership
+// nothing pins, so (i) alone would pass even if a body column a rule reads
+// were accidentally omitted.
+func TestRulesProjectionNamesEveryColumnTheRulesRead(t *testing.T) {
+	full := parseSelectColumns(t, eventSelectColumns)
+	rules := parseSelectColumns(t, rulesSelectColumns)
+
+	if want := len(full) - len(rulesOmittedColumns); len(rules) != want {
+		t.Fatalf("rules projection selects %d columns, want %d (full %d minus %d omitted)",
+			len(rules), want, len(full), len(rulesOmittedColumns))
+	}
+	for _, c := range rulesOmittedColumns {
+		if !containsStr(full, c) {
+			t.Errorf("rulesOmittedColumns names %q, which the full projection does not select", c)
+		}
+	}
+	for _, c := range rules {
+		if containsStr(rulesOmittedColumns, c) {
+			t.Errorf("rules projection selects the omitted column %q", c)
+		}
+	}
+
+	mustRead := []string{
+		"id", "started_at", "ended_at", "total_prompt_tokens",
+		"cache_write_5m_tokens", "cache_write_1h_tokens", "cache_read_tokens",
+		"prefix_hash", "req_body",
+	}
+	for _, c := range mustRead {
+		if !containsStr(rules, c) {
+			t.Errorf("rules projection does not select %q, which a session rule reads", c)
+		}
+	}
+}
+
+// TestRulesScanMatchesRulesColumns (§6 test 3): the 42-destination count,
+// mirroring TestSummaryScanMatchesSummaryColumns.
+func TestRulesScanMatchesRulesColumns(t *testing.T) {
+	var es EventSummary
+	var v eventScanVals
+	var reqBody []byte
+
+	if got, want := len(v.dest(&es, &reqBody)), len(rulesColumnNames); got != want {
+		t.Errorf("scanEventForRules takes %d destinations for %d columns", got, want)
+	}
+}
+
 // TestLatestProxyStartedAt: the observed half of the proxy-mode badge. Its
 // contract has two edges worth pinning at the store: an empty store is the
 // zero time rather than an error, and a transcript-only store is *not*
@@ -1042,12 +1226,12 @@ func TestMigrateAddsTheCompositeIndexAtVersionTwo(t *testing.T) {
 		t.Error("the migration left idx_events_session_id behind")
 	}
 
-	rows, err := st.SessionEvents(context.Background(), sessionID)
+	rows, err := st.SessionEventsForRules(context.Background(), sessionID)
 	if err != nil {
-		t.Fatalf("SessionEvents: %v", err)
+		t.Fatalf("SessionEventsForRules: %v", err)
 	}
 	if len(rows) != 1 || rows[0].RequestID != "req-pre-index" {
-		t.Errorf("SessionEvents = %+v, want the seeded row still returned", rows)
+		t.Errorf("SessionEventsForRules = %+v, want the seeded row still returned", rows)
 	}
 }
 

@@ -335,35 +335,36 @@ func (s *Store) GetEvent(ctx context.Context, id int64) (*Event, error) {
 	return scanEvent(row)
 }
 
-// SessionEvents returns sessionID's rows oldest-first, for the
-// session-scoped analyzer pass (br-GI-1-09) that compares consecutive
-// calls. Unlike ListEvents it takes no pagination. Before D7 a session's
-// row count was bounded by the session resolver's own gap window, since a
-// call beyond the gap got a fresh session id rather than joining this
-// one; D7 makes a session the whole conversation a header names, so that
-// bound no longer holds and nothing here replaces it.
-func (s *Store) SessionEvents(ctx context.Context, sessionID string) ([]*Event, error) {
-	rows, err := s.db.QueryContext(ctx, eventSelectColumns+" FROM events WHERE session_id = ? ORDER BY started_at ASC", sessionID)
+// SessionEventsForRules returns sessionID's rows oldest-first, at the rules
+// projection: every column the session-scoped analyzer pass (br-GI-1-09)
+// reads, req_body included, without the other five header/body blobs it
+// never touches. Unlike ListEvents it takes no pagination. Before D7 a
+// session's row count was bounded by the session resolver's own gap window,
+// since a call beyond the gap got a fresh session id rather than joining
+// this one; D7 makes a session the whole conversation a header names, so
+// that bound no longer holds and nothing here replaces it.
+func (s *Store) SessionEventsForRules(ctx context.Context, sessionID string) ([]*Event, error) {
+	rows, err := s.db.QueryContext(ctx, rulesSelectColumns+" FROM events WHERE session_id = ? ORDER BY started_at ASC", sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("store: SessionEvents: %w", err)
+		return nil, fmt.Errorf("store: SessionEventsForRules: %w", err)
 	}
 	defer rows.Close()
 
 	var out []*Event
 	for rows.Next() {
-		ev, err := scanEvent(rows)
+		ev, err := scanEventForRules(rows)
 		if err != nil {
-			return nil, fmt.Errorf("store: SessionEvents: %w", err)
+			return nil, fmt.Errorf("store: SessionEventsForRules: %w", err)
 		}
 		out = append(out, ev)
 	}
 	return out, rows.Err()
 }
 
-// SessionEventsSummary is SessionEvents at the list projection: the same
-// rows, same order, without the four header/body blobs. The session route
-// renders a call list, so it wants this; the session-scoped analyzer pass
-// compares consecutive request bodies and wants SessionEvents.
+// SessionEventsSummary is SessionEventsForRules at the list projection: the
+// same rows, same order, without any header/body blobs at all. The session
+// route renders a call list, so it wants this; the session-scoped analyzer
+// pass compares consecutive request bodies and wants SessionEventsForRules.
 func (s *Store) SessionEventsSummary(ctx context.Context, sessionID string) ([]*EventSummary, error) {
 	rows, err := s.db.QueryContext(ctx, summarySelectColumns+" FROM events WHERE session_id = ? ORDER BY started_at ASC", sessionID)
 	if err != nil {
@@ -1295,10 +1296,19 @@ var summaryOmittedColumns = []string{
 	"transcript_content", "transcript_role",
 }
 
+// rulesOmittedColumns is summaryOmittedColumns minus req_body: the five
+// blobs the session rules never read. req_body stays in the projection
+// because ruleCacheInvalidatedByTools compares consecutive request bodies.
+// Derived from summaryOmittedColumns rather than listed by hand, so
+// "which columns are bodies" still has one home.
+var rulesOmittedColumns = columnsMinus(summaryOmittedColumns, []string{"req_body"})
+
 var (
 	eventSelectColumns   = selectFrom(eventColumnNames)
 	summaryColumnNames   = columnsMinus(eventColumnNames, summaryOmittedColumns)
 	summarySelectColumns = selectFrom(summaryColumnNames)
+	rulesColumnNames     = columnsMinus(eventColumnNames, rulesOmittedColumns)
+	rulesSelectColumns   = selectFrom(rulesColumnNames)
 )
 
 func selectFrom(cols []string) string { return "SELECT " + strings.Join(cols, ", ") }
@@ -1411,6 +1421,21 @@ func scanEvent(row rowScanner) (*Event, error) {
 	ev.RespBody = respBody
 	ev.TranscriptContent = transcriptContent
 	ev.TranscriptRole = transcriptRole.String
+	return &ev, nil
+}
+
+// scanEventForRules scans a row at the rules projection: the shared summary
+// destinations plus req_body, the one extra column rulesColumnNames adds
+// over summaryColumnNames -- eventColumnNames' tail order puts it last.
+func scanEventForRules(row rowScanner) (*Event, error) {
+	var ev Event
+	var v eventScanVals
+	var reqBody []byte
+	if err := row.Scan(v.dest(&ev.EventSummary, &reqBody)...); err != nil {
+		return nil, err
+	}
+	v.apply(&ev.EventSummary)
+	ev.ReqBody = reqBody
 	return &ev, nil
 }
 

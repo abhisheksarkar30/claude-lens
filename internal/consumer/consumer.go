@@ -41,7 +41,7 @@ type Store interface {
 	// not ev's. The consumer must key its session-scoped work to that id.
 	InsertEvent(ctx context.Context, ev *store.Event) (int64, string, error)
 	UpsertWarnings(ctx context.Context, eventID int64, warnings []store.Warning) error
-	SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error)
+	SessionEventsForRules(ctx context.Context, sessionID string) ([]*store.Event, error)
 }
 
 // Consumer drains a sink.Sink, builds one store.Event per captured call,
@@ -267,7 +267,7 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 // whole row history and upserts each finding onto the row it names,
 // grouped so a row with several findings gets one call.
 func (c *Consumer) runSessionRule(ctx context.Context, sessionID string) {
-	rows, err := c.st.SessionEvents(ctx, sessionID)
+	rows, err := c.st.SessionEventsForRules(ctx, sessionID)
 	if err != nil {
 		log.Printf("consumer: session rows for %s: %v", sessionID, err)
 		return

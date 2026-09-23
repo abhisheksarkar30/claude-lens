@@ -32,7 +32,7 @@ type Store interface {
 	// not ev's. The tailer must key its session-scoped work to that id.
 	InsertEvent(ctx context.Context, ev *store.Event) (int64, string, error)
 	UpsertWarnings(ctx context.Context, eventID int64, warnings []store.Warning) error
-	SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error)
+	SessionEventsForRules(ctx context.Context, sessionID string) ([]*store.Event, error)
 	CursorStore
 }
 
@@ -571,7 +571,7 @@ func (t *Tailer) runAnalyzer(a Analyzer, meta parse.Meta, usage parse.Usage, ev 
 }
 
 func (t *Tailer) runSessionRule(ctx context.Context, sessionID string) int {
-	rows, err := t.st.SessionEvents(ctx, sessionID)
+	rows, err := t.st.SessionEventsForRules(ctx, sessionID)
 	if err != nil {
 		log.Printf("jsonlogs: session rows %s: %v", sessionID, err)
 		return 0
