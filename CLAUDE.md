@@ -19,10 +19,14 @@ default.
 See `docs/planning/GI-1-claude-lens-v1.md` for the converged plan (v6, 7 review rounds). The work
 items are `.beads/GI-1/br-GI-1-01` … `-19`; each bead names its own file list and outcome definition.
 
-**Start from `docs/context/INDEX.md`** for the map to the code — architecture, storage schema, cost
-model, conventions, the CLI and API surfaces, and the decision records. This file states the
-*enforced* conventions and the invariants in their shortest form; the context docs are the map, and
-the code wins wherever they disagree.
+**Before touching any code in this repo — including a one-off ad hoc request, not just a
+`/develop-story` run — read `docs/context/INDEX.md` first**, then the specific module doc(s)
+covering the area you're about to change. This is the map to the code — architecture, storage
+schema, cost model, conventions, the CLI and API surfaces, and the decision records. It states the
+*enforced* conventions and the invariants in their shortest form. Treat what it says about the
+specific slice you're changing as a hypothesis, not fact, until you check it against the real
+source; the code wins wherever they disagree, and a stale doc is worth a one-line callout, not a
+silent workaround.
 
 ## Migrations
 
