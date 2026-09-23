@@ -24,6 +24,16 @@ model, conventions, the CLI and API surfaces, and the decision records. This fil
 *enforced* conventions and the invariants in their shortest form; the context docs are the map, and
 the code wins wherever they disagree.
 
+## Migrations
+
+Any plan or bead step that runs a schema migration (a `schemaVersion` bump, or any change under
+`internal/store/schema.sql` / `migrations`) — whether Claude executes it directly against a real
+`lens.db` or the plan/bead only states it for the user to run manually — is preceded by an automatic
+backup of the live database file(s) (`lens.db`, `lens.db-wal`, `lens.db-shm`) to a separate path
+before the migration runs. This applies regardless of file size: `cp` is cheap, a bad migration
+against the only copy of months of captured traffic is not recoverable. State the backup path when
+it's made.
+
 ## Setup
 
 One step per clone, with no build system to do it for you:
