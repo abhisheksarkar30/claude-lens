@@ -172,8 +172,10 @@ age out when.
 Admin cost report, per `(day, model)`. Divergence past an absolute-dollar threshold raises
 `cost_drift` — the signal that the price table is stale.
 
-`source_mismatch` is the other half: the same `request_id` arriving from two sources with
-disagreeing token counts. **Two measurements are required for a disagreement** — a side with no
+`source_mismatch` is the other half: the same `request_id` observed twice with disagreeing token
+counts — from two different sources, or from the same source re-reading with amended counts (a
+same-collector self-correction, reported at `SeverityInfo` rather than the cross-source case's
+`SeverityError`). **Two measurements are required for a disagreement** — a side with no
 observed usage at all is absent, not contradicting, which is the contract `mergeEvents` already
 documented and the merge now enforces. A row captured under `--body-policy off` carries zeros in every
 token column because usage is parsed from a body it never kept; ungated, that made every off-policy

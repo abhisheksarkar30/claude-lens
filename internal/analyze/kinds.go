@@ -79,7 +79,7 @@ var allKinds = []KindInfo{
 	{KindQuotaWindowApproaching, SeverityWarn, "A subscription window is projected to exhaust before it resets."},
 	{KindCostDrift, SeverityWarn, "Computed cost for a (day, model) diverges from the Admin cost report beyond threshold -- the price table is stale."},
 	{KindAPIEquivalentCost, SeverityInfo, "On a subscription row: what this call would have cost at API rates. Hypothetical, never added to a billed total."},
-	{KindSourceMismatch, SeverityError, "The same request_id arrived from two sources with disagreeing token counts."},
+	{KindSourceMismatch, SeverityError, "The same request_id was observed twice with disagreeing token counts -- from two different sources (severity error), or from the same source re-reading with amended counts (severity info)."},
 	{KindAnalyzerPanic, SeverityError, "A rule panicked; the panic was recovered and logged as a finding instead of crashing the consumer."},
 	{KindPeakPricing, SeverityWarn, "The call was billed at the model's peak rate, which is a cost divergence from the same call off-peak."},
 }
@@ -101,7 +101,7 @@ func AllKinds() []KindInfo {
 // which is per-event-pure enough to live in this package.
 var nonAnalyzeKinds = map[Kind]string{
 	KindAnalyzerPanic:          "consumer (panic recovery)",
-	KindSourceMismatch:         "store (cross-source merge)",
+	KindSourceMismatch:         "store (cross-source or same-source merge)",
 	KindCostDrift:              "reconcile",
 	KindQuotaWindowApproaching: "quota",
 	KindPeakPricing:            "consumer, jsonlogs",

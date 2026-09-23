@@ -1129,6 +1129,85 @@ func TestMergeSourceMismatchDetailNamesDifferingFields(t *testing.T) {
 	}
 }
 
+// TestMergeSourceMismatchSeverityBySourcePair (br-GI-15-04) proves the
+// same-source/cross-source branch both ways in one table: a same-source
+// re-read gets Severity "info" and drops the cross-source phrasing, while a
+// true cross-source disagreement keeps the existing "error" phrasing
+// byte-for-byte, unchanged from before this bead.
+func TestMergeSourceMismatchSeverityBySourcePair(t *testing.T) {
+	cases := []struct {
+		name            string
+		requestID       string
+		firstSource     string
+		secondSource    string
+		wantSeverity    string
+		wantDetailHas   string
+		wantDetailLacks string
+	}{
+		{
+			name:            "same source re-read",
+			requestID:       "req-gi15-severity-same",
+			firstSource:     "jsonl",
+			secondSource:    "jsonl",
+			wantSeverity:    "info",
+			wantDetailLacks: "sources jsonl and jsonl disagree",
+		},
+		{
+			name:          "cross source disagreement",
+			requestID:     "req-gi15-severity-cross",
+			firstSource:   "proxy",
+			secondSource:  "jsonl",
+			wantSeverity:  "error",
+			wantDetailHas: "sources proxy and jsonl disagree",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			ctx := context.Background()
+
+			first := fullEvent(tc.requestID)
+			first.Source, first.FirstSource = tc.firstSource, tc.firstSource
+			first.OutputTokens = 50
+
+			second := fullEvent(tc.requestID)
+			second.Source, second.FirstSource = tc.secondSource, tc.secondSource
+			second.OutputTokens = 999
+
+			if _, _, err := st.InsertEvent(ctx, first); err != nil {
+				t.Fatalf("InsertEvent first: %v", err)
+			}
+			if _, _, err := st.InsertEvent(ctx, second); err != nil {
+				t.Fatalf("InsertEvent second (merge): %v", err)
+			}
+
+			warnings, err := st.ListWarnings(ctx, WarningFilter{})
+			if err != nil {
+				t.Fatalf("ListWarnings: %v", err)
+			}
+			var w *Warning
+			for i := range warnings {
+				if warnings[i].Kind == "source_mismatch" {
+					w = &warnings[i]
+				}
+			}
+			if w == nil {
+				t.Fatalf("no source_mismatch warning; got %d warnings", len(warnings))
+			}
+			if w.Severity != tc.wantSeverity {
+				t.Errorf("Severity = %q, want %q", w.Severity, tc.wantSeverity)
+			}
+			if tc.wantDetailHas != "" && !strings.Contains(w.Detail, tc.wantDetailHas) {
+				t.Errorf("Detail = %q, want it to contain %q", w.Detail, tc.wantDetailHas)
+			}
+			if tc.wantDetailLacks != "" && strings.Contains(w.Detail, tc.wantDetailLacks) {
+				t.Errorf("Detail = %q, want it NOT to contain %q", w.Detail, tc.wantDetailLacks)
+			}
+		})
+	}
+}
+
 // TestMergeCaptureCompleteFollowsTheBodies pins the rule br-GI-11-04 replaced
 // the `||` with, on all seven body-ownership shapes at once.
 //

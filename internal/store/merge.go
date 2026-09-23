@@ -137,11 +137,28 @@ func applyMergeTx(ctx context.Context, tx *sql.Tx, existing, incoming *Event) (*
 		return nil, fmt.Errorf("merge: update: %w", err)
 	}
 	if mismatch {
-		w := Warning{
-			Kind:      "source_mismatch",
-			Severity:  "error",
-			Detail:    fmt.Sprintf("sources %s and %s disagree on token counts for request_id %s: %s", existing.Source, incoming.Source, existing.RequestID, diffTokenFields(existing, incoming)),
-			CreatedAt: time.Now(),
+		diff := diffTokenFields(existing, incoming)
+		var w Warning
+		if existing.Source == incoming.Source {
+			// Same collector, two reads: a later tailer pass amended the
+			// numbers (e.g. Claude Code finalizing usage once a stream that
+			// looked interrupted actually completes) rather than two
+			// independent sources genuinely disagreeing. Reusing the
+			// cross-source "sources X and X disagree" wording here would
+			// misread a benign self-correction as an urgent conflict.
+			w = Warning{
+				Kind:      "source_mismatch",
+				Severity:  "info",
+				Detail:    fmt.Sprintf("source %s re-observed request_id %s with amended token counts: %s", existing.Source, existing.RequestID, diff),
+				CreatedAt: time.Now(),
+			}
+		} else {
+			w = Warning{
+				Kind:      "source_mismatch",
+				Severity:  "error",
+				Detail:    fmt.Sprintf("sources %s and %s disagree on token counts for request_id %s: %s", existing.Source, incoming.Source, existing.RequestID, diff),
+				CreatedAt: time.Now(),
+			}
 		}
 		if err := upsertWarningsTx(ctx, tx, result.ID, []Warning{w}); err != nil {
 			return nil, fmt.Errorf("merge: attach source_mismatch: %w", err)
