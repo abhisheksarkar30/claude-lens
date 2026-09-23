@@ -93,7 +93,7 @@ func newSessionID(now time.Time) string {
 // from events + warnings, so it stays correct under both a fresh insert
 // and a cross-source merge without maintaining two update paths. A NULL
 // (empty) session id is a no-op.
-func (r *Resolver) RecordCall(ctx context.Context, sessionID string, ev *store.Event, warningCount int) error {
+func (r *Resolver) RecordCall(ctx context.Context, sessionID string, ev *store.Event) error {
 	if sessionID == "" {
 		return nil
 	}
