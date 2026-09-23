@@ -30,6 +30,27 @@ subsequent boot would fail with `duplicate column name` and no recovery but dele
 A version *ahead* of the binary is refused, not guessed at: `migrate` errors rather than opening a
 database written by a newer `clens`.
 
+**`schemaVersion` is 4** as of GI#13. Migration 1→2 replaces `idx_events_session_id` with a composite
+index on `(session_id, started_at)` and drops the single-column one, since it is now a redundant
+prefix that would otherwise charge every insert for an index nothing reads. The composite exists
+because the session-scoped analyzer pass's own read (`WHERE session_id = ? ORDER BY started_at ASC`,
+see [workflows.md](workflows.md) flow 1) had no index that satisfied its `ORDER BY`, so SQLite
+materialized the session's rows — BLOBs included — and spilled the sort to a temp file on every
+flush; see [decisions/010](decisions/010-per-session-dedupe-accepts-warning-subset.md) for the fold
+that accompanies this fix.
+
+Migration 2→3 adds `req_tool_names` (below). Migration 3→4 adds `idx_events_stats`, a covering
+index for `/api/stats`' aggregate queries — see the indexes list and §The stats covering index
+below. It does **not** drop `idx_events_cost_source`: an earlier version of this migration folded
+that index's one job (`cost_source`) into `idx_events_stats` and dropped it, on the reasoning that
+`PurgeUnpriced`'s `DELETE FROM events WHERE cost_source = 'unpriced'` would fall back to a scan of
+the new, smaller index. Verified with `EXPLAIN QUERY PLAN`, that was false: `cost_source` sits at
+position 10 of 13 in `idx_events_stats`, not a leading column, so it cannot serve that equality
+lookup at all, and the DELETE regressed to a bare, unindexed scan of the whole table. Both indexes
+are now kept permanently; `TestPurgeUnpricedUsesTheCostSourceIndex`
+([internal/store/store_test.go](../../internal/store/store_test.go)) pins the query plan so this
+cannot regress silently again.
+
 The schema is the enforcement point for two invariants, which is why it is worth reading before
 changing a column: see [architecture.md](architecture.md) and [cost-and-quota.md](cost-and-quota.md).
 
@@ -39,7 +60,7 @@ changing a column: see [architecture.md](architecture.md) and [cost-and-quota.md
 
 | Table | Purpose | Key fields | Constraints / indexes | Evidence |
 |---|---|---|---|---|
-| `events` | one row per captured call: identity, tokens, cost, the proxy-only request/response columns, and the transcript-only reconstruction columns | `id`, `request_id`, `source`, `first_source`, `session_id`, `total_prompt_tokens`, `cost_usd`, `api_equivalent_cost_usd`, `cost_source`, `req_body`/`resp_body`/`req_headers`/`resp_headers`, `transcript_content`/`transcript_role` (47 columns) | `request_id` **UNIQUE** (this is what makes the merge possible); indexes on `session_id`, `started_at`, `cost_source` | [schema.sql](../../internal/store/schema.sql) |
+| `events` | one row per captured call: identity, tokens, cost, the proxy-only request/response columns, and the transcript-only reconstruction columns | `id`, `request_id`, `source`, `first_source`, `session_id`, `total_prompt_tokens`, `cost_usd`, `api_equivalent_cost_usd`, `cost_source`, `req_tool_names`, `req_body`/`resp_body`/`req_headers`/`resp_headers`, `transcript_content`/`transcript_role` (48 columns) | `request_id` **UNIQUE** (this is what makes the merge possible); a composite index on `(session_id, started_at)`, plus `started_at`, `cost_source`, and the covering index `idx_events_stats` (below) | [schema.sql](../../internal/store/schema.sql) |
 | `sessions` | the per-session fold: summed tokens, priced/unpriced counts, warning count | `id` PK, `prefix_hash`, `first_seen`/`last_seen`, every token column, `priced_count`, `unpriced_count`, `model_set`, `warning_count`, both cost columns | no FK — the link to `events` is by `session_id` value only | [schema.sql](../../internal/store/schema.sql) |
 | `warnings` | one row per (event, kind) | `event_id`, `kind`, `severity`, `detail`, `path` | `UNIQUE(event_id, kind)`; `REFERENCES events(id) ON DELETE CASCADE` | [schema.sql](../../internal/store/schema.sql) |
 
@@ -144,6 +165,45 @@ cap would be needed to mark them, and this story does not add one.
 comparison never decides *whether* a capture is complete — `capture_complete` does that, and the
 marker only draws when it is `false`. The comparison decides *which* body to name, and when it cannot,
 the marker degrades to the honest disjunction rather than asserting a cause it cannot see.
+
+## `req_tool_names` (br-GI-13-07)
+
+NULL-or-JSON, not NULL-or-empty: `req_tool_names IS NOT NULL` is the same test as "this row has a
+stored request body at all," matching `req_body`'s own contract — a JSONL-sourced row or a proxy
+row captured under `--body-policy off` has it NULL. When not NULL it is a JSON-encoded array of the
+request's tool names in body order (`'[]'` when the body declares none), written once at insert
+time by the same package that parses the body
+([internal/parse](../../internal/parse/), `ExtractMeta`) — never derived by a second, independent
+SQL-side definition.
+
+This exists so `SessionEventsForRules` (below) does not have to select `req_body` to answer "did the
+tool set change between these two calls," which is what the session-scoped `ruleCacheInvalidatedByTools`
+rule needs. A row written before this column existed reads as no-body until backfilled: `clens
+backfill-tool-names --dry-run`/`--yes` fills it page-at-a-time from the same `ExtractMeta` parse (see
+[cli-and-tooling.md](cli-and-tooling.md)), and `clens doctor`'s `tool_names_backfill` check WARNs
+with the outstanding row count rather than FAILing, since an un-backfilled database is a maintenance
+gap, not a broken one.
+
+## The stats covering index
+
+`idx_events_stats` (schema version 4) covers three of `/api/stats`' four aggregate queries —
+`StatsSummary`, `StatsByModel`, `StatsByPeriod` — as a full covering-index scan: every column they
+`SUM`, `GROUP BY`, or filter on, so the walk never reaches the table's multi-GB of blob-bearing
+pages. Column order: `input_tokens, output_tokens, cache_write_5m_tokens, cache_write_1h_tokens,
+cache_read_tokens, thinking_tokens, total_prompt_tokens, model_resolved, billing_mode, cost_source,
+cost_usd, api_equivalent_cost_usd, started_at`.
+
+`StatsByCostSource` is the fourth query and is **not** covered by this index: `cost_source` is not
+a leading column here, so SQLite keeps using the narrower `idx_events_cost_source` for that query's
+`GROUP BY` instead — still an index scan, not a bare table scan, but one that still pays a table
+lookup per row for `billing_mode`/`cost_usd`. This is a known, accepted gap (unchanged from
+pre-GI#13 behavior), not a regression; forcing the query onto `idx_events_stats` with `INDEXED BY`
+was considered and rejected, since it would make `StatsByCostSource` unusable against a database
+that has not yet run this migration — exactly the case this package's own test suite exercises on
+purpose. `TestStatsQueriesUseTheCoveringIndex` pins all four query plans, including this one
+exception. `BenchmarkInsertEvent` ([internal/store/store_test.go](../../internal/store/store_test.go))
+gives the reproducible insert-side cost of carrying the index (~730µs/op measured), replacing a
+one-off number recorded only in a commit message.
 
 ## Token columns
 

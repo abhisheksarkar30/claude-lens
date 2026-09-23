@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/parse"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
+	"github.com/abhisheksarkar30/claude-lens/internal/session"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
@@ -757,5 +759,88 @@ func TestTranscriptContentObeysTheBodyPolicy(t *testing.T) {
 				t.Errorf("TranscriptRole = %q, want assistant", got.TranscriptRole)
 			}
 		})
+	}
+}
+
+// countingRecorder wraps a SessionRecorder and counts RecordCall calls, so a
+// test can assert the tailer folds once per distinct session in a file, not
+// once per line (C1, br-GI-13-01's tailer half).
+type countingRecorder struct {
+	inner SessionRecorder
+	calls atomic.Int32
+}
+
+func (c *countingRecorder) RecordCall(ctx context.Context, sessionID string, ev *store.Event) error {
+	c.calls.Add(1)
+	return c.inner.RecordCall(ctx, sessionID, ev)
+}
+
+// TestTailerFoldsOncePerSessionPerFile: a file of three lines for one
+// session folds once; a second session in the same file folds separately.
+func TestTailerFoldsOncePerSessionPerFile(t *testing.T) {
+	root := t.TempDir()
+	writeLines(t, filepath.Join(root, "log.jsonl"),
+		assistantLine("req1", "sess-A", "claude-sonnet-5", 10),
+		assistantLine("req2", "sess-A", "claude-sonnet-5", 10),
+		assistantLine("req3", "sess-A", "claude-sonnet-5", 10),
+		assistantLine("req4", "sess-B", "claude-sonnet-5", 10),
+	)
+
+	st := newTestStore(t)
+	rec := &countingRecorder{inner: session.New(st, 30)}
+	tailer := New(root, st)
+	tailer.SetSessionRecorder(rec)
+
+	stats, err := tailer.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if stats.Inserted != 4 {
+		t.Fatalf("Inserted = %d, want 4", stats.Inserted)
+	}
+	if got := rec.calls.Load(); got != 2 {
+		t.Errorf("RecordCall calls = %d, want 2 (once per distinct session in the file, not once per line)", got)
+	}
+}
+
+// capturingRecorder records every RecordCall it receives, so a test can
+// inspect exactly which row was folded.
+type capturingRecorder struct {
+	sessionIDs []string
+	evs        []*store.Event
+}
+
+func (c *capturingRecorder) RecordCall(ctx context.Context, sessionID string, ev *store.Event) error {
+	c.sessionIDs = append(c.sessionIDs, sessionID)
+	c.evs = append(c.evs, ev)
+	return nil
+}
+
+// TestTailerFoldsTheFirstInsertedRow is D8's tailer half: the fold carries
+// the first inserted line for a multi-line single-session file, not the
+// last.
+func TestTailerFoldsTheFirstInsertedRow(t *testing.T) {
+	root := t.TempDir()
+	first := time.Date(2026, time.September, 21, 1, 0, 0, 0, time.UTC)
+	second := first.Add(time.Minute)
+	writeLines(t, filepath.Join(root, "log.jsonl"),
+		assistantLineAt("req-first", "sess-hash", "claude-sonnet-5", first),
+		assistantLineAt("req-second", "sess-hash", "claude-sonnet-5", second),
+	)
+
+	st := newTestStore(t)
+	rec := &capturingRecorder{}
+	tailer := New(root, st)
+	tailer.SetSessionRecorder(rec)
+
+	if _, err := tailer.Poll(context.Background()); err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+
+	if len(rec.evs) != 1 {
+		t.Fatalf("RecordCall calls = %d, want 1", len(rec.evs))
+	}
+	if rec.evs[0].RequestID != "req-first" {
+		t.Errorf("folded row RequestID = %q, want req-first (the first inserted line, not the last)", rec.evs[0].RequestID)
 	}
 }

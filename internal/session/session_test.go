@@ -127,7 +127,7 @@ func TestRecordCallFoldsIntoSessionTotals(t *testing.T) {
 	if _, _, err := st.InsertEvent(ctx, ev); err != nil {
 		t.Fatalf("InsertEvent: %v", err)
 	}
-	if err := r.RecordCall(ctx, sessionID, ev, 0); err != nil {
+	if err := r.RecordCall(ctx, sessionID, ev); err != nil {
 		t.Fatalf("RecordCall: %v", err)
 	}
 
@@ -142,7 +142,7 @@ func TestRecordCallFoldsIntoSessionTotals(t *testing.T) {
 		t.Errorf("session PrefixHash = %q, want abc", sess.PrefixHash)
 	}
 
-	if err := r.RecordCall(ctx, "", ev, 0); err != nil {
+	if err := r.RecordCall(ctx, "", ev); err != nil {
 		t.Errorf("RecordCall with empty session id = %v, want nil (no-op)", err)
 	}
 }

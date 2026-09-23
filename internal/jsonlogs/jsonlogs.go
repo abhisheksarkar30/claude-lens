@@ -32,7 +32,7 @@ type Store interface {
 	// not ev's. The tailer must key its session-scoped work to that id.
 	InsertEvent(ctx context.Context, ev *store.Event) (int64, string, error)
 	UpsertWarnings(ctx context.Context, eventID int64, warnings []store.Warning) error
-	SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error)
+	SessionEventsForRules(ctx context.Context, sessionID string) ([]*store.Event, error)
 	CursorStore
 }
 
@@ -52,7 +52,7 @@ type SessionRule interface {
 // Claude Code's own session id, so this package only needs the persist
 // side -- ensuring the session row exists and re-deriving its totals.
 type SessionRecorder interface {
-	RecordCall(ctx context.Context, sessionID string, ev *store.Event, warningCount int) error
+	RecordCall(ctx context.Context, sessionID string, ev *store.Event) error
 }
 
 // PriceComputer mirrors consumer.PriceComputer.
@@ -341,12 +341,38 @@ func (t *Tailer) tailFile(ctx context.Context, f walkedFile) Stats {
 	distinct := dedupeAssistantLines(assistantLines)
 	stats.RequestsFound = len(distinct)
 
+	// order+firstEv track, per distinct returned session id, the first
+	// inserted row seen for it in this file, in arrival order -- the same
+	// D8 rule the consumer's flush follows, so the fold below carries the
+	// row whose PrefixHash actually won the store's first-writer-wins
+	// insert.
+	var order []string
+	firstEv := map[string]*store.Event{}
+
 	for _, l := range distinct {
 		ev, meta, usage := t.buildEvent(l, f)
-		if t.insert(ctx, ev, meta, usage) {
-			stats.Inserted++
-		} else {
+		sessionID, ok := t.insert(ctx, ev, meta, usage)
+		if !ok {
 			stats.Failed++
+			continue
+		}
+		stats.Inserted++
+		if sessionID != "" {
+			if _, seen := firstEv[sessionID]; !seen {
+				firstEv[sessionID] = ev
+				order = append(order, sessionID)
+			}
+		}
+	}
+
+	// Fold once per distinct session found in this file -- a session
+	// spanning two files still gets one fold per file, a collapse from one
+	// per row.
+	if t.recorder != nil {
+		for _, sessionID := range order {
+			if err := t.recorder.RecordCall(ctx, sessionID, firstEv[sessionID]); err != nil {
+				log.Printf("jsonlogs: record session call %s: %v", sessionID, err)
+			}
 		}
 	}
 
@@ -491,15 +517,16 @@ func parseTimestamp(s string) time.Time {
 	return time.Now()
 }
 
-// insert writes ev, runs the analyzer seam, and folds the result into
-// ev's session. It never returns an error: a per-request failure is
-// logged and counted by the caller, the same fail-open discipline
-// internal/consumer uses.
-func (t *Tailer) insert(ctx context.Context, ev *store.Event, meta parse.Meta, usage parse.Usage) bool {
+// insert writes ev and runs the analyzer seam. It never returns an error: a
+// per-request failure is logged and counted by the caller, the same
+// fail-open discipline internal/consumer uses. The fold into ev's session
+// is the caller's job (tailFile), once per distinct session in the file
+// rather than once per row.
+func (t *Tailer) insert(ctx context.Context, ev *store.Event, meta parse.Meta, usage parse.Usage) (sessionID string, ok bool) {
 	id, sessionID, err := t.st.InsertEvent(ctx, ev)
 	if err != nil {
 		log.Printf("jsonlogs: insert event %s: %v", ev.RequestID, err)
-		return false
+		return "", false
 	}
 
 	var warnings []store.Warning
@@ -519,17 +546,13 @@ func (t *Tailer) insert(ctx context.Context, ev *store.Event, meta parse.Meta, u
 
 	// sessionID is the written row's session, which after a cross-source
 	// merge is the first-written row's, not ev's -- see consumer.Store.
-	warningCount := len(warnings)
+	// The pass stays unwired (t.sessionRule is never set by newTailer); this
+	// call is a no-op in production and left exactly as it was.
 	if t.sessionRule != nil && sessionID != "" {
-		warningCount += t.runSessionRule(ctx, sessionID)
+		t.runSessionRule(ctx, sessionID)
 	}
 
-	if t.recorder != nil && sessionID != "" {
-		if err := t.recorder.RecordCall(ctx, sessionID, ev, warningCount); err != nil {
-			log.Printf("jsonlogs: record session call %s: %v", sessionID, err)
-		}
-	}
-	return true
+	return sessionID, true
 }
 
 func (t *Tailer) runAnalyzer(a Analyzer, meta parse.Meta, usage parse.Usage, ev *store.Event) (warnings []store.Warning) {
@@ -548,7 +571,7 @@ func (t *Tailer) runAnalyzer(a Analyzer, meta parse.Meta, usage parse.Usage, ev 
 }
 
 func (t *Tailer) runSessionRule(ctx context.Context, sessionID string) int {
-	rows, err := t.st.SessionEvents(ctx, sessionID)
+	rows, err := t.st.SessionEventsForRules(ctx, sessionID)
 	if err != nil {
 		log.Printf("jsonlogs: session rows %s: %v", sessionID, err)
 		return 0

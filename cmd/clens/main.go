@@ -40,6 +40,10 @@ var commands = map[string]func([]string) error{
 	// br-GI-11-03 / br-GI-11-06
 	"reprice": cli.Reprice,
 	"reflag":  cli.Reflag,
+
+	// br-GI-13-07 / br-GI-13-09, post-convergence additions
+	"backfill-tool-names": cli.BackfillToolNames,
+	"shutdown":            cli.Shutdown,
 }
 
 func main() {

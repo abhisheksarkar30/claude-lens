@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -71,6 +72,27 @@ func fullEvent(requestID string) *Event {
 		RespHeaders: `{"content-type":["application/json"]}`,
 		ReqBody:     []byte(`{"model":"claude-sonnet-5"}`),
 		RespBody:    []byte(`{"usage":{}}`)}
+}
+
+// BenchmarkInsertEvent (br-GI-13-08's write-side trade, "measured, not
+// asserted"): the insert-side cost against the current, fully-indexed
+// schema, reproducible with `go test -bench=InsertEvent ./internal/store/`
+// instead of the one-off number recorded in a commit message.
+func BenchmarkInsertEvent(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "bench.db")
+	st, err := Open(path)
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := st.InsertEvent(ctx, fullEvent(fmt.Sprintf("req-bench-%d", i))); err != nil {
+			b.Fatalf("InsertEvent: %v", err)
+		}
+	}
 }
 
 // Test 5: round trip, WAL, FK cascade, RedactCheck.
@@ -743,6 +765,269 @@ func TestSummaryScanMatchesSummaryColumns(t *testing.T) {
 	}
 }
 
+// explainQueryPlanDetail runs EXPLAIN QUERY PLAN over query and concatenates
+// every row's columns into one string a test can substring-match against.
+func explainQueryPlanDetail(t *testing.T, db *sql.DB, query string, args ...any) string {
+	t.Helper()
+	rows, err := db.Query("EXPLAIN QUERY PLAN "+query, args...)
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
+	}
+	defer rows.Close()
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("EXPLAIN QUERY PLAN columns: %v", err)
+	}
+	var out strings.Builder
+	for rows.Next() {
+		dest := make([]any, len(cols))
+		for i := range dest {
+			dest[i] = new(sql.RawBytes)
+		}
+		if err := rows.Scan(dest...); err != nil {
+			t.Fatalf("EXPLAIN QUERY PLAN scan: %v", err)
+		}
+		for _, d := range dest {
+			out.Write(*d.(*sql.RawBytes))
+			out.WriteByte(' ')
+		}
+		out.WriteByte('\n')
+	}
+	return out.String()
+}
+
+// TestSessionEventsForRulesUsesTheIndexWithoutASort (§6 test 1) is the
+// runnable check for the whole story: the session-scoped SELECT the rules
+// pass runs must be served by the composite index, not a materialize-and-sort.
+func TestSessionEventsForRulesUsesTheIndexWithoutASort(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	q := rulesSelectColumns + " FROM events WHERE session_id = ? ORDER BY started_at ASC"
+
+	// (a) no temp b-tree sort in the plan.
+	plan := explainQueryPlanDetail(t, st.db, q, "sess-explain")
+	if strings.Contains(strings.ToUpper(plan), "USE TEMP B-TREE FOR ORDER BY") {
+		t.Errorf("query plan uses a temp b-tree sort: %s", plan)
+	}
+
+	// (b) textual: the query string still carries its own ORDER BY. Once the
+	// composite index exists, WHERE session_id = ? returns started_at order
+	// off the index even with no ORDER BY at all, so (a) alone would also
+	// pass with the ORDER BY silently removed.
+	if !strings.Contains(q, "ORDER BY started_at") {
+		t.Errorf("session-scoped SELECT lost its ORDER BY started_at: %q", q)
+	}
+
+	// (c) a fixture whose rowid order and started_at order disagree still
+	// comes back in started_at order, catching a direction flip or a
+	// hand-built reordering that (a) and (b) alone would miss.
+	base := time.Unix(1700000000, 0)
+	newer := fullEvent("req-plan-newer")
+	newer.SessionID = "sess-plan-order"
+	newer.StartedAt = base.Add(time.Hour)
+	older := fullEvent("req-plan-older")
+	older.SessionID = "sess-plan-order"
+	older.StartedAt = base
+	if _, _, err := st.InsertEvent(ctx, newer); err != nil {
+		t.Fatalf("InsertEvent newer: %v", err)
+	}
+	if _, _, err := st.InsertEvent(ctx, older); err != nil {
+		t.Fatalf("InsertEvent older: %v", err)
+	}
+
+	rows, err := st.SessionEventsForRules(ctx, "sess-plan-order")
+	if err != nil {
+		t.Fatalf("SessionEventsForRules: %v", err)
+	}
+	if len(rows) != 2 || rows[0].RequestID != "req-plan-older" || rows[1].RequestID != "req-plan-newer" {
+		t.Fatalf("rows = %+v, want [req-plan-older, req-plan-newer] in started_at order", rows)
+	}
+}
+
+// TestSessionEventsForRulesReturnsTheSameRowsInOrder (§6 test 2): compared
+// against GetEvent's full-projection fields on a fixture, so the rules
+// projection cannot silently drop a column the rules use.
+func TestSessionEventsForRulesReturnsTheSameRowsInOrder(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	first := fullEvent("req-rules-first")
+	first.SessionID = "sess-rules"
+	first.StartedAt = time.Unix(1700000000, 0)
+	second := fullEvent("req-rules-second")
+	second.SessionID = "sess-rules"
+	second.StartedAt = time.Unix(1700000100, 0)
+
+	id1, _, err := st.InsertEvent(ctx, first)
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+	id2, _, err := st.InsertEvent(ctx, second)
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+
+	want1, err := st.GetEvent(ctx, id1)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	want2, err := st.GetEvent(ctx, id2)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+
+	rows, err := st.SessionEventsForRules(ctx, "sess-rules")
+	if err != nil {
+		t.Fatalf("SessionEventsForRules: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	for i, want := range []*Event{want1, want2} {
+		got := rows[i]
+		if got.RequestID != want.RequestID || !got.StartedAt.Equal(want.StartedAt) ||
+			got.ModelResolved != want.ModelResolved || got.TotalPromptTokens != want.TotalPromptTokens ||
+			got.PrefixHash == nil || want.PrefixHash == nil || *got.PrefixHash != *want.PrefixHash ||
+			got.HasReqBody != want.HasReqBody || got.ToolNames != want.ToolNames {
+			t.Errorf("row %d = %+v, want the full-projection fields of %+v", i, got, want)
+		}
+		if got.ReqBody != nil || got.RespBody != nil || got.ReqHeaders != "" || got.RespHeaders != "" ||
+			got.TranscriptContent != nil || got.TranscriptRole != "" {
+			t.Errorf("row %d retained an omitted blob: %+v", i, got)
+		}
+	}
+}
+
+// TestRulesProjectionNamesEveryColumnTheRulesRead (§6 test 3), two
+// assertions: (i) the mirrored full-minus-omitted check TestSummary...
+// already runs for the summary projection, applied to the rules one; and
+// (ii) the nine columns the rules actually read (§2), named explicitly --
+// rulesOmittedColumns derives from summaryOmittedColumns, whose membership
+// nothing pins, so (i) alone would pass even if a body column a rule reads
+// were accidentally omitted.
+func TestRulesProjectionNamesEveryColumnTheRulesRead(t *testing.T) {
+	full := parseSelectColumns(t, eventSelectColumns)
+	rules := parseSelectColumns(t, rulesSelectColumns)
+
+	if want := len(full) - len(rulesOmittedColumns); len(rules) != want {
+		t.Fatalf("rules projection selects %d columns, want %d (full %d minus %d omitted)",
+			len(rules), want, len(full), len(rulesOmittedColumns))
+	}
+	for _, c := range rulesOmittedColumns {
+		if !containsStr(full, c) {
+			t.Errorf("rulesOmittedColumns names %q, which the full projection does not select", c)
+		}
+	}
+	for _, c := range rules {
+		if containsStr(rulesOmittedColumns, c) {
+			t.Errorf("rules projection selects the omitted column %q", c)
+		}
+	}
+
+	mustRead := []string{
+		"id", "started_at", "ended_at", "total_prompt_tokens",
+		"cache_write_5m_tokens", "cache_write_1h_tokens", "cache_read_tokens",
+		"prefix_hash", "req_tool_names",
+	}
+	for _, c := range mustRead {
+		if !containsStr(rules, c) {
+			t.Errorf("rules projection does not select %q, which a session rule reads", c)
+		}
+	}
+}
+
+// TestRulesScanMatchesRulesColumns (§6 test 3): the 42-destination count,
+// mirroring TestSummaryScanMatchesSummaryColumns.
+func TestRulesScanMatchesRulesColumns(t *testing.T) {
+	var es EventSummary
+	var v eventScanVals
+
+	if got, want := len(v.dest(&es)), len(rulesColumnNames); got != want {
+		t.Errorf("scanEventForRules takes %d destinations for %d columns", got, want)
+	}
+}
+
+// TestRulesProjectionOmitsRequestBodies (br-GI-13-07): the mirrored check
+// TestSummaryColumnsAreTheFullSetMinusBodies already runs for the summary
+// projection, applied to the rules one -- rulesOmittedColumns is now
+// identical to summaryOmittedColumns, req_body included.
+func TestRulesProjectionOmitsRequestBodies(t *testing.T) {
+	if containsStr(rulesColumnNames, "req_body") {
+		t.Error("rulesColumnNames still selects req_body")
+	}
+	if len(rulesOmittedColumns) != len(summaryOmittedColumns) {
+		t.Fatalf("rulesOmittedColumns = %v, want the same set as summaryOmittedColumns = %v", rulesOmittedColumns, summaryOmittedColumns)
+	}
+	for _, c := range summaryOmittedColumns {
+		if !containsStr(rulesOmittedColumns, c) {
+			t.Errorf("rulesOmittedColumns is missing %q, present in summaryOmittedColumns", c)
+		}
+	}
+}
+
+// TestReqToolNamesIsNullExactlyWhenThereIsNoBody (br-GI-13-07): three rows --
+// a proxy row with tools, a proxy row whose body declares no tools, and a
+// JSONL row with no body -- come back as ["…"], [] and NULL respectively.
+// The middle row is the point: a ''-defaulted column would pass the other
+// two and fail this one.
+func TestReqToolNamesIsNullExactlyWhenThereIsNoBody(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	withTools := fullEvent("req-tools-some")
+	withTools.ToolNames = EncodeToolNames([]string{"bash"})
+	idWithTools, _, err := st.InsertEvent(ctx, withTools)
+	if err != nil {
+		t.Fatalf("InsertEvent withTools: %v", err)
+	}
+
+	noTools := fullEvent("req-tools-none")
+	noTools.ToolNames = EncodeToolNames(nil)
+	idNoTools, _, err := st.InsertEvent(ctx, noTools)
+	if err != nil {
+		t.Fatalf("InsertEvent noTools: %v", err)
+	}
+
+	// A JSONL row: no request body. ToolNames is deliberately set to a
+	// nonsense value here to prove the write derives NULL from len(ReqBody),
+	// not from whatever this field happens to hold.
+	jsonlRow := fullEvent("req-tools-jsonl")
+	jsonlRow.Source = "jsonl"
+	jsonlRow.ReqBody = nil
+	jsonlRow.RespHeaders = ""
+	jsonlRow.ReqHeaders = ""
+	jsonlRow.ToolNames = "garbage"
+	idJSONL, _, err := st.InsertEvent(ctx, jsonlRow)
+	if err != nil {
+		t.Fatalf("InsertEvent jsonlRow: %v", err)
+	}
+
+	got, err := st.GetEvent(ctx, idWithTools)
+	if err != nil {
+		t.Fatalf("GetEvent withTools: %v", err)
+	}
+	if !got.HasReqBody || got.ToolNames != `["bash"]` {
+		t.Errorf("withTools: HasReqBody=%v ToolNames=%q, want true and [\"bash\"]", got.HasReqBody, got.ToolNames)
+	}
+
+	got, err = st.GetEvent(ctx, idNoTools)
+	if err != nil {
+		t.Fatalf("GetEvent noTools: %v", err)
+	}
+	if !got.HasReqBody || got.ToolNames != `[]` {
+		t.Errorf("noTools: HasReqBody=%v ToolNames=%q, want true and []", got.HasReqBody, got.ToolNames)
+	}
+
+	got, err = st.GetEvent(ctx, idJSONL)
+	if err != nil {
+		t.Fatalf("GetEvent jsonlRow: %v", err)
+	}
+	if got.HasReqBody || got.ToolNames != "" {
+		t.Errorf("jsonlRow: HasReqBody=%v ToolNames=%q, want false and \"\"", got.HasReqBody, got.ToolNames)
+	}
+}
+
 // TestLatestProxyStartedAt: the observed half of the proxy-mode badge. Its
 // contract has two edges worth pinning at the store: an empty store is the
 // zero time rather than an error, and a transcript-only store is *not*
@@ -882,7 +1167,32 @@ func eventsSchemaWithoutTranscriptColumns(t *testing.T) string {
 	// resp_body's line keeps its comma up to here; the closing paren may not
 	// follow one.
 	head := strings.TrimSuffix(strings.TrimRight(schemaSQL[:start], " \t\r\n"), ",")
-	return head + "\n);" + schemaSQL[start+end+len("\n);"):]
+	return stripReqToolNamesColumn(t, head+"\n);"+schemaSQL[start+end+len("\n);"):])
+}
+
+// stripReqToolNamesColumn removes the req_tool_names column (br-GI-13-07,
+// migrations[2]) from a schema text, for a fixture standing in for a
+// database at schemaVersion < 3. Shared by eventsSchemaWithoutTranscriptColumns
+// (a database at version 0) and preIndexChangeSchema (a database at version
+// 1): both predate this column, so a fixture built from the *current*
+// schemaSQL text would already carry it, and the ALTER TABLE ADD COLUMN
+// migration this bead adds would then fail "duplicate column name" the
+// moment either fixture's Open runs every migration from its stamped
+// version forward.
+func stripReqToolNamesColumn(t *testing.T, schema string) string {
+	t.Helper()
+	const before = "status                  INTEGER,"
+	const after = "req_headers             TEXT,"
+	i := strings.Index(schema, before)
+	if i < 0 {
+		t.Fatal("schema.sql no longer declares status immediately before req_tool_names")
+	}
+	rest := schema[i+len(before):]
+	j := strings.Index(rest, after)
+	if j < 0 {
+		t.Fatal("schema.sql no longer declares req_headers after req_tool_names")
+	}
+	return schema[:i+len(before)] + rest[j:]
 }
 
 // buildPreChangeDB writes a database in the shape the previous binary left
@@ -957,10 +1267,13 @@ func TestMigrateHealsAPartialDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "partial.db")
 	buildPreChangeDB(t, path, "warnings")
 
-	// An index the schema exec re-creates (schema.sql:68), dropped here to
+	// An index the schema exec re-creates (schema.sql:69), dropped here to
 	// stand in for the other half of a first exec that died mid-file: the
 	// missing index heals by the same IF NOT EXISTS mechanism as the table.
-	const idx = "idx_events_session_id"
+	// idx_events_session_id no longer exists in schema.sql (br-GI-13-02
+	// replaced it with the composite idx_events_session_started), so this
+	// must name an index schema.sql still creates.
+	const idx = "idx_events_started_at"
 	db := rawDB(t, path)
 	if _, err := db.Exec("DROP INDEX " + idx); err != nil {
 		t.Fatalf("DROP INDEX %s: %v", idx, err)
@@ -986,6 +1299,171 @@ func TestMigrateHealsAPartialDatabase(t *testing.T) {
 	}
 	if got := userVersion(t, st.db); got != schemaVersion {
 		t.Errorf("user_version = %d, want %d", got, schemaVersion)
+	}
+}
+
+// preIndexChangeSchema returns schemaSQL with the composite session index
+// swapped back for the single-column index it replaced -- the on-disk shape
+// of a database one migration behind schemaVersion (br-GI-13-02's "before").
+func preIndexChangeSchema(t *testing.T) string {
+	t.Helper()
+	const oldLine = "CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);"
+	const newLine = "CREATE INDEX IF NOT EXISTS idx_events_session_started ON events(session_id, started_at);"
+	if !strings.Contains(schemaSQL, newLine) {
+		t.Fatal("schema.sql no longer creates idx_events_session_started with the expected text")
+	}
+	// A database at user_version = 1 also predates req_tool_names
+	// (migrations[2], br-GI-13-07): strip it here too, or Open's forward
+	// migration from 1 hits the same "duplicate column name" this bead's
+	// other pre-change fixture guards against.
+	return stripReqToolNamesColumn(t, strings.Replace(schemaSQL, newLine, oldLine, 1))
+}
+
+// TestMigrateAddsTheCompositeIndexAtVersionTwo (§6 test 9): a database at
+// user_version = 1 with rows present reaches version 2, holds the composite
+// index, has no idx_events_session_id, and still returns its rows.
+func TestMigrateAddsTheCompositeIndexAtVersionTwo(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-index.db")
+	db := rawDB(t, path)
+	if _, err := db.Exec(preIndexChangeSchema(t)); err != nil {
+		t.Fatalf("build a pre-index-change database: %v", err)
+	}
+	const sessionID = "sess-pre-index"
+	if _, err := db.Exec(
+		`INSERT INTO events (request_id, source, first_source, started_at, session_id) VALUES (?, 'proxy', 'proxy', ?, ?)`,
+		"req-pre-index", time.Now().UnixNano(), sessionID,
+	); err != nil {
+		t.Fatalf("seed a row: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA user_version = 1"); err != nil {
+		t.Fatalf("seed user_version: %v", err)
+	}
+	db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a database one migration behind: %v", err)
+	}
+	defer st.Close()
+
+	if got := userVersion(t, st.db); got != schemaVersion {
+		t.Errorf("user_version = %d, want %d", got, schemaVersion)
+	}
+	if !hasIndex(t, st.db, "idx_events_session_started") {
+		t.Error("the migration did not create idx_events_session_started")
+	}
+	if hasIndex(t, st.db, "idx_events_session_id") {
+		t.Error("the migration left idx_events_session_id behind")
+	}
+
+	rows, err := st.SessionEventsForRules(context.Background(), sessionID)
+	if err != nil {
+		t.Fatalf("SessionEventsForRules: %v", err)
+	}
+	if len(rows) != 1 || rows[0].RequestID != "req-pre-index" {
+		t.Errorf("SessionEventsForRules = %+v, want the seeded row still returned", rows)
+	}
+}
+
+// preStatsIndexSchema returns schemaSQL with idx_events_stats removed -- the
+// on-disk shape of a database one migration behind schemaVersion (br-GI-13-08's
+// "before"). idx_events_cost_source is left alone: it was never dropped, so
+// it already appears in schemaSQL ahead of the block this strips out. Built
+// from bare schemaSQL, not buildPreChangeDB: that fixture's helper also
+// strips req_tool_names (migrations[2]) and the transcript columns
+// (migrations[0]), which a database sitting at user_version = 3 already
+// carries.
+func preStatsIndexSchema(t *testing.T) string {
+	t.Helper()
+	const marker = "-- Covers three of the four /api/stats aggregate queries"
+	i := strings.Index(schemaSQL, marker)
+	if i < 0 {
+		t.Fatal("schema.sql no longer has the idx_events_stats comment")
+	}
+	rest := schemaSQL[i:]
+	j := strings.Index(rest, ");")
+	if j < 0 {
+		t.Fatal("schema.sql's idx_events_stats block has no closing paren")
+	}
+	after := strings.TrimLeft(rest[j+len(");"):], "\r\n")
+	return schemaSQL[:i] + after
+}
+
+// TestMigrateAddsTheStatsIndexAtVersionFour: a database at user_version = 3
+// with a row present reaches version 4, holds idx_events_stats, and still
+// returns its rows.
+func TestMigrateAddsTheStatsIndexAtVersionFour(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-stats-index.db")
+	db := rawDB(t, path)
+	if _, err := db.Exec(preStatsIndexSchema(t)); err != nil {
+		t.Fatalf("build a pre-stats-index database: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO events (request_id, source, first_source, started_at) VALUES (?, 'proxy', 'proxy', ?)`,
+		"req-pre-stats-index", time.Now().UnixNano(),
+	); err != nil {
+		t.Fatalf("seed a row: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA user_version = 3"); err != nil {
+		t.Fatalf("seed user_version: %v", err)
+	}
+	db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a database one migration behind: %v", err)
+	}
+	defer st.Close()
+
+	if got := userVersion(t, st.db); got != schemaVersion {
+		t.Errorf("user_version = %d, want %d", got, schemaVersion)
+	}
+	if !hasIndex(t, st.db, "idx_events_stats") {
+		t.Error("the migration did not create idx_events_stats")
+	}
+	if !hasIndex(t, st.db, "idx_events_cost_source") {
+		t.Error("the migration dropped idx_events_cost_source, want it kept")
+	}
+
+	n, err := st.CountEvents(context.Background(), EventFilter{})
+	if err != nil {
+		t.Fatalf("CountEvents: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("CountEvents = %d, want the seeded row still present", n)
+	}
+}
+
+// TestFreshSchemaMatchesTheMigratedShape: a fresh DB reaches the same index
+// set as a migrated one, so a future edit to one home alone fails the other.
+func TestFreshSchemaMatchesTheMigratedShape(t *testing.T) {
+	freshSt, err := Open(filepath.Join(t.TempDir(), "fresh.db"))
+	if err != nil {
+		t.Fatalf("Open fresh: %v", err)
+	}
+	defer freshSt.Close()
+
+	migratedPath := filepath.Join(t.TempDir(), "migrated.db")
+	buildPreChangeDB(t, migratedPath)
+	migratedSt, err := Open(migratedPath)
+	if err != nil {
+		t.Fatalf("Open pre-change: %v", err)
+	}
+	defer migratedSt.Close()
+
+	for name, st := range map[string]*Store{"fresh": freshSt, "migrated": migratedSt} {
+		if !hasIndex(t, st.db, "idx_events_session_started") {
+			t.Errorf("%s: missing idx_events_session_started", name)
+		}
+		if hasIndex(t, st.db, "idx_events_session_id") {
+			t.Errorf("%s: idx_events_session_id present, want dropped", name)
+		}
+		if !hasIndex(t, st.db, "idx_events_stats") {
+			t.Errorf("%s: missing idx_events_stats", name)
+		}
+		if !hasIndex(t, st.db, "idx_events_cost_source") {
+			t.Errorf("%s: missing idx_events_cost_source", name)
+		}
 	}
 }
 
@@ -1031,5 +1509,161 @@ func TestMigrateDoesNotReAddColumnsOnAPartialNewSchema(t *testing.T) {
 	}
 	if got := userVersion(t, st.db); got != schemaVersion {
 		t.Errorf("user_version = %d, want %d", got, schemaVersion)
+	}
+}
+
+// --- the stats covering index (br-GI-13-08) -------------------------------
+
+// statsFixtureEvents returns a small mixed-billing-mode fixture: one api row
+// (cost_usd set), one subscription row (api_equivalent_cost_usd set), and one
+// unpriced row -- the shape every branch in statsSelectColumnsInner and
+// StatsByCostSource's CASE keys off (billing_mode, cost_source).
+func statsFixtureEvents() []*Event {
+	api := fullEvent("req-stats-api")
+
+	sub := fullEvent("req-stats-sub")
+	sub.BillingMode = "subscription"
+	sub.CostUSD = nil
+	sub.ApiEquivalentCostUSD = f64(0.08)
+	sub.ModelResolved = "claude-opus-5"
+	sub.CostSource = "shipped"
+
+	unpriced := fullEvent("req-stats-unpriced")
+	unpriced.CostUSD = nil
+	unpriced.CostSource = "unpriced"
+
+	return []*Event{api, sub, unpriced}
+}
+
+// TestStatsQueriesUseTheCoveringIndex (§6, br-GI-13-08): StatsSummary,
+// StatsByModel, and StatsByPeriod must be served off idx_events_stats as a
+// covering index rather than a bare table scan, since none of them selects a
+// blob column but the table's B-tree carries them on every page.
+// StatsByCostSource is the documented exception: cost_source is not a
+// leading column of idx_events_stats, so SQLite keeps using the narrower
+// idx_events_cost_source for its GROUP BY -- still an index, not a bare
+// scan, but not a covering one either. See schema.sql's comment on both
+// indexes.
+func TestStatsQueriesUseTheCoveringIndex(t *testing.T) {
+	st := newTestStore(t)
+	where, args := EventFilter{}.whereClause()
+
+	queries := []struct {
+		query    string
+		covering bool
+	}{
+		{statsSelectColumns + " FROM events" + where, true},
+		{"SELECT model_resolved, billing_mode, " + statsSelectColumnsInner +
+			" FROM events" + where + " GROUP BY model_resolved, billing_mode ORDER BY model_resolved", true},
+		{"SELECT " + periodExprs["day"] + " AS period, billing_mode, " + statsSelectColumnsInner +
+			" FROM events" + where + " GROUP BY period, billing_mode ORDER BY period", true},
+		{"SELECT cost_source, COUNT(*), SUM(CASE WHEN billing_mode = 'api' THEN cost_usd END)" +
+			" FROM events" + where + " GROUP BY cost_source ORDER BY cost_source", false},
+	}
+	for _, q := range queries {
+		plan := strings.ToUpper(explainQueryPlanDetail(t, st.db, q.query, args...))
+		usesIndex := strings.Contains(plan, "USING INDEX") || strings.Contains(plan, "USING COVERING INDEX")
+		if !usesIndex {
+			t.Errorf("query plan is a bare table scan, want at least an index:\nquery: %s\nplan: %s", q.query, plan)
+		}
+		if q.covering && !strings.Contains(plan, "COVERING INDEX IDX_EVENTS_STATS") {
+			t.Errorf("query plan does not use idx_events_stats as a covering index:\nquery: %s\nplan: %s", q.query, plan)
+		}
+	}
+}
+
+// TestStatsAggregatesAreUnchangedByTheIndex: idx_events_stats changes how the
+// four stats queries are served, not what they return. The same fixture rows
+// must produce identical results whether the index exists or not.
+func TestStatsAggregatesAreUnchangedByTheIndex(t *testing.T) {
+	ctx := context.Background()
+	seed := func(t *testing.T, st *Store) {
+		t.Helper()
+		for _, ev := range statsFixtureEvents() {
+			if _, _, err := st.InsertEvent(ctx, ev); err != nil {
+				t.Fatalf("seed InsertEvent: %v", err)
+			}
+		}
+	}
+
+	beforePath := filepath.Join(t.TempDir(), "before-index.db")
+	beforeDB := rawDB(t, beforePath)
+	defer beforeDB.Close()
+	if _, err := beforeDB.Exec(preStatsIndexSchema(t)); err != nil {
+		t.Fatalf("build a pre-stats-index database: %v", err)
+	}
+	beforeSt := &Store{db: beforeDB}
+	seed(t, beforeSt)
+	if hasIndex(t, beforeDB, "idx_events_stats") {
+		t.Fatal("pre-stats-index fixture already has idx_events_stats")
+	}
+
+	afterSt := newTestStore(t)
+	seed(t, afterSt)
+	if !hasIndex(t, afterSt.db, "idx_events_stats") {
+		t.Fatal("newTestStore's database is missing idx_events_stats")
+	}
+
+	summaryBefore, err := beforeSt.StatsSummary(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsSummary (before): %v", err)
+	}
+	summaryAfter, err := afterSt.StatsSummary(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsSummary (after): %v", err)
+	}
+	if !reflect.DeepEqual(summaryBefore, summaryAfter) {
+		t.Errorf("StatsSummary changed:\nbefore=%+v\nafter=%+v", summaryBefore, summaryAfter)
+	}
+
+	byModelBefore, err := beforeSt.StatsByModel(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsByModel (before): %v", err)
+	}
+	byModelAfter, err := afterSt.StatsByModel(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsByModel (after): %v", err)
+	}
+	if !reflect.DeepEqual(byModelBefore, byModelAfter) {
+		t.Errorf("StatsByModel changed:\nbefore=%+v\nafter=%+v", byModelBefore, byModelAfter)
+	}
+
+	byPeriodBefore, err := beforeSt.StatsByPeriod(ctx, EventFilter{}, "day")
+	if err != nil {
+		t.Fatalf("StatsByPeriod (before): %v", err)
+	}
+	byPeriodAfter, err := afterSt.StatsByPeriod(ctx, EventFilter{}, "day")
+	if err != nil {
+		t.Fatalf("StatsByPeriod (after): %v", err)
+	}
+	if !reflect.DeepEqual(byPeriodBefore, byPeriodAfter) {
+		t.Errorf("StatsByPeriod changed:\nbefore=%+v\nafter=%+v", byPeriodBefore, byPeriodAfter)
+	}
+
+	byCostSourceBefore, err := beforeSt.StatsByCostSource(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsByCostSource (before): %v", err)
+	}
+	byCostSourceAfter, err := afterSt.StatsByCostSource(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsByCostSource (after): %v", err)
+	}
+	if !reflect.DeepEqual(byCostSourceBefore, byCostSourceAfter) {
+		t.Errorf("StatsByCostSource changed:\nbefore=%+v\nafter=%+v", byCostSourceBefore, byCostSourceAfter)
+	}
+}
+
+// TestPurgeUnpricedUsesTheCostSourceIndex pins the regression idx_events_stats
+// caused when idx_events_cost_source was dropped alongside it: cost_source
+// sits at position 10 of 13 in idx_events_stats, not a leading column, so a
+// DELETE keyed on cost_source alone got no seek out of it and fell back to a
+// bare SCAN of the whole table. Verified with EXPLAIN QUERY PLAN, not assumed
+// -- see schema.sql's comment on idx_events_cost_source.
+func TestPurgeUnpricedUsesTheCostSourceIndex(t *testing.T) {
+	st := newTestStore(t)
+	plan := strings.ToUpper(explainQueryPlanDetail(t, st.db,
+		"DELETE FROM events WHERE cost_source = 'unpriced'"))
+	if !strings.Contains(plan, "SEARCH EVENTS USING") || !strings.Contains(plan, "IDX_EVENTS_COST_SOURCE") {
+		t.Errorf("PurgeUnpriced's DELETE does not seek via idx_events_cost_source:\nplan: %s", plan)
 	}
 }

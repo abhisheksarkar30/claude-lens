@@ -45,6 +45,13 @@ func nonStreamBodyWithCacheWrite5m(model string, write5m int) []byte {
 	))
 }
 
+func nonStreamBodyWithCacheRead(model string, read int) []byte {
+	return []byte(fmt.Sprintf(
+		`{"model":%q,"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":%d}}`,
+		model, read,
+	))
+}
+
 func sseBody(model string, inputTokens, outputTokens int) []byte {
 	return []byte(
 		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"" + model +
@@ -238,8 +245,8 @@ func (f *failingStore) UpsertWarnings(ctx context.Context, eventID int64, warnin
 	return f.inner.UpsertWarnings(ctx, eventID, warnings)
 }
 
-func (f *failingStore) SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error) {
-	return f.inner.SessionEvents(ctx, sessionID)
+func (f *failingStore) SessionEventsForRules(ctx context.Context, sessionID string) ([]*store.Event, error) {
+	return f.inner.SessionEventsForRules(ctx, sessionID)
 }
 
 // A store error on one call does not stop processing subsequent calls.
@@ -507,6 +514,367 @@ func TestConsumerSessionRuleAttachesFindingToEarlierRow(t *testing.T) {
 	}
 	if sess.WarningCount == 0 {
 		t.Error("session warning_count did not pick up the session-scoped finding")
+	}
+}
+
+// countingStore wraps a Store and counts SessionEventsForRules calls, so a test can
+// assert the session-scoped pass runs once per distinct session in a batch,
+// not once per row (C1, br-GI-13-01).
+type countingStore struct {
+	Store
+	sessionEventsCalls atomic.Int32
+}
+
+func (c *countingStore) SessionEventsForRules(ctx context.Context, sessionID string) ([]*store.Event, error) {
+	c.sessionEventsCalls.Add(1)
+	return c.Store.SessionEventsForRules(ctx, sessionID)
+}
+
+// countingAggregator wraps a SessionAggregator and counts RecordCall calls,
+// the fold's own once-per-session assertion.
+type countingAggregator struct {
+	SessionAggregator
+	recordCallCalls atomic.Int32
+}
+
+func (a *countingAggregator) RecordCall(ctx context.Context, sessionID string, ev *store.Event) error {
+	a.recordCallCalls.Add(1)
+	return a.SessionAggregator.RecordCall(ctx, sessionID, ev)
+}
+
+func hasWarningKind(warnings []store.Warning, kind string) bool {
+	for _, w := range warnings {
+		if w.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFlushFoldsAndPassesOncePerSession is C1's core claim: a batch of a
+// multi-event, single-session burst runs the session-scoped pass and the
+// aggregator fold exactly once each, not once per row.
+func TestFlushFoldsAndPassesOncePerSession(t *testing.T) {
+	st := newTestStore(t)
+	cst := &countingStore{Store: st}
+	resolver := session.New(st, 30)
+	agg := &countingAggregator{SessionAggregator: resolver}
+	sk := sink.New(sink.DefaultCapacity)
+	c := New(sk, cst, nil)
+	c.SetSessionResolver(resolver)
+	c.SetSessionAggregator(agg)
+	c.SetSessionRule(analyze.Engine{})
+
+	headers := http.Header{}
+	headers.Set("x-clens-session", "sess-once")
+
+	write := basicCall("req-once-write")
+	write.ReqHeaders = headers
+	write.RespBody = nonStreamBodyWithCacheWrite5m("claude-sonnet-5", 1000)
+
+	read := basicCall("req-once-read")
+	read.ReqHeaders = headers
+	read.RespBody = nonStreamBodyWithCacheRead("claude-sonnet-5", 10)
+
+	third := basicCall("req-once-third")
+	third.ReqHeaders = headers
+
+	ctx := context.Background()
+	batch := []*pendingEvent{c.processCall(write), c.processCall(read), c.processCall(third)}
+	c.flush(ctx, batch)
+
+	if got := cst.sessionEventsCalls.Load(); got != 1 {
+		t.Errorf("SessionEventsForRules calls = %d, want 1 (once per distinct session, not once per row)", got)
+	}
+	if got := agg.recordCallCalls.Load(); got != 1 {
+		t.Errorf("RecordCall calls = %d, want 1 (once per distinct session, not once per row)", got)
+	}
+
+	evs, err := st.ListEvents(ctx, store.EventFilter{})
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	if len(evs) != 3 {
+		t.Fatalf("events = %d, want 3", len(evs))
+	}
+	var writeID int64
+	for _, e := range evs {
+		if e.RequestID == "req-once-write" {
+			writeID = e.ID
+		}
+	}
+	warnings, err := st.EventWarnings(ctx, writeID)
+	if err != nil {
+		t.Fatalf("EventWarnings: %v", err)
+	}
+	// The read landed in the same batch, so the single batch-end pass must
+	// see it -- the write must not be flagged as never-read.
+	if hasWarningKind(warnings, string(analyze.KindCacheWriteNeverRead)) {
+		t.Errorf("write flagged never-read even though its batch-mate read it: %v", warnings)
+	}
+}
+
+// TestFlushPassRunsBeforeFold: a two-row same-session batch where the pass
+// attaches a warning to the first row; the fold that follows must see a
+// warning_count counting it (consumer.go's ordering, preserved by the phase
+// split).
+func TestFlushPassRunsBeforeFold(t *testing.T) {
+	st := newTestStore(t)
+	resolver := session.New(st, 30)
+	sk := sink.New(sink.DefaultCapacity)
+	c := New(sk, st, nil)
+	c.SetSessionResolver(resolver)
+	c.SetSessionAggregator(resolver)
+	c.SetSessionRule(analyze.Engine{})
+
+	headers := http.Header{}
+	headers.Set("x-clens-session", "sess-order")
+
+	write := basicCall("req-order-write")
+	write.ReqHeaders = headers
+	write.RespBody = nonStreamBodyWithCacheWrite5m("claude-sonnet-5", 1000)
+
+	followUp := basicCall("req-order-follow-up")
+	followUp.ReqHeaders = headers
+
+	ctx := context.Background()
+	batch := []*pendingEvent{c.processCall(write), c.processCall(followUp)}
+	c.flush(ctx, batch)
+
+	sess, err := st.GetSession(ctx, "sess-order")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.WarningCount == 0 {
+		t.Error("session warning_count did not pick up the pass's finding -- fold must run after the pass")
+	}
+}
+
+// TestFlushFoldsTheFirstInsertedRow is D8: the fold must carry the batch's
+// first *inserted* row for a session, not the last -- prefix_hash is
+// first-writer-wins at the store, so folding the last row would insert a
+// different hash than the one that actually won.
+func TestFlushFoldsTheFirstInsertedRow(t *testing.T) {
+	st := newTestStore(t)
+	resolver := session.New(st, 30)
+	sk := sink.New(sink.DefaultCapacity)
+	c := New(sk, st, nil)
+	c.SetSessionResolver(resolver)
+	c.SetSessionAggregator(resolver)
+
+	headers := http.Header{}
+	headers.Set("x-clens-session", "sess-hash")
+
+	first := basicCall("req-hash-first")
+	first.ReqHeaders = headers
+	first.ReqBody = []byte(`{"model":"claude-sonnet-5","system":"A","messages":[{"role":"user","content":"hi"}]}`)
+
+	second := basicCall("req-hash-second")
+	second.ReqHeaders = headers
+	second.ReqBody = []byte(`{"model":"claude-sonnet-5","system":"B","messages":[{"role":"user","content":"yo"}]}`)
+
+	ctx := context.Background()
+	batch := []*pendingEvent{c.processCall(first), c.processCall(second)}
+	c.flush(ctx, batch)
+
+	evs, err := st.ListEvents(ctx, store.EventFilter{})
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var firstHash *string
+	for _, e := range evs {
+		if e.RequestID == "req-hash-first" {
+			firstHash = e.PrefixHash
+		}
+	}
+	if firstHash == nil {
+		t.Fatal("first row's PrefixHash is nil, want a computed hash")
+	}
+
+	sess, err := st.GetSession(ctx, "sess-hash")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.PrefixHash != *firstHash {
+		t.Errorf("session PrefixHash = %q, want the first inserted row's hash %q", sess.PrefixHash, *firstHash)
+	}
+}
+
+// TestFlushDedupesAWriteThenReadOfIt pins D1's chosen cadence in both
+// directions: a batch containing a cache write and its read produces no
+// warning for that session under the single batch-end pass, while a write
+// that is genuinely never read still warns.
+func TestFlushDedupesAWriteThenReadOfIt(t *testing.T) {
+	st := newTestStore(t)
+	resolver := session.New(st, 30)
+	sk := sink.New(sink.DefaultCapacity)
+	c := New(sk, st, nil)
+	c.SetSessionResolver(resolver)
+	c.SetSessionAggregator(resolver)
+	c.SetSessionRule(analyze.Engine{})
+
+	readHeaders := http.Header{}
+	readHeaders.Set("x-clens-session", "sess-dedup-read")
+	write := basicCall("req-dedup-write")
+	write.ReqHeaders = readHeaders
+	write.RespBody = nonStreamBodyWithCacheWrite5m("claude-sonnet-5", 1000)
+	read := basicCall("req-dedup-read")
+	read.ReqHeaders = readHeaders
+	read.RespBody = nonStreamBodyWithCacheRead("claude-sonnet-5", 10)
+
+	ctx := context.Background()
+	c.flush(ctx, []*pendingEvent{c.processCall(write), c.processCall(read)})
+
+	evs, err := st.ListEvents(ctx, store.EventFilter{})
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var writeID int64
+	for _, e := range evs {
+		if e.RequestID == "req-dedup-write" {
+			writeID = e.ID
+		}
+	}
+	warnings, err := st.EventWarnings(ctx, writeID)
+	if err != nil {
+		t.Fatalf("EventWarnings: %v", err)
+	}
+	if hasWarningKind(warnings, string(analyze.KindCacheWriteNeverRead)) {
+		t.Errorf("write read within the same batch still flagged never-read: %v", warnings)
+	}
+
+	// Converse: a write with no read anywhere in its session still warns.
+	neverHeaders := http.Header{}
+	neverHeaders.Set("x-clens-session", "sess-dedup-never")
+	neverRead := basicCall("req-dedup-never-read")
+	neverRead.ReqHeaders = neverHeaders
+	neverRead.RespBody = nonStreamBodyWithCacheWrite5m("claude-sonnet-5", 1000)
+
+	c.flush(ctx, []*pendingEvent{c.processCall(neverRead)})
+
+	evs, err = st.ListEvents(ctx, store.EventFilter{})
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var neverReadID int64
+	for _, e := range evs {
+		if e.RequestID == "req-dedup-never-read" {
+			neverReadID = e.ID
+		}
+	}
+	warnings, err = st.EventWarnings(ctx, neverReadID)
+	if err != nil {
+		t.Fatalf("EventWarnings: %v", err)
+	}
+	if !hasWarningKind(warnings, string(analyze.KindCacheWriteNeverRead)) {
+		t.Errorf("write genuinely never read did not warn: %v", warnings)
+	}
+}
+
+// TestSessionWarningCountMatchesWarningRows: after a multi-event batch,
+// sessions.warning_count equals the warnings rows for the session, asserted
+// through the store's own ReconcileSession-derived value and an independent
+// count from EventWarnings, so it cannot pass by both sides being wrong.
+func TestSessionWarningCountMatchesWarningRows(t *testing.T) {
+	st := newTestStore(t)
+	resolver := session.New(st, 30)
+	sk := sink.New(sink.DefaultCapacity)
+	c := New(sk, st, nil)
+	c.SetSessionResolver(resolver)
+	c.SetSessionAggregator(resolver)
+	c.SetSessionRule(analyze.Engine{})
+
+	headers := http.Header{}
+	headers.Set("x-clens-session", "sess-count")
+
+	write := basicCall("req-count-write")
+	write.ReqHeaders = headers
+	write.RespBody = nonStreamBodyWithCacheWrite5m("claude-sonnet-5", 1000)
+	followUp := basicCall("req-count-follow-up")
+	followUp.ReqHeaders = headers
+
+	ctx := context.Background()
+	c.flush(ctx, []*pendingEvent{c.processCall(write), c.processCall(followUp)})
+
+	evs, err := st.ListEvents(ctx, store.EventFilter{})
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	total := 0
+	for _, e := range evs {
+		warnings, err := st.EventWarnings(ctx, e.ID)
+		if err != nil {
+			t.Fatalf("EventWarnings: %v", err)
+		}
+		total += len(warnings)
+	}
+
+	sess, err := st.GetSession(ctx, "sess-count")
+	if err != nil {
+		t.Fatalf("GetSession: %v", err)
+	}
+	if sess.WarningCount != total {
+		t.Errorf("session warning_count = %d, want %d (the warnings table's own count)", sess.WarningCount, total)
+	}
+}
+
+// TestBatchEndPassWritesTheUsageLessTailFinding (§6 test 5, pipe level): a
+// batch of three full rewrites followed by a usage-less row (an upstream
+// error, so its response never carries usage) writes the
+// cache_prefix_invalidation warning through the single batch-end pass,
+// anchored on the last usage-carrying row. This fails if rowsWithUsage is
+// dropped, if the walk reverts to aborting on a usage-less pair, or if the
+// anchor lands on the usage-less row instead.
+func TestBatchEndPassWritesTheUsageLessTailFinding(t *testing.T) {
+	st := newTestStore(t)
+	resolver := session.New(st, 30)
+	sk := sink.New(sink.DefaultCapacity)
+	c := New(sk, st, nil)
+	c.SetSessionResolver(resolver)
+	c.SetSessionAggregator(resolver)
+	c.SetSessionRule(analyze.Engine{})
+
+	headers := http.Header{}
+	headers.Set("x-clens-session", "sess-usageless-tail")
+
+	p1 := basicCall("req-tail-p1")
+	p1.ReqHeaders = headers
+	p1.RespBody = nonStreamBody("claude-sonnet-5", 5000, 5)
+
+	p2 := basicCall("req-tail-p2")
+	p2.ReqHeaders = headers
+	p2.RespBody = nonStreamBodyWithCacheWrite5m("claude-sonnet-5", 4900)
+
+	p3 := basicCall("req-tail-p3")
+	p3.ReqHeaders = headers
+	p3.RespBody = nonStreamBodyWithCacheWrite5m("claude-sonnet-5", 5000)
+
+	z := basicCall("req-tail-z")
+	z.ReqHeaders = headers
+	z.Err = errors.New("upstream connection reset")
+	z.RespBody = nil
+
+	ctx := context.Background()
+	c.flush(ctx, []*pendingEvent{
+		c.processCall(p1), c.processCall(p2), c.processCall(p3), c.processCall(z),
+	})
+
+	evs, err := st.ListEvents(ctx, store.EventFilter{})
+	if err != nil {
+		t.Fatalf("ListEvents: %v", err)
+	}
+	var p3ID int64
+	for _, e := range evs {
+		if e.RequestID == "req-tail-p3" {
+			p3ID = e.ID
+		}
+	}
+	warnings, err := st.EventWarnings(ctx, p3ID)
+	if err != nil {
+		t.Fatalf("EventWarnings: %v", err)
+	}
+	if !hasWarningKind(warnings, string(analyze.KindCachePrefixInvalidation)) {
+		t.Errorf("p3 missing cache_prefix_invalidation after a usage-less tail row: %v", warnings)
 	}
 }
 

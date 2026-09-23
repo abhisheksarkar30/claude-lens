@@ -2,7 +2,7 @@
 
 # Decision records
 
-Nine architectural forks where the code took one path and a real alternative was rejected. Each is
+Ten architectural forks where the code took one path and a real alternative was rejected. Each is
 recorded because **the losing side is the one a future change is most likely to reintroduce** —
 these are not history for its own sake.
 
@@ -11,7 +11,9 @@ these are not history for its own sake.
 different in kind**: it records a GI-1 decision being *superseded*, and it is here because the
 rejected side of that original decision — "no migrations" — is the one a reader will still find
 quoted in the older docs. **008 and 009 come from the GI-9 plan** (`docs/planning/GI-9-merge-jsonl-and-proxy-rows.md`,
-D1 and D7): the identity key and the session id the cross-source merge relies on.
+D1 and D7): the identity key and the session id the cross-source merge relies on. **010 comes from
+the GI-13 plan** (`docs/planning/GI-13-session-pass-cost.md`, D1): the per-session analyzer pass and
+fold dedupe to once per flush batch.
 
 | ADR | Decision | Reintroducing the rejected side would… |
 |---|---|---|
@@ -24,6 +26,7 @@ D1 and D7): the identity key and the session id the cross-source merge relies on
 | [007](007-schema-migrations-by-user-version.md) | schema changes go through a `PRAGMA user_version` runner; `schema.sql` never `ALTER`s | recreate (or hand-edit) the user's database to add a column — silently, because it looks safe when the database is a temp file |
 | [008](008-three-tier-identity-key.md) | cross-source identity is a three-tier key (`request-id` header → response body `message.id` → namespaced synthetic) | fall back to a header-only key that cannot converge a proxy row with its JSONL counterpart whenever the header is absent from either side |
 | [009](009-proxy-adopts-the-conversation-id.md) | the proxy adopts `x-claude-code-session-id` as its stored `session_id` | leave `clens sessions` showing gap-window heuristic groups instead of real conversations |
+| [010](010-per-session-dedupe-accepts-warning-subset.md) | the session-scoped analyzer pass and fold run once per distinct session per flush batch, not once per row | re-walk a large session's full row history once per row in a batch again, scaling flush cost with `batch_size × session_row_count` even with the composite index in place |
 
-The status of all nine is **Accepted**. None is superseded — 007 supersedes a *GI-1 decision*
+The status of all ten is **Accepted**. None is superseded — 007 supersedes a *GI-1 decision*
 ("migrations: none in v1"), not another ADR.

@@ -52,6 +52,13 @@ CREATE TABLE IF NOT EXISTS events (
     method                  TEXT,
     path                    TEXT,
     status                  INTEGER,
+    -- NULL iff the row has no request body (structurally for a JSONL row, or
+    -- because --body-policy dropped it); otherwise the request's tool names
+    -- in body order, JSON-encoded ('[]' when the body declares none). This is
+    -- what lets the session-scoped rules compare tool names between turns
+    -- without reading req_body -- see internal/store/store.go's
+    -- encodeToolNames, the one place this contract is enforced at write time.
+    req_tool_names          TEXT,
     req_headers             TEXT,
     resp_headers            TEXT,
     req_body                BLOB,
@@ -65,9 +72,37 @@ CREATE TABLE IF NOT EXISTS events (
     transcript_role         TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
+CREATE INDEX IF NOT EXISTS idx_events_session_started ON events(session_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_events_started_at ON events(started_at);
+-- idx_events_cost_source is kept alongside idx_events_stats below, not folded
+-- into it, despite cost_source being one of that index's columns: dropping
+-- this one was tried and reverted after it regressed PurgeUnpriced's
+-- `DELETE FROM events WHERE cost_source = 'unpriced'` from an index seek to a
+-- bare, unindexed SCAN of the whole table -- verified with EXPLAIN QUERY
+-- PLAN, not assumed. cost_source sits at position 10 of 13 in idx_events_stats,
+-- not a leading column, so it cannot serve an equality seek at all; SQLite
+-- correctly prefers a full table scan over a full index scan for a DELETE
+-- that needs the whole row anyway. Keeping both means one query
+-- (StatsByCostSource, below) still is not served as a covering-index scan --
+-- see its comment -- which is an accepted, documented gap, not a silent one.
 CREATE INDEX IF NOT EXISTS idx_events_cost_source ON events(cost_source);
+-- Covers three of the four /api/stats aggregate queries (StatsSummary,
+-- StatsByModel, StatsByPeriod) as a full covering-index scan: every column
+-- they SUM, GROUP BY, or filter on, so the walk never reaches the table's
+-- 2GB+ of blob-bearing rows. StatsByCostSource is the fourth query and is
+-- NOT covered by this index in practice: cost_source is not a leading
+-- column here, so SQLite keeps using idx_events_cost_source for that one
+-- query's GROUP BY instead (still an index scan, not a bare table scan, but
+-- not covering either -- it still pays one table lookup per row for
+-- billing_mode/cost_usd). Forcing it onto this index with INDEXED BY was
+-- considered and rejected: it would make StatsByCostSource unusable against
+-- any database that has not yet run this migration, which is exactly the
+-- scenario this package's own test suite exercises on purpose.
+CREATE INDEX IF NOT EXISTS idx_events_stats ON events(
+    input_tokens, output_tokens, cache_write_5m_tokens, cache_write_1h_tokens,
+    cache_read_tokens, thinking_tokens, total_prompt_tokens, model_resolved,
+    billing_mode, cost_source, cost_usd, api_equivalent_cost_usd, started_at
+);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id                             TEXT PRIMARY KEY,

@@ -125,7 +125,7 @@ func Open(dbPath string) (*Store, error) {
 
 // schemaVersion is the current PRAGMA user_version. It must equal
 // len(migrations): migrations[n] upgrades version n to n+1.
-const schemaVersion = 1
+const schemaVersion = 4
 
 // SchemaVersion reports the schema version this binary knows, so a diagnostic
 // can print it beside a database's stored one. Exported rather than duplicated
@@ -162,6 +162,43 @@ var migrations = []string{
 	// wire-capture ones. Nullable and additive, so there is no table rewrite.
 	`ALTER TABLE events ADD COLUMN transcript_content BLOB;
 	 ALTER TABLE events ADD COLUMN transcript_role TEXT;`,
+	// 1 -> 2: a session-scoped read (WHERE session_id = ? ORDER BY
+	// started_at ASC) had no index that satisfied its ORDER BY, so SQLite
+	// materialized the session's rows -- BLOBs included -- and spilled the
+	// sort to a temp file. idx_events_session_id is a strict prefix of the
+	// composite and every session_id-filtered query is served by its
+	// leading column, so it is redundant weight on every insert once the
+	// composite exists.
+	`CREATE INDEX IF NOT EXISTS idx_events_session_started ON events(session_id, started_at);
+	 DROP INDEX IF EXISTS idx_events_session_id;`,
+	// 2 -> 3: the session-scoped rules read req_body only to compare tool
+	// names between two consecutive calls (ruleCacheInvalidatedByTools). The
+	// consumer already parses those names on the write path; recording them
+	// here lets SessionEventsForRules drop req_body from its projection
+	// entirely, which is most of what the pass costs on a session with large
+	// bodies. See internal/store/schema.sql's comment on the column for the
+	// NULL contract; a plain ADD COLUMN is enough because the value is
+	// derived on write, not backfilled by this migration -- see
+	// `clens backfill-tool-names` for existing rows.
+	`ALTER TABLE events ADD COLUMN req_tool_names TEXT;`,
+	// 3 -> 4: three of /api/stats' four aggregate queries (StatsSummary,
+	// StatsByModel, StatsByPeriod) SUM/GROUP BY/filter on columns that were
+	// otherwise unindexed, so each one walked the whole table -- blob
+	// columns included -- to reach the small set of columns it actually
+	// needs. idx_events_cost_source is deliberately NOT dropped here: an
+	// earlier version of this migration folded it into idx_events_stats,
+	// verified only against the four SELECTs and not against
+	// PurgeUnpriced's `DELETE FROM events WHERE cost_source = 'unpriced'`,
+	// which regressed from an index seek to a bare, unindexed table scan --
+	// cost_source is not a leading column of idx_events_stats, so it cannot
+	// serve that equality lookup at all. See schema.sql's comments on both
+	// indexes for the full column list and the accepted StatsByCostSource
+	// gap this leaves.
+	`CREATE INDEX IF NOT EXISTS idx_events_stats ON events(
+		input_tokens, output_tokens, cache_write_5m_tokens, cache_write_1h_tokens,
+		cache_read_tokens, thinking_tokens, total_prompt_tokens, model_resolved,
+		billing_mode, cost_source, cost_usd, api_equivalent_cost_usd, started_at
+	);`,
 }
 
 // eventsTableAbsent reports whether this database has no events table yet,
@@ -326,35 +363,39 @@ func (s *Store) GetEvent(ctx context.Context, id int64) (*Event, error) {
 	return scanEvent(row)
 }
 
-// SessionEvents returns sessionID's rows oldest-first, for the
-// session-scoped analyzer pass (br-GI-1-09) that compares consecutive
-// calls. Unlike ListEvents it takes no pagination. Before D7 a session's
-// row count was bounded by the session resolver's own gap window, since a
-// call beyond the gap got a fresh session id rather than joining this
-// one; D7 makes a session the whole conversation a header names, so that
-// bound no longer holds and nothing here replaces it.
-func (s *Store) SessionEvents(ctx context.Context, sessionID string) ([]*Event, error) {
-	rows, err := s.db.QueryContext(ctx, eventSelectColumns+" FROM events WHERE session_id = ? ORDER BY started_at ASC", sessionID)
+// SessionEventsForRules returns sessionID's rows oldest-first, at the rules
+// projection: every column the session-scoped analyzer pass (br-GI-1-09)
+// reads, without any of the six header/body blobs -- br-GI-13-07 moved the
+// one rule that used to need req_body (comparing tool names between turns)
+// onto the req_tool_names column instead. Unlike ListEvents it takes no
+// pagination. Before D7 a
+// session's row count was bounded by the session resolver's own gap window,
+// since a call beyond the gap got a fresh session id rather than joining
+// this one; D7 makes a session the whole conversation a header names, so
+// that bound no longer holds and nothing here replaces it.
+func (s *Store) SessionEventsForRules(ctx context.Context, sessionID string) ([]*Event, error) {
+	rows, err := s.db.QueryContext(ctx, rulesSelectColumns+" FROM events WHERE session_id = ? ORDER BY started_at ASC", sessionID)
 	if err != nil {
-		return nil, fmt.Errorf("store: SessionEvents: %w", err)
+		return nil, fmt.Errorf("store: SessionEventsForRules: %w", err)
 	}
 	defer rows.Close()
 
 	var out []*Event
 	for rows.Next() {
-		ev, err := scanEvent(rows)
+		ev, err := scanEventForRules(rows)
 		if err != nil {
-			return nil, fmt.Errorf("store: SessionEvents: %w", err)
+			return nil, fmt.Errorf("store: SessionEventsForRules: %w", err)
 		}
 		out = append(out, ev)
 	}
 	return out, rows.Err()
 }
 
-// SessionEventsSummary is SessionEvents at the list projection: the same
-// rows, same order, without the four header/body blobs. The session route
-// renders a call list, so it wants this; the session-scoped analyzer pass
-// compares consecutive request bodies and wants SessionEvents.
+// SessionEventsSummary is SessionEventsForRules at the list projection: the
+// same rows, same order. Both projections are now the same 42 columns (the
+// full set minus the six header/body blobs) -- SessionEventsForRules exists
+// as its own type and query because the session-scoped analyzer pass names
+// it explicitly, not because it reads anything wider.
 func (s *Store) SessionEventsSummary(ctx context.Context, sessionID string) ([]*EventSummary, error) {
 	rows, err := s.db.QueryContext(ctx, summarySelectColumns+" FROM events WHERE session_id = ? ORDER BY started_at ASC", sessionID)
 	if err != nil {
@@ -1259,6 +1300,38 @@ type rowScanner interface {
 	Scan(dest ...any) error
 }
 
+// EncodeToolNames is the one encoding of req_tool_names' JSON array, shared
+// by the consumer's write path (internal/consumer sets Event.ToolNames from
+// this) and the backfill's rewrite of a historical row, so the two writers
+// cannot disagree on what "the tool names" looks like on disk. A nil slice
+// encodes as "[]", not "null": json.Marshal(nil) would otherwise make an
+// empty-tools body indistinguishable from a decode failure once read back.
+// Exported because both callers live outside package store.
+func EncodeToolNames(names []string) string {
+	if names == nil {
+		names = []string{}
+	}
+	b, err := json.Marshal(names)
+	if err != nil {
+		// names is always []string; Marshal cannot fail on it.
+		return "[]"
+	}
+	return string(b)
+}
+
+// reqToolNamesArg is the write-time value for req_tool_names: the column's
+// contract (schema.sql) is "NULL iff the row has no request body", decided
+// by the body the row is about to hold, not by whatever ev.ToolNames
+// currently contains -- a merge that backfills ReqBody from the other side
+// must also backfill ToolNames (see mergeEvents), and this is what makes an
+// unset ToolNames on a body-less row write NULL rather than an empty string.
+func reqToolNamesArg(ev *Event) any {
+	if len(ev.ReqBody) == 0 {
+		return nil
+	}
+	return ev.ToolNames
+}
+
 // eventColumnNames is the positional column list every event SELECT uses, in
 // scan order. Both scans below take their order from it, and the summary
 // projection is *derived* from it rather than hand-kept, so the list SELECT
@@ -1274,22 +1347,35 @@ var eventColumnNames = []string{
 	"is_sidechain", "session_id", "project", "git_branch", "client_version", "cli_entrypoint",
 	"cost_usd", "api_equivalent_cost_usd", "cost_source",
 	"prefix_hash", "replay_of", "replay_edits", "capture_complete",
-	"method", "path", "status", "req_headers", "resp_headers", "req_body", "resp_body",
+	"method", "path", "status", "req_tool_names", "req_headers", "resp_headers", "req_body", "resp_body",
 	"transcript_content", "transcript_role",
 }
 
 // summaryOmittedColumns are the header/body blobs the list path never reads.
 // This is the one place the projection names them: adding a column to the
 // blob set is a one-line change here, and the list keeps excluding it.
+// req_tool_names is deliberately not here: it is a small text column, not a
+// blob, and both the summary and rules projections select it.
 var summaryOmittedColumns = []string{
 	"req_headers", "resp_headers", "req_body", "resp_body",
 	"transcript_content", "transcript_role",
 }
 
+// rulesOmittedColumns was summaryOmittedColumns minus req_body before
+// br-GI-13-07: the session rules used to read req_body directly to compare
+// tool names between two calls. That rule now reads the stored
+// req_tool_names column instead, so req_body rejoins the omitted set and the
+// two lists are identical. Kept as its own var (rather than collapsed onto
+// summaryOmittedColumns) because rulesColumnNames/rulesSelectColumns below
+// are asserted against by name in tests that predate this change.
+var rulesOmittedColumns = columnsMinus(summaryOmittedColumns, nil)
+
 var (
 	eventSelectColumns   = selectFrom(eventColumnNames)
 	summaryColumnNames   = columnsMinus(eventColumnNames, summaryOmittedColumns)
 	summarySelectColumns = selectFrom(summaryColumnNames)
+	rulesColumnNames     = columnsMinus(eventColumnNames, rulesOmittedColumns)
+	rulesSelectColumns   = selectFrom(rulesColumnNames)
 )
 
 func selectFrom(cols []string) string { return "SELECT " + strings.Join(cols, ", ") }
@@ -1321,6 +1407,7 @@ type eventScanVals struct {
 	prefixHash      sql.NullString
 	method, path    sql.NullString
 	status          sql.NullInt64
+	reqToolNames    sql.NullString
 }
 
 // dest returns the Scan destinations for summaryColumnNames, in order,
@@ -1339,7 +1426,7 @@ func (v *eventScanVals) dest(es *EventSummary, extra ...any) []any {
 		&v.isSidechain, &es.SessionID, &es.Project, &es.GitBranch, &es.ClientVersion, &es.CliEntrypoint,
 		&v.costUSD, &v.apiEquivCost, &es.CostSource,
 		&v.prefixHash, &es.ReplayOf, &es.ReplayEdits, &v.captureComplete,
-		&v.method, &v.path, &v.status,
+		&v.method, &v.path, &v.status, &v.reqToolNames,
 	}
 	return append(d, extra...)
 }
@@ -1369,6 +1456,11 @@ func (v *eventScanVals) apply(es *EventSummary) {
 	es.Method = v.method.String
 	es.Path = v.path.String
 	es.Status = int(v.status.Int64)
+	// req_tool_names is NULL exactly when the row has no request body (the
+	// column's own contract, schema.sql); Valid is therefore HasReqBody
+	// itself, not a separate derivation.
+	es.HasReqBody = v.reqToolNames.Valid
+	es.ToolNames = v.reqToolNames.String
 }
 
 func scanEventSummary(row rowScanner) (*EventSummary, error) {
@@ -1402,6 +1494,19 @@ func scanEvent(row rowScanner) (*Event, error) {
 	ev.RespBody = respBody
 	ev.TranscriptContent = transcriptContent
 	ev.TranscriptRole = transcriptRole.String
+	return &ev, nil
+}
+
+// scanEventForRules scans a row at the rules projection: exactly the shared
+// summary destinations, no extras -- since br-GI-13-07, rulesColumnNames and
+// summaryColumnNames are the same 42 columns, and ev.ReqBody is left nil.
+func scanEventForRules(row rowScanner) (*Event, error) {
+	var ev Event
+	var v eventScanVals
+	if err := row.Scan(v.dest(&ev.EventSummary)...); err != nil {
+		return nil, err
+	}
+	v.apply(&ev.EventSummary)
 	return &ev, nil
 }
 
@@ -2210,4 +2315,71 @@ func (s *Store) ReflagIncompleteCaptures(ctx context.Context, dryRun bool) (Refl
 		return counts, fmt.Errorf("store: ReflagIncompleteCaptures: commit: %w", err)
 	}
 	return counts, nil
+}
+
+// ToolNamesBackfillPageSize bounds how many rows
+// EventsAwaitingToolNamesBackfill loads at once, so `clens
+// backfill-tool-names` holds one page of request bodies in memory rather
+// than the whole outstanding set -- a session's req_body column alone can
+// run into hundreds of megabytes (br-GI-13-07's own measurement).
+const ToolNamesBackfillPageSize = 200
+
+// ToolNamesBackfillRow is one row EventsAwaitingToolNamesBackfill returns:
+// just enough to recompute req_tool_names, not a whole Event.
+type ToolNamesBackfillRow struct {
+	ID      int64
+	ReqBody []byte
+}
+
+// EventsAwaitingToolNamesBackfill returns up to limit rows, ordered by id,
+// with id > afterID, whose req_body is present but req_tool_names is still
+// unset -- br-GI-13-07's historical-row gap. Paged by a keyset cursor
+// (afterID) rather than OFFSET, so a long-running backfill's cost per page
+// does not grow with how far it has already gotten.
+func (s *Store) EventsAwaitingToolNamesBackfill(ctx context.Context, afterID int64, limit int) ([]ToolNamesBackfillRow, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, req_body FROM events
+		 WHERE req_body IS NOT NULL AND req_tool_names IS NULL AND id > ?
+		 ORDER BY id LIMIT ?`, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: EventsAwaitingToolNamesBackfill: %w", err)
+	}
+	defer rows.Close()
+
+	var out []ToolNamesBackfillRow
+	for rows.Next() {
+		var r ToolNamesBackfillRow
+		if err := rows.Scan(&r.ID, &r.ReqBody); err != nil {
+			return nil, fmt.Errorf("store: EventsAwaitingToolNamesBackfill: scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// SetReqToolNames writes the backfill's single-column result for one row.
+// toolNames is the caller's already-encoded value (EncodeToolNames) -- a row
+// with no tools to record still passes "[]", the column's contract for "a
+// body that declares none", never an empty string.
+func (s *Store) SetReqToolNames(ctx context.Context, id int64, toolNames string) error {
+	if _, err := s.db.ExecContext(ctx, `UPDATE events SET req_tool_names = ? WHERE id = ?`, toolNames, id); err != nil {
+		return fmt.Errorf("store: SetReqToolNames: %w", err)
+	}
+	return nil
+}
+
+// CountEventsAwaitingToolNamesBackfill is `clens doctor`'s discovery path
+// for an un-backfilled database: the same predicate as
+// EventsAwaitingToolNamesBackfill, counted rather than paged, so an
+// outstanding gap is a visible number instead of a silent behaviour change
+// (rowsWithRequestBody -> HasReqBody declining the tools rule on every
+// pre-migration row until the backfill runs).
+func (s *Store) CountEventsAwaitingToolNamesBackfill(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM events WHERE req_body IS NOT NULL AND req_tool_names IS NULL`).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: CountEventsAwaitingToolNamesBackfill: %w", err)
+	}
+	return n, nil
 }

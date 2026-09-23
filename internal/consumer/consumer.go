@@ -41,7 +41,7 @@ type Store interface {
 	// not ev's. The consumer must key its session-scoped work to that id.
 	InsertEvent(ctx context.Context, ev *store.Event) (int64, string, error)
 	UpsertWarnings(ctx context.Context, eventID int64, warnings []store.Warning) error
-	SessionEvents(ctx context.Context, sessionID string) ([]*store.Event, error)
+	SessionEventsForRules(ctx context.Context, sessionID string) ([]*store.Event, error)
 }
 
 // Consumer drains a sink.Sink, builds one store.Event per captured call,
@@ -202,6 +202,16 @@ func (c *Consumer) Run(ctx context.Context) error {
 func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 	c.flushCount.Add(1)
 	wrote := false
+
+	// order+firstEv track, per distinct returned session id, the first
+	// inserted row seen for it, in arrival order (D8): the fold below must
+	// carry that row's PrefixHash, not the last one's -- prefix_hash is
+	// first-writer-wins at the store (store.go's ON CONFLICT never touches
+	// it), so folding the last row would insert a different hash than the
+	// one that actually won the write.
+	var order []string
+	firstEv := map[string]*store.Event{}
+
 	for _, pe := range batch {
 		id, sessionID, err := c.st.InsertEvent(ctx, pe.ev)
 		if err != nil {
@@ -217,25 +227,37 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 			}
 		}
 
-		warningCount := len(pe.warnings)
-		if c.sessionRule != nil && sessionID != "" {
-			warningCount += c.runSessionRule(ctx, sessionID)
-		}
-
-		// Run last, after the session-scoped pass, so warning_count's
-		// re-derivation (ReconcileSession) counts findings that pass
-		// attached to earlier rows in this same session too.
-		//
 		// sessionID is the written row's session, which after a cross-source
-		// merge is the first-written row's, not pe.ev's. Folding into
-		// pe.ev.SessionID would create a session row owning no events and
-		// leave the row's real session out of the analysis.
-		if c.aggregator != nil && sessionID != "" {
-			if err := c.aggregator.RecordCall(ctx, sessionID, pe.ev, warningCount); err != nil {
+		// merge is the first-written row's, not pe.ev's. Grouping on
+		// pe.ev.SessionID would fold into the wrong session, or create a
+		// session row owning no events.
+		if sessionID != "" {
+			if _, ok := firstEv[sessionID]; !ok {
+				firstEv[sessionID] = pe.ev
+				order = append(order, sessionID)
+			}
+		}
+	}
+
+	// Phase 2: the session-scoped pass, once per distinct session in this
+	// batch -- not once per row.
+	if c.sessionRule != nil {
+		for _, sessionID := range order {
+			c.runSessionRule(ctx, sessionID)
+		}
+	}
+
+	// Phase 3: the fold, once per distinct session, after every pass above
+	// so warning_count's re-derivation (ReconcileSession) counts findings
+	// the pass attached to any row of this same session.
+	if c.aggregator != nil {
+		for _, sessionID := range order {
+			if err := c.aggregator.RecordCall(ctx, sessionID, firstEv[sessionID]); err != nil {
 				log.Printf("consumer: record session call for %s: %v", sessionID, err)
 			}
 		}
 	}
+
 	if wrote {
 		c.lastWriteAt.Store(time.Now().UnixNano())
 	}
@@ -243,13 +265,12 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 
 // runSessionRule runs the session-scoped analysis pass over sessionID's
 // whole row history and upserts each finding onto the row it names,
-// grouped so a row with several findings gets one call. It returns how
-// many warnings it wrote, folded into the aggregator's warningCount.
-func (c *Consumer) runSessionRule(ctx context.Context, sessionID string) int {
-	rows, err := c.st.SessionEvents(ctx, sessionID)
+// grouped so a row with several findings gets one call.
+func (c *Consumer) runSessionRule(ctx context.Context, sessionID string) {
+	rows, err := c.st.SessionEventsForRules(ctx, sessionID)
 	if err != nil {
 		log.Printf("consumer: session rows for %s: %v", sessionID, err)
-		return 0
+		return
 	}
 	grouped := map[int64][]store.Warning{}
 	for _, w := range c.sessionRule.AnalyzeSession(rows) {
@@ -258,15 +279,11 @@ func (c *Consumer) runSessionRule(ctx context.Context, sessionID string) int {
 		}
 		grouped[w.EventID] = append(grouped[w.EventID], w)
 	}
-	n := 0
 	for eventID, warnings := range grouped {
 		if err := c.st.UpsertWarnings(ctx, eventID, warnings); err != nil {
 			log.Printf("consumer: upsert session warnings for event %d: %v", eventID, err)
-			continue
 		}
-		n += len(warnings)
 	}
-	return n
 }
 
 // drainRemaining opportunistically drains whatever is already buffered in
@@ -471,6 +488,11 @@ func buildEvent(call *sink.CapturedCall, meta parse.Meta, usage parse.Usage) *st
 			Method:             call.Method,
 			Path:               call.Path,
 			Status:             call.Status,
+			// The store derives NULL-vs-value from len(ReqBody) at write time
+			// (reqToolNamesArg), so this is set unconditionally -- meta was
+			// already extracted from call.ReqBody, so it costs no extra parse
+			// whether or not a body ends up stored.
+			ToolNames: store.EncodeToolNames(meta.ToolNames),
 		},
 		ReqBody:  call.ReqBody,
 		RespBody: call.RespBody,

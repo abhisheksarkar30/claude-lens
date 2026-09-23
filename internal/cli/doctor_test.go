@@ -34,6 +34,22 @@ func TestDoctorRunsCleanOnEmptyInstall(t *testing.T) {
 	}
 }
 
+// TestDoctorNamesThePprofFlagWhenUnset: the profiler is off by default, so
+// doctor must name the flag that turns it on rather than just printing an
+// empty value -- otherwise the feature is discoverable only by reading the
+// source that needed it.
+func TestDoctorNamesThePprofFlagWhenUnset(t *testing.T) {
+	withHome(t)
+	var buf bytes.Buffer
+	if err := runDoctor(nil, &buf); err != nil {
+		t.Fatalf("runDoctor: %v\noutput:\n%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "--pprof-addr") {
+		t.Errorf("doctor output does not name --pprof-addr when PprofAddr is unset:\n%s", out)
+	}
+}
+
 // TestDoctorReportsTheSchemaVersion covers the reporting half of the check,
 // which is the half doctor owns. Whether a version-0 database is actually
 // brought forward is the migration runner's behaviour, and it is pinned in

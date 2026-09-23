@@ -38,7 +38,7 @@ Three non-stdlib modules and no more: `modernc.org/sqlite` (pure Go, no cgo),
 | [infra-and-deploy.md](infra-and-deploy.md) | before touching a workflow, a hook, or branch policy | conditional — trigger: `.github/workflows/` |
 | [integrations-and-external-services.md](integrations-and-external-services.md) | before changing a collector or adding a dependency | conditional — trigger: four external endpoints, three Go modules |
 | [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 1142 lines of hand-written JS under a hard no-build-step rule |
-| [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — nine genuine forks, each with a rejected alternative a change could reintroduce |
+| [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — ten genuine forks, each with a rejected alternative a change could reintroduce |
 
 ## Grounding rules for agents
 
@@ -269,3 +269,81 @@ both are recorded in the beads rather than here: plan §4's three-option Calls-p
 otherwise display a granularity it is not applying) and plan §4/§5's "`--dry-run` is not an argument to
 `Store.RepriceCosts`" (it is). Re-asserting `status=converged` on text no review round has read is
 round 9's finding O4, so the beads carry the corrections instead.
+
+**2026-09-23 — REFRESH, scoped to `GI-13-session-pass-cost`** (beads `br-GI-13-01` … `-06`; plan
+`docs/planning/GI-13-session-pass-cost.md`). **No module was added or retired and no dependency
+moved.** `decisions/` gained **one ADR** — [010](decisions/010-per-session-dedupe-accepts-warning-subset.md),
+the per-session analyzer pass and fold deduping to once per flush batch — so the count above moved
+nine → ten.
+
+**Nine module files changed.** `storage-schema.md` (the composite `(session_id, started_at)` index
+replacing the single-column one; a new paragraph on `schemaVersion` reaching 2 and why), `build-and-run.md`
+and `cli-and-tooling.md` (the new `--pprof-addr` flag, loopback-locked even under `--allow-remote`),
+`security-and-permissions.md` (a third listener surface added to the AuthN/AuthZ table, with the
+`--allow-remote` exception named), `architecture.md` (the same exception, at the component-map level),
+`workflows.md` §1 (the per-batch, not per-row, session pass/fold — the story's one user-visible
+behaviour change, and the first-inserted-row rule for `prefix_hash`), `api-surface.md` and `glossary.md`
+(both named a `SessionEvents` method the story renamed to `SessionEventsForRules` and narrowed to a
+nine-column rules projection — `req_body` included, the other five blobs dropped), and
+`testing-and-quality.md` (the size figures, re-measured: no new test file this story, every case
+landed in an existing one).
+
+**The dominant finding this refresh made, worth stating plainly: two module docs still named a store
+method the code no longer has.** `api-surface.md` and `glossary.md` both said `SessionEvents` was
+one of the full-row reads; `br-GI-13-03` deleted that method outright (D3: "a method whose name
+promises full rows and returns `nil` blobs is a trap for the next caller") and replaced it with
+`SessionEventsForRules`, a narrower projection, not a renamed twin. Neither doc's own file was in
+any bead's list — the beads' file lists named the store and the callers, not the two docs that
+happened to mention the old name — so this is the same class GI-11's refresh flagged: a fact
+restated in more than one place, where the story moved the site it named but not every site that
+named it.
+
+**No new store column, no new capture, no CLI subcommand added** — `--pprof-addr` is a flag on the
+existing shared set, not a new one; see [cli-and-tooling.md](cli-and-tooling.md) for why its row
+count still reads 21.
+
+**2026-09-23 — REFRESH, scoped to `GI-13-session-pass-cost`'s post-convergence beads `br-GI-13-07`
+… `-09`** (plan `docs/planning/GI-13-session-pass-cost.md`; beads 01–06 were the prior entry above).
+**No module was added or retired and no dependency moved.** `decisions/` gained no new ADR — none of
+the three beads is a chosen fork with a rejected alternative; the one candidate (dropping
+`idx_events_cost_source`) was tried, found to regress `PurgeUnpriced` to a table scan, and reverted,
+which is a bug fixed during the story rather than a design decision to record.
+
+**One new store column** (`events.req_tool_names`, `br-GI-13-07`), **one new index**
+(`idx_events_stats`, `br-GI-13-08`, alongside — not replacing — `idx_events_cost_source`), **two new
+CLI subcommands** (`backfill-tool-names`, `shutdown`, `br-GI-13-07`/`-09`) taking the dispatch table
+21 → 23, and **one new route** (`POST /api/shutdown`, `br-GI-13-09`) taking the write-guard count from
+two to three. `schemaVersion` moved 2 → 4.
+
+**Six module files changed:** `storage-schema.md` (`schemaVersion` 4; `req_tool_names`'s NULL
+contract; the stats covering index and the `idx_events_cost_source` regression-and-revert, named so
+a future edit does not repeat it; 48 columns), `cli-and-tooling.md` (23 subcommands; the two new
+rows; the `--yes`-gated writer count four → five; `doctor`'s new `tool_names_backfill` check),
+`api-surface.md` (the `/api/shutdown` route; its guard as a **third** write guard, not a variant of
+same-origin), `security-and-permissions.md` (the shutdown route's loopback-caller check, distinct
+from `--pprof-addr`'s loopback-listener control already in the table), `glossary.md` (a
+`req_tool_names` entry), and `testing-and-quality.md` (56 → 59 test files, re-measured).
+
+**The refresh's one real correction, not just an addition: two docs described a projection that no
+longer exists.** `api-surface.md` and `glossary.md` both said `SessionEventsForRules` was "a third,
+narrower projection" than `EventSummary`, carrying `req_body` but omitting the other five blobs —
+true when `br-GI-13-03` introduced it, and silently made false by `br-GI-13-07`, which moved the one
+rule that read `req_body` (comparing tool names between calls) onto the new `req_tool_names` column
+instead. `rulesOmittedColumns` in [internal/store/store.go](../../internal/store/store.go) is now
+`summaryOmittedColumns` under a different name — the code's own comment says so — so
+`SessionEventsForRules` and `EventSummary` select the identical 42 columns. Neither doc's file was in
+`br-GI-13-07`'s own file list (it named the store and the callers, the two docs only happened to
+describe the old shape), which is the same defect class GI-9's and GI-13's earlier refreshes both
+named: a fact restated in more than one place, where the story moved the site it named but not every
+site that named it.
+
+**A regression this refresh verified rather than took on faith.** `br-GI-13-08`'s commit history
+shows `idx_events_cost_source` was dropped, then restored one commit later, after `EXPLAIN QUERY
+PLAN` showed the drop regressed `PurgeUnpriced`'s `DELETE FROM events WHERE cost_source = 'unpriced'`
+from an index seek to a bare table scan. `storage-schema.md` now states the reverted shape — both
+indexes kept, `StatsByCostSource` a documented non-covering gap — rather than the shape a docs pass
+run mid-story would have captured. Also verified directly against the live 2GB+ production store
+(`D:/clens/lens.db`, outside the generated tree but the reason the fix mattered): `clens doctor`'s
+unconditional schema exec silently repaired the already-migrated database's missing index with no
+new migration or version bump, and `EXPLAIN QUERY PLAN` there confirmed the same seek this refresh
+documents.

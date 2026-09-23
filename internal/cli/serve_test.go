@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go/parser"
 	"go/token"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -175,6 +176,29 @@ func TestWriteSeamsDoNotImportConfigOrIngest(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestStartPprofRefusesANonLoopbackHost is the second layer named in
+// startPprof's own doc comment: config.Validate already rejects a
+// non-loopback PprofAddr, but startPprof re-checks with config.IsLoopbackHost
+// so a Config built by anything other than config.Load can't open a listener
+// whose heap profile contains whatever is in memory just by skipping
+// Validate. A public host must log the refusal and return without spawning
+// the listener goroutine.
+func TestStartPprofRefusesANonLoopbackHost(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	startPprof("0.0.0.0:6060")
+
+	out := buf.String()
+	if !strings.Contains(out, "refusing") {
+		t.Fatalf("startPprof did not log a refusal for a non-loopback host:\n%s", out)
+	}
+	if strings.Contains(out, "listening") {
+		t.Fatalf("startPprof logged a listen for a non-loopback host:\n%s", out)
 	}
 }
 

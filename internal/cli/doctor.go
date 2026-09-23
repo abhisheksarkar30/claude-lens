@@ -70,6 +70,17 @@ func effectiveAPIPrefixes(cfg *config.Config) string {
 	}
 }
 
+// effectivePprofAddr names the flag that enables the profiler when it is
+// unset, so the feature is discoverable from doctor's output rather than
+// folklore -- otherwise the only way to learn --pprof-addr exists is to
+// have already read the source that needed it.
+func effectivePprofAddr(addr string) string {
+	if addr == "" {
+		return "unset (enable with --pprof-addr/CLENS_PPROF_ADDR)"
+	}
+	return addr
+}
+
 func runDoctor(args []string, w io.Writer) error {
 	cfg, err := config.Load(args)
 	if err != nil {
@@ -91,6 +102,7 @@ func runDoctor(args []string, w io.Writer) error {
 		{"accounts_configured", fmt.Sprintf("%d", len(cfg.Accounts))},
 		{"peak_off_peak_dates", effectivePeakDates(cfg.PeakOffPeakDates)},
 		{"api_model_prefixes", effectiveAPIPrefixes(cfg)},
+		{"pprof_addr", effectivePprofAddr(cfg.PprofAddr)},
 	}
 	for _, row := range cfgRows {
 		fmt.Fprintf(w, "  %-20s %s\n", row[0], row[1])
@@ -191,8 +203,33 @@ func runChecks(cfg *config.Config) []doctorCheck {
 	checks = append(checks, secretProtectionCheck())
 	checks = append(checks, clientConfigCheck())
 	checks = append(checks, dbSchemaCheck(cfg))
+	checks = append(checks, toolNamesBackfillCheck(cfg))
 
 	return checks
+}
+
+// toolNamesBackfillCheck reports how many rows still await `clens
+// backfill-tool-names` (br-GI-13-07). A row written before that column
+// existed reads as HasReqBody=false under the column's NULL contract until
+// backfilled, which would silently decline ruleCacheInvalidatedByTools on
+// real history -- WARNs rather than FAILs, since an un-backfilled database is
+// a maintenance gap, not a broken one.
+func toolNamesBackfillCheck(cfg *config.Config) doctorCheck {
+	st, err := store.Open(cfg.DBPath)
+	if err != nil {
+		return doctorCheck{"tool_names_backfill", statusFail, err.Error()}
+	}
+	defer st.Close()
+
+	n, err := st.CountEventsAwaitingToolNamesBackfill(context.Background())
+	if err != nil {
+		return doctorCheck{"tool_names_backfill", statusFail, err.Error()}
+	}
+	if n == 0 {
+		return doctorCheck{"tool_names_backfill", statusPass, "0 row(s) awaiting backfill"}
+	}
+	return doctorCheck{"tool_names_backfill", statusWarn,
+		fmt.Sprintf("%d row(s) awaiting backfill -- run `clens backfill-tool-names --yes`", n)}
 }
 
 // dbSchemaCheck reports the database's schema version beside the one this

@@ -29,7 +29,7 @@ type SessionResolver interface {
 // A Consumer without one installed behaves exactly as it did before
 // SetSessionAggregator was called: no session totals are maintained.
 type SessionAggregator interface {
-	RecordCall(ctx context.Context, sessionID string, ev *store.Event, warningCount int) error
+	RecordCall(ctx context.Context, sessionID string, ev *store.Event) error
 }
 
 // PriceComputer is the pre-insert cost step's seam (br-GI-1-07): both

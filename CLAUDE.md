@@ -19,10 +19,18 @@ default.
 See `docs/planning/GI-1-claude-lens-v1.md` for the converged plan (v6, 7 review rounds). The work
 items are `.beads/GI-1/br-GI-1-01` … `-19`; each bead names its own file list and outcome definition.
 
-**Start from `docs/context/INDEX.md`** for the map to the code — architecture, storage schema, cost
-model, conventions, the CLI and API surfaces, and the decision records. This file states the
-*enforced* conventions and the invariants in their shortest form; the context docs are the map, and
-the code wins wherever they disagree.
+`docs/context/INDEX.md` is this repo's map to the code — architecture, storage schema, cost
+model, conventions, the CLI and API surfaces, and the decision records. It states the *enforced*
+conventions and the invariants in their shortest form. The read-first / track-staleness rule for
+`docs/context/` lives in the user CLAUDE.md; under `/develop-story`, staleness is tracked in the
+story's plan file (`docs/planning/{ticket-id}-{slug}.md`)'s "Context docs to refresh" list.
+
+## Migrations
+
+Applies the user CLAUDE.md's backup-before-migration rule to this repo's specifics: back up
+`lens.db`, `lens.db-wal`, and `lens.db-shm` before any `schemaVersion` bump or change under
+`internal/store/schema.sql` / `migrations` — whether Claude runs the migration directly against a
+real `lens.db` or the plan/bead only states it for the user to run manually.
 
 ## Setup
 
@@ -129,11 +137,3 @@ there is nothing for it to integrate.
   modes on Unix and an explicit Windows ACL on Windows (`0600` is a no-op there). Full bodies *are*
   stored, so the content — every prompt and every file the agent read — is the asset this repo is
   protecting. Loopback binding and redaction are load-bearing defaults, not conveniences.
-
-## Compact Instructions
-
-When compacting, always preserve the working state for continuation:
-
-- Keep the current high-level goal and acceptance criteria.
-- Keep the exact list of files modified during this session.
-- Do not preserve verbose terminal outputs or tool logs.

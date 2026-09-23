@@ -123,6 +123,90 @@ func TestValidateRejectsNonLoopbackWithoutAllowRemote(t *testing.T) {
 	}
 }
 
+// TestPprofAddrPrecedence (§6 test 8): flag beats env beats file; unset
+// leaves the zero value, the same resolution order every other field uses.
+func TestPprofAddrPrecedence(t *testing.T) {
+	dir := withHome(t)
+	if cfg, err := Load(nil); err != nil {
+		t.Fatalf("Load: %v", err)
+	} else if cfg.PprofAddr != "" {
+		t.Errorf("PprofAddr with nothing configured = %q, want empty (the listener off)", cfg.PprofAddr)
+	}
+
+	clensDir := filepath.Join(dir, ".clens")
+	if err := os.MkdirAll(clensDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clensDir, "config.toml"), []byte("PprofAddr = 127.0.0.1:6061\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load (file): %v", err)
+	}
+	if cfg.PprofAddr != "127.0.0.1:6061" {
+		t.Errorf("PprofAddr from file = %q, want 127.0.0.1:6061", cfg.PprofAddr)
+	}
+
+	t.Setenv("CLENS_PPROF_ADDR", "127.0.0.1:6062")
+	cfg, err = Load(nil)
+	if err != nil {
+		t.Fatalf("Load (env): %v", err)
+	}
+	if cfg.PprofAddr != "127.0.0.1:6062" {
+		t.Errorf("env should beat file: PprofAddr = %q, want 127.0.0.1:6062", cfg.PprofAddr)
+	}
+
+	cfg, err = Load([]string{"--pprof-addr", "127.0.0.1:6063"})
+	if err != nil {
+		t.Fatalf("Load (flag): %v", err)
+	}
+	if cfg.PprofAddr != "127.0.0.1:6063" {
+		t.Errorf("flag should beat env: PprofAddr = %q, want 127.0.0.1:6063", cfg.PprofAddr)
+	}
+}
+
+// TestValidateRejectsNonLoopbackPprofAddrEvenWithAllowRemote is D5's test:
+// a public PprofAddr with AllowRemote = true still fails, because a profile
+// is a dump of whatever is in memory. This is the one that catches a later
+// "tidy-up" that starts passing c.AllowRemote to validateLoopback here.
+func TestValidateRejectsNonLoopbackPprofAddrEvenWithAllowRemote(t *testing.T) {
+	cfg := Default()
+	cfg.AllowRemote = true
+	cfg.PprofAddr = "0.0.0.0:6060"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("Validate: want error for a non-loopback PprofAddr even with AllowRemote set")
+	}
+}
+
+// TestValidateAcceptsEmptyPprofAddr: the default (the listener off)
+// validates clean.
+func TestValidateAcceptsEmptyPprofAddr(t *testing.T) {
+	cfg := Default()
+	if cfg.PprofAddr != "" {
+		t.Fatalf("Default().PprofAddr = %q, want empty", cfg.PprofAddr)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("Validate rejected the default empty PprofAddr: %v", err)
+	}
+}
+
+// TestIsLoopbackHost: accepts every loopback spelling, including one a naive
+// ip.IsLoopback()-only predicate would reject ("localhost", since
+// net.ParseIP returns nil for it) and one a naive three-spelling allowlist
+// would reject (127.0.0.2, a legitimately loopback IP that is neither
+// 127.0.0.1 nor ::1).
+func TestIsLoopbackHost(t *testing.T) {
+	for _, host := range []string{"127.0.0.1", "::1", "127.0.0.2", "localhost"} {
+		if !IsLoopbackHost(host) {
+			t.Errorf("IsLoopbackHost(%q) = false, want true", host)
+		}
+	}
+	if IsLoopbackHost("example.com") {
+		t.Error("IsLoopbackHost(\"example.com\") = true, want false")
+	}
+}
+
 // TestBodyPolicyAcceptsExactlyTheValuesThatDoSomething pins the accepted set in
 // both directions. The positive half is the one that matters: "truncated" was
 // accepted for the project's whole life and read nowhere, so an assertion that

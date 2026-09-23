@@ -291,7 +291,19 @@ const bigWriteFraction = 0.5
 // re-writes roughly the whole prior conversation into the cache instead
 // of reading from it -- a healthy session's writes taper off after the
 // first turn as later turns read the growing prefix instead.
+//
+// The row set is filtered to usage-carrying rows before the walk (D9): a
+// usage-less row (a 429, a truncated body) would otherwise abort the walk
+// as a zero prevTotal or a zero write and permanently drop a real finding
+// -- the walk returns nil on the first violating pair, so one bad row
+// anywhere in the session used to cost the whole session's finding. A real
+// row that continues the rewrite run past a filtered usage-less row still
+// anchors the finding on itself, same as if the usage-less row had never
+// arrived; a real row that instead reads from cache still declines it,
+// same as today -- filtering changes which rows are walked, not the
+// walk's own condition.
 func ruleCachePrefixInvalidation(rows []*store.Event) []store.Warning {
+	rows = rowsWithUsage(rows)
 	if len(rows) < 3 {
 		return nil
 	}
@@ -333,7 +345,7 @@ func ruleCacheInvalidatedByTools(rows []*store.Event) []store.Warning {
 		if float64(write) < bigWriteFraction*float64(prev.TotalPromptTokens) {
 			continue
 		}
-		if toolNamesEqual(prev.ReqBody, cur.ReqBody) {
+		if prev.ToolNames == cur.ToolNames {
 			continue
 		}
 		out = append(out, withEventID(cur.ID, warning(KindCacheInvalidatedByTools, SeverityWarn,
@@ -346,29 +358,35 @@ func ruleCacheInvalidatedByTools(rows []*store.Event) []store.Warning {
 // in order. A JSONL-sourced row structurally never carries one (the
 // transcript records no request), so this is what lets a rule that
 // compares consecutive request bodies skip over an interleaved JSONL row
-// rather than treating it as an adjacent, body-less pair.
+// rather than treating it as an adjacent, body-less pair. Since br-GI-13-07
+// the rules projection no longer selects req_body itself, so this reads
+// HasReqBody -- the req_tool_names column's own NULL-iff-no-body contract --
+// rather than a body length.
 func rowsWithRequestBody(rows []*store.Event) []*store.Event {
 	out := make([]*store.Event, 0, len(rows))
 	for _, r := range rows {
-		if len(r.ReqBody) > 0 {
+		if r.HasReqBody {
 			out = append(out, r)
 		}
 	}
 	return out
 }
 
-func toolNamesEqual(a, b []byte) bool {
-	an := parse.ExtractMeta(a, http.Header{}).ToolNames
-	bn := parse.ExtractMeta(b, http.Header{}).ToolNames
-	if len(an) != len(bn) {
-		return false
-	}
-	for i := range an {
-		if an[i] != bn[i] {
-			return false
+// rowsWithUsage returns the subset of rows that actually carry usage, in
+// order -- the sibling filter to rowsWithRequestBody, for a rule that reads
+// token columns rather than bodies. TotalPromptTokens is zero for a
+// usage-less row (a 429 or a truncated body; the store recomputes the
+// column from the token columns), and unlike rowsWithRequestBody this keeps
+// JSONL rows: a transcript line structurally never carries a request body
+// but does carry usage.
+func rowsWithUsage(rows []*store.Event) []*store.Event {
+	out := make([]*store.Event, 0, len(rows))
+	for _, r := range rows {
+		if r.TotalPromptTokens != 0 {
+			out = append(out, r)
 		}
 	}
-	return true
+	return out
 }
 
 // ruleCacheWriteNeverRead fires on a write with no subsequent read of any
