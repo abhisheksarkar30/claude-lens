@@ -111,8 +111,14 @@ upstream that returns a normal response, following the pattern of `TestByteIdent
    }
    ```
    This turns the security self-review's prose guarantee into an enforced regression test — a
-   lazy `log.Printf("dropped: %+v", call)` struct-dump would carry body content and would fail
-   this check.
+   lazy `log.Printf("dropped: %s", call.ReqBody)` convenience leak would carry body content and
+   would fail this check. (Verified during implementation that the check does **not** catch a
+   `log.Printf("dropped: %+v", call)` whole-struct dump specifically: Go's `fmt` renders a
+   `[]byte` field under `%+v` as a slice of decimal integers, never as text, so the sentinel never
+   appears verbatim in that output even though the raw bytes are technically still present,
+   decimal-encoded. The `%s`/string-conversion leak class is the realistic one this check guards
+   against; a `%+v`-proof check would need a stricter allow-listed-format assertion, which is a
+   separate scope decision, not required by this bead.)
 7. **Do not use an `Authorization`-header value as the sentinel.** `redactHeaders` replaces
    `Authorization` with the literal `"[redacted]"` at `proxy.go:122` (inside the handler, before
    `captureState` is constructed), so `call.ReqHeaders.Authorization` (and thus anything a drop

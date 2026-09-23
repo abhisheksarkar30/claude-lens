@@ -666,8 +666,12 @@ func waitForSinkStat(t *testing.T, sk *sink.Sink, want func(accepted, dropped ui
 // capture must be logged (closing the fail-open gap this bead exists for),
 // and the log line must never carry request/response body or header content
 // -- only the negative-containment assertion below actually enforces that; a
-// lazy log.Printf("dropped: %+v", call) struct-dump would pass every
-// positive assertion here and still leak the body.
+// lazy log.Printf("dropped: %s", call.ReqBody) convenience leak would pass
+// every positive assertion here and still leak the body. (Not %+v on the
+// whole struct: Go's fmt renders a []byte field under %+v as a slice of
+// decimal integers, never as text, so that particular shape of struct-dump
+// would not trip this string-containment check even though the bytes are
+// technically still present, decimal-encoded, in the output.)
 func TestSubmitLogsADropWithoutTheBody(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.ReadAll(r.Body)
