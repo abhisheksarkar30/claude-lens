@@ -125,7 +125,7 @@ func Open(dbPath string) (*Store, error) {
 
 // schemaVersion is the current PRAGMA user_version. It must equal
 // len(migrations): migrations[n] upgrades version n to n+1.
-const schemaVersion = 3
+const schemaVersion = 4
 
 // SchemaVersion reports the schema version this binary knows, so a diagnostic
 // can print it beside a database's stored one. Exported rather than duplicated
@@ -181,6 +181,22 @@ var migrations = []string{
 	// derived on write, not backfilled by this migration -- see
 	// `clens backfill-tool-names` for existing rows.
 	`ALTER TABLE events ADD COLUMN req_tool_names TEXT;`,
+	// 3 -> 4: /api/stats' four aggregate queries (StatsSummary, StatsByModel,
+	// StatsByPeriod, StatsByCostSource) SUM/GROUP BY/filter on columns that
+	// were otherwise unindexed, so each one walked the whole table -- blob
+	// columns included -- to reach the small set of columns it actually
+	// needs. idx_events_cost_source is dropped in the same step: it is now
+	// redundant (idx_events_stats carries cost_source too), and left in
+	// place it out-competes the new index for StatsByCostSource's GROUP BY
+	// even though it still pays a table lookup per row for the columns it
+	// lacks -- verified empirically, not assumed. See schema.sql's comment
+	// on idx_events_stats for the column list and the PurgeUnpriced trade.
+	`CREATE INDEX IF NOT EXISTS idx_events_stats ON events(
+		input_tokens, output_tokens, cache_write_5m_tokens, cache_write_1h_tokens,
+		cache_read_tokens, thinking_tokens, total_prompt_tokens, model_resolved,
+		billing_mode, cost_source, cost_usd, api_equivalent_cost_usd, started_at
+	);
+	 DROP INDEX IF EXISTS idx_events_cost_source;`,
 }
 
 // eventsTableAbsent reports whether this database has no events table yet,

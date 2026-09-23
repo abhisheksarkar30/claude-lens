@@ -74,7 +74,20 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_session_started ON events(session_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_events_started_at ON events(started_at);
-CREATE INDEX IF NOT EXISTS idx_events_cost_source ON events(cost_source);
+-- Covers the four /api/stats aggregate queries (StatsSummary, StatsByModel,
+-- StatsByPeriod, StatsByCostSource): every column they SUM, GROUP BY, or
+-- filter on, so the aggregate is served entirely out of the index without
+-- walking the table's 2GB+ of blob-bearing rows. This folds in
+-- idx_events_cost_source (dropped below): that index only ever served
+-- StatsByCostSource's GROUP BY and PurgeUnpriced's equality DELETE, and this
+-- one now covers the former outright. PurgeUnpriced trades an index seek for
+-- a full scan of this (much smaller, blob-free) index -- acceptable because
+-- it is an infrequent manual `clens purge`, not a per-request path.
+CREATE INDEX IF NOT EXISTS idx_events_stats ON events(
+    input_tokens, output_tokens, cache_write_5m_tokens, cache_write_1h_tokens,
+    cache_read_tokens, thinking_tokens, total_prompt_tokens, model_resolved,
+    billing_mode, cost_source, cost_usd, api_equivalent_cost_usd, started_at
+);
 
 CREATE TABLE IF NOT EXISTS sessions (
     id                             TEXT PRIMARY KEY,

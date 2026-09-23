@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -1343,6 +1344,75 @@ func TestMigrateAddsTheCompositeIndexAtVersionTwo(t *testing.T) {
 	}
 }
 
+// preStatsIndexSchema returns schemaSQL with idx_events_stats swapped back
+// for the idx_events_cost_source it replaces -- the on-disk shape of a
+// database one migration behind schemaVersion (br-GI-13-08's "before").
+// Built from bare schemaSQL, not buildPreChangeDB: that fixture's helper also
+// strips req_tool_names (migrations[2]) and the transcript columns
+// (migrations[0]), which a database sitting at user_version = 3 already
+// carries.
+func preStatsIndexSchema(t *testing.T) string {
+	t.Helper()
+	const marker = "-- Covers the four /api/stats aggregate queries"
+	const oldIndex = "CREATE INDEX IF NOT EXISTS idx_events_cost_source ON events(cost_source);\r\n"
+	i := strings.Index(schemaSQL, marker)
+	if i < 0 {
+		t.Fatal("schema.sql no longer has the idx_events_stats comment")
+	}
+	rest := schemaSQL[i:]
+	j := strings.Index(rest, ");")
+	if j < 0 {
+		t.Fatal("schema.sql's idx_events_stats block has no closing paren")
+	}
+	after := strings.TrimLeft(rest[j+len(");"):], "\r\n")
+	return schemaSQL[:i] + oldIndex + after
+}
+
+// TestMigrateAddsTheStatsIndexAtVersionFour: a database at user_version = 3
+// with a row present reaches version 4, holds idx_events_stats, and still
+// returns its rows.
+func TestMigrateAddsTheStatsIndexAtVersionFour(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-stats-index.db")
+	db := rawDB(t, path)
+	if _, err := db.Exec(preStatsIndexSchema(t)); err != nil {
+		t.Fatalf("build a pre-stats-index database: %v", err)
+	}
+	if _, err := db.Exec(
+		`INSERT INTO events (request_id, source, first_source, started_at) VALUES (?, 'proxy', 'proxy', ?)`,
+		"req-pre-stats-index", time.Now().UnixNano(),
+	); err != nil {
+		t.Fatalf("seed a row: %v", err)
+	}
+	if _, err := db.Exec("PRAGMA user_version = 3"); err != nil {
+		t.Fatalf("seed user_version: %v", err)
+	}
+	db.Close()
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open on a database one migration behind: %v", err)
+	}
+	defer st.Close()
+
+	if got := userVersion(t, st.db); got != schemaVersion {
+		t.Errorf("user_version = %d, want %d", got, schemaVersion)
+	}
+	if !hasIndex(t, st.db, "idx_events_stats") {
+		t.Error("the migration did not create idx_events_stats")
+	}
+	if hasIndex(t, st.db, "idx_events_cost_source") {
+		t.Error("the migration left idx_events_cost_source behind")
+	}
+
+	n, err := st.CountEvents(context.Background(), EventFilter{})
+	if err != nil {
+		t.Fatalf("CountEvents: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("CountEvents = %d, want the seeded row still present", n)
+	}
+}
+
 // TestFreshSchemaMatchesTheMigratedShape: a fresh DB reaches the same index
 // set as a migrated one, so a future edit to one home alone fails the other.
 func TestFreshSchemaMatchesTheMigratedShape(t *testing.T) {
@@ -1366,6 +1436,12 @@ func TestFreshSchemaMatchesTheMigratedShape(t *testing.T) {
 		}
 		if hasIndex(t, st.db, "idx_events_session_id") {
 			t.Errorf("%s: idx_events_session_id present, want dropped", name)
+		}
+		if !hasIndex(t, st.db, "idx_events_stats") {
+			t.Errorf("%s: missing idx_events_stats", name)
+		}
+		if hasIndex(t, st.db, "idx_events_cost_source") {
+			t.Errorf("%s: idx_events_cost_source present, want dropped", name)
 		}
 	}
 }
@@ -1412,5 +1488,134 @@ func TestMigrateDoesNotReAddColumnsOnAPartialNewSchema(t *testing.T) {
 	}
 	if got := userVersion(t, st.db); got != schemaVersion {
 		t.Errorf("user_version = %d, want %d", got, schemaVersion)
+	}
+}
+
+// --- the stats covering index (br-GI-13-08) -------------------------------
+
+// statsFixtureEvents returns a small mixed-billing-mode fixture: one api row
+// (cost_usd set), one subscription row (api_equivalent_cost_usd set), and one
+// unpriced row -- the shape every branch in statsSelectColumnsInner and
+// StatsByCostSource's CASE keys off (billing_mode, cost_source).
+func statsFixtureEvents() []*Event {
+	api := fullEvent("req-stats-api")
+
+	sub := fullEvent("req-stats-sub")
+	sub.BillingMode = "subscription"
+	sub.CostUSD = nil
+	sub.ApiEquivalentCostUSD = f64(0.08)
+	sub.ModelResolved = "claude-opus-5"
+	sub.CostSource = "shipped"
+
+	unpriced := fullEvent("req-stats-unpriced")
+	unpriced.CostUSD = nil
+	unpriced.CostSource = "unpriced"
+
+	return []*Event{api, sub, unpriced}
+}
+
+// TestStatsQueriesUseTheCoveringIndex (§6, br-GI-13-08): each of the four
+// /api/stats aggregate queries must be served off idx_events_stats rather
+// than a bare table scan, since none of them selects a blob column but the
+// table's B-tree carries them on every page.
+func TestStatsQueriesUseTheCoveringIndex(t *testing.T) {
+	st := newTestStore(t)
+	where, args := EventFilter{}.whereClause()
+
+	queries := []string{
+		statsSelectColumns + " FROM events" + where,
+		"SELECT model_resolved, billing_mode, " + statsSelectColumnsInner +
+			" FROM events" + where + " GROUP BY model_resolved, billing_mode ORDER BY model_resolved",
+		"SELECT " + periodExprs["day"] + " AS period, billing_mode, " + statsSelectColumnsInner +
+			" FROM events" + where + " GROUP BY period, billing_mode ORDER BY period",
+		"SELECT cost_source, COUNT(*), SUM(CASE WHEN billing_mode = 'api' THEN cost_usd END)" +
+			" FROM events" + where + " GROUP BY cost_source ORDER BY cost_source",
+	}
+	for _, q := range queries {
+		plan := strings.ToUpper(explainQueryPlanDetail(t, st.db, q, args...))
+		if strings.Contains(plan, "SCAN EVENTS") && !strings.Contains(plan, "COVERING INDEX IDX_EVENTS_STATS") {
+			t.Errorf("query plan does not use idx_events_stats as a covering index:\nquery: %s\nplan: %s", q, plan)
+		}
+	}
+}
+
+// TestStatsAggregatesAreUnchangedByTheIndex: idx_events_stats changes how the
+// four stats queries are served, not what they return. The same fixture rows
+// must produce identical results whether the index exists or not.
+func TestStatsAggregatesAreUnchangedByTheIndex(t *testing.T) {
+	ctx := context.Background()
+	seed := func(t *testing.T, st *Store) {
+		t.Helper()
+		for _, ev := range statsFixtureEvents() {
+			if _, _, err := st.InsertEvent(ctx, ev); err != nil {
+				t.Fatalf("seed InsertEvent: %v", err)
+			}
+		}
+	}
+
+	beforePath := filepath.Join(t.TempDir(), "before-index.db")
+	beforeDB := rawDB(t, beforePath)
+	defer beforeDB.Close()
+	if _, err := beforeDB.Exec(preStatsIndexSchema(t)); err != nil {
+		t.Fatalf("build a pre-stats-index database: %v", err)
+	}
+	beforeSt := &Store{db: beforeDB}
+	seed(t, beforeSt)
+	if hasIndex(t, beforeDB, "idx_events_stats") {
+		t.Fatal("pre-stats-index fixture already has idx_events_stats")
+	}
+
+	afterSt := newTestStore(t)
+	seed(t, afterSt)
+	if !hasIndex(t, afterSt.db, "idx_events_stats") {
+		t.Fatal("newTestStore's database is missing idx_events_stats")
+	}
+
+	summaryBefore, err := beforeSt.StatsSummary(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsSummary (before): %v", err)
+	}
+	summaryAfter, err := afterSt.StatsSummary(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsSummary (after): %v", err)
+	}
+	if !reflect.DeepEqual(summaryBefore, summaryAfter) {
+		t.Errorf("StatsSummary changed:\nbefore=%+v\nafter=%+v", summaryBefore, summaryAfter)
+	}
+
+	byModelBefore, err := beforeSt.StatsByModel(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsByModel (before): %v", err)
+	}
+	byModelAfter, err := afterSt.StatsByModel(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsByModel (after): %v", err)
+	}
+	if !reflect.DeepEqual(byModelBefore, byModelAfter) {
+		t.Errorf("StatsByModel changed:\nbefore=%+v\nafter=%+v", byModelBefore, byModelAfter)
+	}
+
+	byPeriodBefore, err := beforeSt.StatsByPeriod(ctx, EventFilter{}, "day")
+	if err != nil {
+		t.Fatalf("StatsByPeriod (before): %v", err)
+	}
+	byPeriodAfter, err := afterSt.StatsByPeriod(ctx, EventFilter{}, "day")
+	if err != nil {
+		t.Fatalf("StatsByPeriod (after): %v", err)
+	}
+	if !reflect.DeepEqual(byPeriodBefore, byPeriodAfter) {
+		t.Errorf("StatsByPeriod changed:\nbefore=%+v\nafter=%+v", byPeriodBefore, byPeriodAfter)
+	}
+
+	byCostSourceBefore, err := beforeSt.StatsByCostSource(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsByCostSource (before): %v", err)
+	}
+	byCostSourceAfter, err := afterSt.StatsByCostSource(ctx, EventFilter{})
+	if err != nil {
+		t.Fatalf("StatsByCostSource (after): %v", err)
+	}
+	if !reflect.DeepEqual(byCostSourceBefore, byCostSourceAfter) {
+		t.Errorf("StatsByCostSource changed:\nbefore=%+v\nafter=%+v", byCostSourceBefore, byCostSourceAfter)
 	}
 }
