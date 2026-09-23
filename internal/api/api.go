@@ -132,6 +132,11 @@ type api struct {
 	// internal/cli already imports this package, so the reverse edge is a
 	// build cycle rather than a guard violation.
 	proxyMode func(ctx context.Context) (ProxyMode, error)
+
+	// shutdownFunc backs POST /api/shutdown (br-GI-13-09): the same cancel
+	// func Ctrl+C drives, wired by SetShutdown from the composition root.
+	// Unset is supported: the route answers 503 rather than a nil call.
+	shutdownFunc func()
 }
 
 // SetPricing wires GET/POST /api/prices to loader's table and override file.
@@ -209,6 +214,7 @@ func New(st Store, sk *sink.Sink, cons *consumer.Consumer, broker *Broker, asset
 	mux.HandleFunc("POST /api/accounts", a.saveAccounts)
 	mux.HandleFunc("POST /api/secrets", a.setSecret)
 	mux.HandleFunc("POST /api/ingest", a.triggerIngest)
+	mux.HandleFunc("POST /api/shutdown", a.shutdown)
 
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 	a.mux = mux

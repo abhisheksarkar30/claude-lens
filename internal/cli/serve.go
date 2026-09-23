@@ -134,6 +134,10 @@ func Serve(args []string) error {
 	dashAPI.SetPricing(priceLoader)
 	dashAPI.SetCredentialWriter(secret.Save)
 	dashAPI.SetAccountWriter(reloadAccounts)
+	// br-GI-13-09: POST /api/shutdown drives stop, the same NotifyContext
+	// cancel func os.Interrupt drives, so `clens shutdown` triggers the one
+	// shutdown path this function already has rather than a second one.
+	dashAPI.SetShutdown(stop)
 
 	// One Runner, shared by the scheduler below and the dashboard's on-demand
 	// trigger -- the same addCollectors source set `clens refresh` runs, so a

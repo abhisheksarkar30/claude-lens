@@ -10,10 +10,10 @@ import (
 // carriedOver is the subcommands the story's outcome definition names:
 // doctor and serve, br-GI-1-15's six collectors, br-GI-1-17's ten readers and
 // writers, br-GI-9-04's rekey, br-GI-11-03's reprice with br-GI-11-06's
-// reflag (2 + 6 + 10 + 1 + 2 = 21), and br-GI-13-07's backfill-tool-names, a
-// post-convergence addition (22). It is written out rather than derived from
-// the map, because a list derived from the thing under test cannot notice a
-// missing entry.
+// reflag (2 + 6 + 10 + 1 + 2 = 21), and br-GI-13-07's backfill-tool-names
+// with br-GI-13-09's shutdown, two post-convergence additions (23). It is
+// written out rather than derived from the map, because a list derived from
+// the thing under test cannot notice a missing entry.
 var carriedOver = []string{
 	// br-GI-1-01 / br-GI-1-14
 	"doctor", "serve",
@@ -25,8 +25,8 @@ var carriedOver = []string{
 	"rekey",
 	// br-GI-11-03 / br-GI-11-06
 	"reprice", "reflag",
-	// br-GI-13-07, post-convergence addition
-	"backfill-tool-names",
+	// br-GI-13-07 / br-GI-13-09, post-convergence additions
+	"backfill-tool-names", "shutdown",
 }
 
 // TestEveryCarriedOverCommandIsDispatched is the bead's "all 21 subcommands
