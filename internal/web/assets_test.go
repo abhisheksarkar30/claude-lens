@@ -376,6 +376,34 @@ func funcBody(js, name string) (string, bool) {
 	return rest[:end], true
 }
 
+// goDeclaration matches a Go keyword in declaration position at the start of a
+// line. No valid JavaScript line begins this way, so a match is always the same
+// mistake and never a false positive: `var`, `const` and `let` are deliberately
+// absent, because those are lines this file legitimately contains.
+var goDeclaration = regexp.MustCompile(`^\s*(func|package|chan|defer)\s`)
+
+// TestAssetsAppJSIsJavaScript is the one guard that reads app.js as code rather
+// than as text -- and it exists because no other test in this file can. Every
+// other case here greps for an id, a function name, or a slice between two
+// anchors, and all of them pass happily on a file the browser refuses to parse.
+//
+// That is not hypothetical. br-GI-11-08 shipped `func mountWindowPicker(...)`
+// -- one Go keyword where `function` belongs -- at the top level of app.js. A
+// parse error is total: the browser discards the whole file, so loadTotals,
+// show('overview') and subscribe() never run, and the dashboard renders its
+// static shell -- zeros in the header, dead tabs, empty panels -- while every
+// API route behind it answers in milliseconds. The page looks like a backend
+// problem and is not one.
+func TestAssetsAppJSIsJavaScript(t *testing.T) {
+	js := readAsset(t, "app.js")
+	for i, line := range strings.Split(js, "\n") {
+		if goDeclaration.MatchString(line) {
+			t.Errorf("app.js:%d starts a line with a Go keyword: %q -- the file does not parse as JavaScript, so the browser runs none of it",
+				i+1, strings.TrimSpace(line))
+		}
+	}
+}
+
 // TestAssetsTheBadgeIsInTheHeader (br-GI-7-05) is the positional half of the
 // badge guard. The mechanical half -- app.js looks up an id that index.html
 // defines -- is TestAssetsEveryLookupHasAMount's job; this one asserts *where*

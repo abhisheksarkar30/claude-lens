@@ -335,7 +335,7 @@ function timeWindow(gran, value) {
 // native input it reveals, and the free-text labels only `custom` uses (empty
 // on Calls, which has no free-text pair). One implementation, two mounts, so
 // the two tabs cannot disagree about what a picked hour means.
-func mountWindowPicker(granSel, valueInput, freeLabels, onChange) {
+function mountWindowPicker(granSel, valueInput, freeLabels, onChange) {
   const sync = () => {
     const t = windowInputType[granSel.value];
     if (t) {
