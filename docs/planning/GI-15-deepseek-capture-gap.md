@@ -1,7 +1,7 @@
 # GI#15: DeepSeek residual capture gap — close the two proxy-side blind spots
 
-**Version:** 7
-**Status:** revision pending re-review (beads 1-2 converged v6; beads 3-4 added, not yet reviewed)
+**Version:** 11
+**Status:** converged — beads 1-2 shipped in open PR; beads 3-4 addendum converged (v11), ready for beadification
 **Issue:** [GI#15](https://github.com/abhisheksarkar30/claude-lens/issues/15)
 **Branch:** `GI-15-deepseek-capture-gap`
 **Origin:** `memory/project_deepseek_capture_gap.md` from the reconciliation session that
@@ -222,10 +222,12 @@ the matching `~/.claude/projects/**/*.jsonl` transcript line.
      re-observing its own transcript with different numbers on a later tailer pass. This is real
      and structurally different from a true cross-source (`proxy` vs `jsonl`) disagreement:
      `internal/jsonlogs/jsonlogs.go:300-303` documents that a file-rotation re-read is "absorbed as
-     a merge, never a duplicate row" **only if the re-read content is byte-identical** to what was
-     already ingested. Claude Code can amend a previously-written transcript line (e.g. finalizing
-     usage once a stream that looked interrupted actually completes), which breaks that assumption
-     and produces a same-source pair that legitimately differs. The current code has no branch for
+     a merge, never a duplicate row" unconditionally — the UNIQUE constraint merges regardless of
+     whether the re-read content matches what was already ingested. Claude Code can amend a
+     previously-written transcript line (e.g. finalizing usage once a stream that looked interrupted
+     actually completes), and the merge path does not distinguish that case from a byte-identical
+     re-read, which is exactly why an amended transcript line surfaces as a same-source mismatch
+     instead of being silently deduped. The current code has no branch for
      this — it reuses the identical `"sources %s and %s disagree..."` phrasing (reading as a
      cross-source conflict when it is a self-correction) at `SeverityError` (reading as urgent when
      it is expected and benign).
@@ -243,7 +245,7 @@ the matching `~/.claude/projects/**/*.jsonl` transcript line.
 
 | File | Change | Why |
 |---|---|---|
-| `internal/store/merge.go` | **br-GI-15-03**: in the mismatch branch of `applyMergeTx`, build the `Warning.Detail` from the actual differing fields — only the ones `tokensDiffer` found unequal, each as `field existing_value vs incoming_value` — instead of the current field-free sentence. A small unexported helper (e.g. `diffTokenFields(existing, incoming *Event) string`) keeps `applyMergeTx` readable and gives the new behavior one place to test directly. | Turns the warning from "something disagreed, go look" into an actionable diagnostic — this plan's own investigation had to reconstruct this by hand from raw DB/JSONL data because the warning didn't say it |
+| `internal/store/merge.go` | **br-GI-15-03**: in the mismatch branch of `applyMergeTx`, build the `Warning.Detail` from the actual differing fields — only the ones `tokensDiffer` found unequal, each as `field existing_value vs incoming_value` — instead of the current field-free sentence. Extract the six-field list that `tokensDiffer` currently compares (`merge.go:168-173`) into one shared `[]struct{ name string; get func(*Event) int }` slice (or equivalent) and have both `tokensDiffer` and the new helper iterate it, so the two can never drift into checking different fields. A small unexported helper (e.g. `diffTokenFields(existing, incoming *Event) string`) built on that table keeps `applyMergeTx` readable and gives the new behavior one place to test directly. | Turns the warning from "something disagreed, go look" into an actionable diagnostic — this plan's own investigation had to reconstruct this by hand from raw DB/JSONL data because the warning didn't say it; the shared table is load-bearing: a bespoke helper with its own independent six-field enumeration would satisfy the acceptance criteria while silently leaving two independently-maintained lists in `merge.go` |
 | `internal/store/merge.go` | **br-GI-15-04**: in the same branch, when `existing.Source == incoming.Source`, emit a distinct `Detail` phrasing (a same-source re-read/self-correction, naming the shared source) and `Severity: "info"` instead of `"error"`; the existing `"sources %s and %s disagree..."` phrasing and `SeverityError` stay exactly as they are for the `existing.Source != incoming.Source` case. `Kind` stays `"source_mismatch"` in both cases — see rationale below. | A same-source pair is a structurally different, generally benign event (a corrected re-read) from a true two-source parsing disagreement, and today's single wording/severity conflates them, overstating the benign case as an `error` |
 | `internal/store/merge_test.go` | New test(s): (a) a fixture that differs in exactly one known field (e.g. `OutputTokens`) asserts `Detail` names that field and both values, and does not name a field that didn't differ; (b) a same-source (`jsonl`/`jsonl`) fixture that differs on tokens asserts `Severity == "info"` and a detail phrasing distinct from the cross-source case; `TestMergeStillWarnsOnATrueDisagreement` (the existing cross-source pin) is checked to still pass unmodified — it only asserts `Kind`, not `Detail` text or `Severity`, so it is not expected to need a change, but the plan record's own convention (bead 2's precedent) is to verify existing tests explicitly rather than assume | Bead 3's acceptance check; bead 4's acceptance check; regression guard on the pre-existing cross-source case |
 
@@ -294,11 +296,25 @@ import, no schema change, no new CLI command, no new route.
   from one shared table, so the two can never drift into checking different fields.
 - **The `info`-severity same-source path must not swallow a *real* cross-source disagreement that
   happens to reuse a source name coincidentally.** The condition is a plain `existing.Source ==
-  incoming.Source` string compare on the two merge inputs actually being merged — there is no third
-  case where that could be true except the one it's meant to catch (two `Event`s cannot both claim
-  `Source: "proxy"` and reach this branch by a different code path; `Source` is set once, at
-  capture time, per `internal/consumer` and `internal/jsonlogs` each writing their own literal
-  value).
+  incoming.Source` string compare on the two merge inputs actually being merged. `Source` is set
+  once, at capture time, per `internal/consumer` and `internal/jsonlogs` each writing their own
+  literal value, so there is no common path where two genuinely distinct sources share the same
+  name. **Accepted residual risk:** a same-source pair can also arise from two independent captures
+  that collide on a fallback-derived key — e.g. two DeepSeek completions that happen to reuse the
+  same `message.id` (a provider-side anomaly; `internal/jsonlogs/dedup.go:96-106` explains why
+  DeepSeek falls back to `message.id`). In that scenario the same-source branch would classify a
+  true duplicate/collision as `info` rather than `error`. This is a low-probability risk this addendum surfaces — it depends on the upstream provider
+  issuing a duplicate `message.id` across two distinct calls, which is outside `clens`'s control.
+  `docs/context/decisions/008-three-tier-identity-key.md` addresses only convergence of the *same*
+  request across two writers and does not cover independent-call collision. GI-9 does name a
+  mechanistically adjacent risk (a replay/cache response returning the same `message.id` for two
+  distinct calls, causing them to collapse into one row) and explicitly accepts that
+  collapse-to-one-row outcome as current intended behaviour, pinned by a test
+  (`GI-9-merge-jsonl-and-proxy-rows.md:1716-1727`); the specific trigger introduced here — an
+  upstream provider independently issuing a duplicate id rather than internal replay — is novel to
+  this addendum, while the resulting row-collapse consequence follows the same already-accepted
+  pattern. Bead 4 does not change its likelihood, only its presentation — and it was never
+  observed in the 48 sampled rows.
 - **No database migration.** `warnings.severity` is already a free-text column
   (`internal/store/schema.sql`); writing `"info"` instead of `"error"` for one case requires no
   schema change and is fully backward-compatible with every existing reader (`ListWarnings`, the
@@ -306,17 +322,36 @@ import, no schema change, no new CLI command, no new route.
 
 ### Context docs to refresh
 
-- `internal/analyze/kinds.go`'s `KindSourceMismatch` `Description` string ("The same request_id
-  arrived from two sources with disagreeing token counts.") is a source comment, not a
-  `docs/context/*.md` file, and is not checked against `README.md` (only `Kind` + `Severity` +
-  `nonAnalyzeKinds` membership are, per `readme_test.go`). It stays accurate for the common case;
-  Phase 5.6 should check whether it's worth a short addition noting the same-source/`info` case
-  exists, but this is optional polish, not a correctness requirement.
+- `internal/analyze/kinds.go` has two separate `source_mismatch`-related strings that require
+  different treatment after bead 4 ships. The `KindSourceMismatch` `Description` string ("The
+  same request_id arrived from two sources with disagreeing token counts.") is a source comment,
+  not a `docs/context/*.md` file, and is not checked against `README.md` (only `Kind` +
+  `Severity` + `nonAnalyzeKinds` membership are, per `readme_test.go`). It stays accurate for
+  the common case; Phase 5.6 should check whether it's worth a short addition noting the
+  same-source/`info` case exists, but this is optional polish, not a correctness requirement.
+  **The `nonAnalyzeKinds[KindSourceMismatch]` entry at `kinds.go:104` ("store (cross-source
+  merge)") is different in kind:** it is the user-facing origin label mirrored verbatim into
+  `README.md:256` (the kind table's third column) and cited in `README.md:262`, enforced 1:1 by
+  `readme_test.go`'s `row[2] != by` check. The test keeps the two in lockstep but does not
+  check semantic accuracy against what bead 4 actually does, so CI will not catch the staleness.
+  After bead 4 ships, both will describe as exclusively cross-source a warning that can now also
+  arise same-source. Phase 5.6 must update `nonAnalyzeKinds[KindSourceMismatch]` (e.g. "store
+  (cross-source or same-source merge)") and verify `README.md:256,262` are updated to match —
+  the same "cross-source only" → "cross-source or same-source" broadening already required for
+  `glossary.md:21` and `cost-and-quota.md:175`.
   `docs/context/testing-and-quality.md` and `architecture.md` were reviewed against beads 3-4: the
   `source_mismatch`/merge-idempotency rows already describe the mechanism at the level these beads
   operate within (a warning's content, not the merge's correctness rule), so Phase 5.6 should
   confirm no wording there becomes inaccurate rather than assume it, per this repo's own
   context-docs convention.
+- **`docs/context/glossary.md:21`** — "a second **source** arriving with disagreeing counts for
+  the same id is a `source_mismatch` warning" frames `source_mismatch` as an inherently
+  cross-source phenomenon. Once bead 4 ships, same-source pairs also raise it. Phase 5.6 must
+  update this to cover both cases (e.g. "a second observation of the same id — from another source
+  or from the same source re-reading with amended counts — is a `source_mismatch` warning").
+- **`docs/context/cost-and-quota.md:175`** — "the same `request_id` arriving from **two sources**
+  with disagreeing token counts" is similarly cross-source only. Phase 5.6 must broaden this to
+  acknowledge the same-source/self-correction case bead 4 adds.
 
 ### Self-review
 
@@ -344,6 +379,56 @@ header content — there is no new redaction surface here, unlike bead 2's log l
 leaves the process boundary; this only changes what's already written to the local `warnings` table.
 
 ## Change History
+
+### v11 (round-11 review — F11.1 JUSTIFIED)
+
+- **F11.1:** Expanded the first "Context docs to refresh" bullet to cover `nonAnalyzeKinds
+  [KindSourceMismatch]` at `kinds.go:104` and its two README mirrors (`README.md:256,262`). The
+  previous text addressed only the `Description` string (optional polish) and missed this
+  adjacent map entry, which is user-facing, test-enforced to stay in lockstep with `README.md`,
+  and will be materially inaccurate after bead 4 ships (describes as cross-source-only a warning
+  that bead 4 makes same-source-capable too). Phase 5.6 is now explicitly tasked with the same
+  "cross-source only" → "cross-source or same-source" broadening for these two files as for
+  `glossary.md:21` and `cost-and-quota.md:175`.
+
+### v10 (round-9 review — F9.1 JUSTIFIED)
+
+- **F9.1:** Corrected the risk-provenance claim in the same-source fallback-key bullet. The
+  previous text said the "two distinct calls colliding on a shared message.id" risk was "not
+  discussed or accepted in any prior decision record." That overclaimed against GI-9, which at
+  lines 1716-1727 explicitly names a mechanistically adjacent risk (replay/cache returning the
+  same `message.id` for two distinct calls, collapsing them to one row) and accepts the
+  collapse-to-one-row outcome as current intended behaviour, pinned by a test. The new text
+  correctly narrows: `decisions/008` is indeed narrower (same-request convergence only); GI-9
+  does accept the general outcome; what is novel to this addendum is the specific trigger — an
+  upstream provider independently issuing a duplicate id — not the resulting row-collapse pattern.
+
+### v9 (round-8 review — F8.1–F8.2 both JUSTIFIED)
+
+- **F8.1:** Corrected the shared-table element type in the bead 3 "What changes" row from
+  `get func(*Event) int64` to `get func(*Event) int`, matching the actual declared type of all six
+  token fields on `EventSummary` (`internal/store/types.go:32-37`). The previous signature would
+  not compile without an explicit `int64(...)` cast nowhere mentioned in the plan.
+- **F8.2:** Replaced the inaccurate "same risk beads 1-2 already accept" framing in the Risk
+  section's same-source fallback-key bullet with accurate language: this is a new, low-probability
+  risk the addendum names for the first time. GI-9 and `decisions/008-three-tier-identity-key.md`
+  address convergence of the *same* request across two writers (disjoint namespaces, same upstream
+  id), not two *independent* calls colliding on a provider-issued id — a structurally different
+  scenario that no prior decision record discusses or accepts.
+
+### v8 (round-7 review — F7.1–F7.4 all JUSTIFIED)
+
+- **F7.1:** Added `docs/context/glossary.md:21` and `docs/context/cost-and-quota.md:175` to
+  "Context docs to refresh", each with a named stale claim and Phase 5.6 update instruction.
+- **F7.2:** Folded the shared-table requirement from the Risk section into the bead 3 "What
+  changes" row: implementer must extract `tokensDiffer`'s six-field `||` chain into one shared
+  slice and have both `tokensDiffer` and `diffTokenFields` iterate it.
+- **F7.3:** Replaced the "there is no third case" assertion in Risk areas with a named accepted
+  residual risk (same-source collision on a fallback-derived key, same probability as beads 1-2's
+  already-accepted cross-source collision risk).
+- **F7.4:** Corrected Findings §2's misquote of `jsonlogs.go:300-303`: the comment makes no
+  "byte-identical" precondition; the merge is unconditional, which is precisely why an amended
+  transcript produces a same-source mismatch.
 
 ### v7 (addendum — beads 3-4, source_mismatch diagnostics, not yet cross-reviewed)
 
