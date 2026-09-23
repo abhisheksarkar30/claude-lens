@@ -25,8 +25,15 @@ covering the area you're about to change. This is the map to the code — archit
 schema, cost model, conventions, the CLI and API surfaces, and the decision records. It states the
 *enforced* conventions and the invariants in their shortest form. Treat what it says about the
 specific slice you're changing as a hypothesis, not fact, until you check it against the real
-source; the code wins wherever they disagree, and a stale doc is worth a one-line callout, not a
-silent workaround.
+source; the code wins wherever they disagree.
+
+**The other half of that rule: fix the doc, don't just note it.** Whether the staleness turns up
+mid-read (a doc claim that no longer matches the code) or your own change just created it (a new,
+renamed, or removed entity, endpoint, permission, flow, module, or convention), update the specific
+`docs/context/*.md` line(s) before you're done — in the same change, not a follow-up. This holds
+for ad hoc edits exactly as it does for `/develop-story`'s Phase 5.6; there's no separate audit
+pass that will catch it later. Skip only when the change is purely internal to the code (nothing a
+context doc would claim), and say so rather than skipping silently.
 
 ## Migrations
 
