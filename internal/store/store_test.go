@@ -74,6 +74,27 @@ func fullEvent(requestID string) *Event {
 		RespBody:    []byte(`{"usage":{}}`)}
 }
 
+// BenchmarkInsertEvent (br-GI-13-08's write-side trade, "measured, not
+// asserted"): the insert-side cost against the current, fully-indexed
+// schema, reproducible with `go test -bench=InsertEvent ./internal/store/`
+// instead of the one-off number recorded in a commit message.
+func BenchmarkInsertEvent(b *testing.B) {
+	path := filepath.Join(b.TempDir(), "bench.db")
+	st, err := Open(path)
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, err := st.InsertEvent(ctx, fullEvent(fmt.Sprintf("req-bench-%d", i))); err != nil {
+			b.Fatalf("InsertEvent: %v", err)
+		}
+	}
+}
+
 // Test 5: round trip, WAL, FK cascade, RedactCheck.
 func TestRoundTripAllFields(t *testing.T) {
 	st := newTestStore(t)
