@@ -88,6 +88,7 @@ Every subcommand accepts the same flag set; precedence is flags > `CLENS_*` > fi
 | `--retention-days` | — | drives `clens purge` |
 | `--replay` | off | the replay endpoint is opt-in |
 | `--accounts-path` | `~/.clens/accounts.toml` | |
+| `--pprof-addr` | unset (disabled) | serves `net/http/pprof` on this address for the process's life — a diagnostic, deliberately absent from `Default()`. **Loopback-locked even under `--allow-remote`**: a profile dumps whatever is in process memory, including prompt and response bodies, so `Validate()` hardcodes `allowRemote=false` for this one field rather than reusing `c.AllowRemote` (`internal/config/config.go`'s `IsLoopbackHost`, shared with the general bind check so a legitimately-loopback address can't pass one and fail the other) |
 
 Source: [internal/config/config.go](../../internal/config/config.go) `Default()` and the `Config`
 struct. `clens doctor` prints the resolved values.

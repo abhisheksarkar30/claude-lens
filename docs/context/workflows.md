@@ -40,6 +40,15 @@ sequenceDiagram
 - **`InsertEvent` returns `(id, sessionID, error)`, and `sessionID` may not be `ev.SessionID`.**
   On a `request_id` merge it is the *existing* row's session. Every session-scoped call keys off
   the returned value — see flow 2.
+- **The session-scoped analyzer pass and the session fold run once per distinct session per flush
+  batch, not once per row (GI#13).** A batch of several calls for the same session used to re-run
+  `SessionEventsForRules` (then `SessionEvents`) and re-fold the session once per row in the batch;
+  it now runs once after every row in the batch is inserted, keyed off the distinct `sessionID`s
+  `InsertEvent` returned. This trades exact byte-identical warning output for the query no longer
+  scaling with batch size on top of session size — see
+  [decisions/010](decisions/010-per-session-dedupe-accepts-warning-subset.md) for what it costs.
+  The fold carries the **first inserted** row's `PrefixHash` for that session, not the last, because
+  `prefix_hash` is insert-only at the store (first-writer-wins).
 - **`CaptureComplete` covers both teed buffers.** The flag is submitted as
   `!respBuf.truncated && !reqBuf.truncated`; deriving it from the response alone let a request body
   cut at the read cap be stored as a prefix on a row still reporting a whole capture (br-GI-7-08,

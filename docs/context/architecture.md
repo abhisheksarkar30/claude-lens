@@ -47,6 +47,11 @@ Both are loopback-only unless `allow_remote` is set ([internal/config/config.go]
 `Validate()`). `clens doctor` prints the effective config, the bind addresses, and a PASS/WARN/FAIL
 per check.
 
+A third, optional listener — `net/http/pprof` behind `--pprof-addr` (GI#13) — stays loopback-locked
+**even when `allow_remote` is set**: a heap profile is a dump of whatever is in process memory, so
+`--allow-remote` widening the dashboard and proxy must not also widen this one. See
+[security-and-permissions.md](security-and-permissions.md).
+
 ### The three stages
 
 | Stage | Package | Owns |

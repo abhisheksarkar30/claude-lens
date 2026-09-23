@@ -17,6 +17,7 @@ the bind address *is* the security boundary.
 | Dashboard reads | **none** — loopback is the control | deliberate |
 | Dashboard writes | same-origin guard (`originReject`) | [internal/api/origin.go](../../internal/api/origin.go) |
 | Replay (the billable route) | opt-in, off by default (`clens serve --replay`) | [internal/api/replay.go:42](../../internal/api/replay.go#L42) |
+| `net/http/pprof` (`--pprof-addr`, GI#13) | off by default; loopback only, **and `--allow-remote` cannot widen it** | `config.Validate()` hardcodes `allowRemote=false` for this one field ([internal/config/config.go](../../internal/config/config.go)); `internal/cli`'s `startPprof` re-checks with the same `IsLoopbackHost` predicate before spawning the listener, so a `Config` built by anything other than `config.Load` can't skip `Validate` and open one anyway |
 
 `--allow-remote` is documented as the footgun flag, not a feature: it exists so that binding a
 public interface is an explicit act rather than a default nobody noticed.

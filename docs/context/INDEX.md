@@ -38,7 +38,7 @@ Three non-stdlib modules and no more: `modernc.org/sqlite` (pure Go, no cgo),
 | [infra-and-deploy.md](infra-and-deploy.md) | before touching a workflow, a hook, or branch policy | conditional — trigger: `.github/workflows/` |
 | [integrations-and-external-services.md](integrations-and-external-services.md) | before changing a collector or adding a dependency | conditional — trigger: four external endpoints, three Go modules |
 | [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 1142 lines of hand-written JS under a hard no-build-step rule |
-| [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — nine genuine forks, each with a rejected alternative a change could reintroduce |
+| [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — ten genuine forks, each with a rejected alternative a change could reintroduce |
 
 ## Grounding rules for agents
 
@@ -269,3 +269,35 @@ both are recorded in the beads rather than here: plan §4's three-option Calls-p
 otherwise display a granularity it is not applying) and plan §4/§5's "`--dry-run` is not an argument to
 `Store.RepriceCosts`" (it is). Re-asserting `status=converged` on text no review round has read is
 round 9's finding O4, so the beads carry the corrections instead.
+
+**2026-09-23 — REFRESH, scoped to `GI-13-session-pass-cost`** (beads `br-GI-13-01` … `-06`; plan
+`docs/planning/GI-13-session-pass-cost.md`). **No module was added or retired and no dependency
+moved.** `decisions/` gained **one ADR** — [010](decisions/010-per-session-dedupe-accepts-warning-subset.md),
+the per-session analyzer pass and fold deduping to once per flush batch — so the count above moved
+nine → ten.
+
+**Nine module files changed.** `storage-schema.md` (the composite `(session_id, started_at)` index
+replacing the single-column one; a new paragraph on `schemaVersion` reaching 2 and why), `build-and-run.md`
+and `cli-and-tooling.md` (the new `--pprof-addr` flag, loopback-locked even under `--allow-remote`),
+`security-and-permissions.md` (a third listener surface added to the AuthN/AuthZ table, with the
+`--allow-remote` exception named), `architecture.md` (the same exception, at the component-map level),
+`workflows.md` §1 (the per-batch, not per-row, session pass/fold — the story's one user-visible
+behaviour change, and the first-inserted-row rule for `prefix_hash`), `api-surface.md` and `glossary.md`
+(both named a `SessionEvents` method the story renamed to `SessionEventsForRules` and narrowed to a
+nine-column rules projection — `req_body` included, the other five blobs dropped), and
+`testing-and-quality.md` (the size figures, re-measured: no new test file this story, every case
+landed in an existing one).
+
+**The dominant finding this refresh made, worth stating plainly: two module docs still named a store
+method the code no longer has.** `api-surface.md` and `glossary.md` both said `SessionEvents` was
+one of the full-row reads; `br-GI-13-03` deleted that method outright (D3: "a method whose name
+promises full rows and returns `nil` blobs is a trap for the next caller") and replaced it with
+`SessionEventsForRules`, a narrower projection, not a renamed twin. Neither doc's own file was in
+any bead's list — the beads' file lists named the store and the callers, not the two docs that
+happened to mention the old name — so this is the same class GI-11's refresh flagged: a fact
+restated in more than one place, where the story moved the site it named but not every site that
+named it.
+
+**No new store column, no new capture, no CLI subcommand added** — `--pprof-addr` is a flag on the
+existing shared set, not a new one; see [cli-and-tooling.md](cli-and-tooling.md) for why its row
+count still reads 21.

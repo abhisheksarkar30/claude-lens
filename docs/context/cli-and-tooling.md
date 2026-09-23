@@ -6,7 +6,7 @@ One entry point: [cmd/clens/main.go](../../cmd/clens/main.go), a `map[string]fun
 of 21 subcommands dispatching into [internal/cli](../../internal/cli/). Every subcommand accepts
 the same config flag set (`--proxy-addr`, `--dashboard-addr`, `--upstream-url`, `--db-path`,
 `--body-policy`, `--body-cap-bytes`, `--allow-remote`, `--session-gap-minutes`, `--retention-days`,
-`--replay`, `--accounts-path`) — see [build-and-run.md](build-and-run.md).
+`--replay`, `--accounts-path`, `--pprof-addr`) — see [build-and-run.md](build-and-run.md).
 
 An unknown name prints `clens <name>: not implemented yet` and exits non-zero.
 
@@ -15,7 +15,7 @@ An unknown name prints `clens <name>: not implemented yet` and exits non-zero.
 | Command | Flags | What it does | Evidence |
 |---|---|---|---|
 | `serve` | `--replay` | **The only long-running command.** proxy + dashboard in one process; owns every goroutine. Blocks until interrupted. | [internal/cli/serve.go](../../internal/cli/serve.go) |
-| `doctor` | — | prints the effective config, the bind addresses, and a PASS/WARN/FAIL per check — including the *observed* protection level of `secrets.toml` and the database's `db_schema` version beside the one this binary knows. `db_schema` reports Open's own outcome, since Open migrates before returning: a skew is refused there, so the check FAILs rather than reporting a mismatch | [internal/cli/doctor.go](../../internal/cli/doctor.go) |
+| `doctor` | — | prints the effective config, the bind addresses, and a PASS/WARN/FAIL per check — including the *observed* protection level of `secrets.toml` and the database's `db_schema` version beside the one this binary knows. `db_schema` reports Open's own outcome, since Open migrates before returning: a skew is refused there, so the check FAILs rather than reporting a mismatch. Also names `--pprof-addr` when it is unset, rather than printing an empty value — the flag is otherwise discoverable only by reading the source | [internal/cli/doctor.go](../../internal/cli/doctor.go) |
 | `ingest` | `--rebuild` | backfill from Claude Code's JSONL transcripts; `--rebuild` restarts from zero rather than from the byte cursor, so an added rate row or a changed prefix is applied to rows already captured without duplicating them. It is **not** the general re-pricing path (it was described as one before GI-11): a re-read produces a *JSONL* row, priced with `speed=""` / `serviceTier=""`, and the `request_id` merge never replaces the proxy's bodies — so it cannot reach the proxy-only rows. Use `reprice` for stored costs | [internal/cli/ingest.go](../../internal/cli/ingest.go) |
 | `refresh` | — | run every non-proxy collector once. **The cron / Task Scheduler target.** | [internal/cli/refresh.go](../../internal/cli/refresh.go) |
 | `ls` | filters | the call log, newest first | [internal/cli/ls.go](../../internal/cli/ls.go) |

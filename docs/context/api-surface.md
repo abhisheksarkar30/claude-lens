@@ -60,8 +60,11 @@ than `store.Event`. The distinction is a **compile error, not a filter flag**: a
 body cannot reach one, because the field is not there to name, whereas a forgotten flag would return
 `nil` where bytes were expected, and a body-less `jsonl` row is byte-identical on the wire to an
 unselected one. Fifty captured calls carry ~15 MB of stored bodies (measured), so the projection is
-what keeps the dashboard's hottest fetch at ~48 KB. `ListEventsFull` / `SessionEvents` are the
-full-row reads, and the two SELECTs are derived from one column list so they cannot drift.
+what keeps the dashboard's hottest fetch at ~48 KB. `ListEventsFull` is the full-row read;
+`SessionEventsForRules` (GI#13) is a third, narrower projection — the nine columns the session-scoped
+analyzer pass actually reads, `req_body` included but the other five blobs omitted — and all three
+SELECTs derive from one column list so they cannot drift. See
+[storage-schema.md](storage-schema.md).
 
 `/api/requests/{id}` adds the decoded response body and the two fields that keep it honest:
 

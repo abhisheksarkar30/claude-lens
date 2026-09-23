@@ -168,8 +168,8 @@ Two things to know first:
 Every command takes the config flags — `--proxy-addr`, `--dashboard-addr`,
 `--upstream-url`, `--db-path`, `--body-policy`, `--body-cap-bytes`,
 `--allow-remote`, `--session-gap-minutes`, `--retention-days`, `--replay`,
-`--accounts-path`. Precedence is flags > `CLENS_*` environment > the config
-file at `~/.clens/config.toml` > defaults.
+`--accounts-path`, `--pprof-addr`. Precedence is flags > `CLENS_*` environment
+> the config file at `~/.clens/config.toml` > defaults.
 
 ## Dashboard
 

@@ -30,6 +30,15 @@ subsequent boot would fail with `duplicate column name` and no recovery but dele
 A version *ahead* of the binary is refused, not guessed at: `migrate` errors rather than opening a
 database written by a newer `clens`.
 
+**`schemaVersion` is 2** as of GI#13: migration 1→2 replaces `idx_events_session_id` with a composite
+index on `(session_id, started_at)` and drops the single-column one, since it is now a redundant
+prefix that would otherwise charge every insert for an index nothing reads. The composite exists
+because the session-scoped analyzer pass's own read (`WHERE session_id = ? ORDER BY started_at ASC`,
+see [workflows.md](workflows.md) flow 1) had no index that satisfied its `ORDER BY`, so SQLite
+materialized the session's rows — BLOBs included — and spilled the sort to a temp file on every
+flush; see [decisions/010](decisions/010-per-session-dedupe-accepts-warning-subset.md) for the fold
+that accompanies this fix.
+
 The schema is the enforcement point for two invariants, which is why it is worth reading before
 changing a column: see [architecture.md](architecture.md) and [cost-and-quota.md](cost-and-quota.md).
 
@@ -39,7 +48,7 @@ changing a column: see [architecture.md](architecture.md) and [cost-and-quota.md
 
 | Table | Purpose | Key fields | Constraints / indexes | Evidence |
 |---|---|---|---|---|
-| `events` | one row per captured call: identity, tokens, cost, the proxy-only request/response columns, and the transcript-only reconstruction columns | `id`, `request_id`, `source`, `first_source`, `session_id`, `total_prompt_tokens`, `cost_usd`, `api_equivalent_cost_usd`, `cost_source`, `req_body`/`resp_body`/`req_headers`/`resp_headers`, `transcript_content`/`transcript_role` (47 columns) | `request_id` **UNIQUE** (this is what makes the merge possible); indexes on `session_id`, `started_at`, `cost_source` | [schema.sql](../../internal/store/schema.sql) |
+| `events` | one row per captured call: identity, tokens, cost, the proxy-only request/response columns, and the transcript-only reconstruction columns | `id`, `request_id`, `source`, `first_source`, `session_id`, `total_prompt_tokens`, `cost_usd`, `api_equivalent_cost_usd`, `cost_source`, `req_body`/`resp_body`/`req_headers`/`resp_headers`, `transcript_content`/`transcript_role` (47 columns) | `request_id` **UNIQUE** (this is what makes the merge possible); a composite index on `(session_id, started_at)`, plus `started_at`, `cost_source` | [schema.sql](../../internal/store/schema.sql) |
 | `sessions` | the per-session fold: summed tokens, priced/unpriced counts, warning count | `id` PK, `prefix_hash`, `first_seen`/`last_seen`, every token column, `priced_count`, `unpriced_count`, `model_set`, `warning_count`, both cost columns | no FK — the link to `events` is by `session_id` value only | [schema.sql](../../internal/store/schema.sql) |
 | `warnings` | one row per (event, kind) | `event_id`, `kind`, `severity`, `detail`, `path` | `UNIQUE(event_id, kind)`; `REFERENCES events(id) ON DELETE CASCADE` | [schema.sql](../../internal/store/schema.sql) |
 
