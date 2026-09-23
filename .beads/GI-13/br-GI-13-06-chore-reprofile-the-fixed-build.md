@@ -33,6 +33,39 @@ result to a live-store row count or a quoted millisecond figure — both are mov
 Record the result — the `-top` excerpt before and after, and the store's size/shape at capture — in
 the story's PR body (or the bead's tracking comment), so the claim is checkable rather than asserted.
 
+### The recorded pre-fix signature — the "before" half, kept here
+
+The pre-fix capture has been deleted from disk, so the excerpt is recorded here rather than left as a
+path. It was taken from the **live** process at `http://127.0.0.1:8899/debug/pprof/profile?seconds=30`
+against the live store `D:/clens/lens.db` while the dashboard was hanging — **not** from a probe
+instance; those ran on 8897/8898 with their own stores, and both are gone.
+
+`go tool pprof -top -cum` over the 30s capture, total samples 28.95s (96.50% of one core):
+
+```
+  96.34%  internal/consumer.(*Consumer).flush
+  94.85%  internal/consumer.(*Consumer).runSessionRule
+  94.85%  internal/store.(*Store).SessionEvents     <-- the whole story, on one line
+  94.23%  modernc.org/sqlite/lib._sqlite3VdbeExec
+  89.91%  runtime.cgocall        (89.91% FLAT -- the cgo hop into sqlite)
+  59.76%  database/sql.(*DB).queryDC
+```
+
+`SessionEvents` is **94.85%** of the profile and its only caller is `runSessionRule`, inside `flush`.
+That is C1's and C2's target measured directly: the per-row session re-read. The flat-view markers
+(`_vdbePmaWriteBlob` 31.6%, `_vdbeIncrSwap` 27.5%, `_vdbePmaReadBlob`, `_winRead` 57.5%,
+`_vdbeColumnFromOverflow` 34.6%) are the temp-file sort spill *inside* that `_sqlite3VdbeExec`.
+
+Compare the after-profile against these rows, not against a wall-clock figure.
+
+### The trap this bead must not fall into
+
+Two of the investigation's captures were of an **idle** process (0.33% and 0.27% of a core, top frame
+`runtime.(*timers).run`), and one was written to a file named `cpu-top.txt`, where it read as evidence
+that there was no bug at all. **Confirm the process is burning CPU before sampling** — read
+`TotalProcessorTime` twice, ten seconds apart; if it is under ~30% of a core, let it run and
+re-capture. An after-profile taken against an idle fixed build would "pass" for the wrong reason.
+
 ## Rationale
 
 `_vdbePmaWriteBlob` + `_vdbeIncrSwap` + `_vdbePmaReadBlob` are the sort spilling to a temp file; their

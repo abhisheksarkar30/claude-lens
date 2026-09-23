@@ -91,6 +91,12 @@ tree is generated, so a hand-written runbook there is clobbered by the next refr
 - The **method** that cracked this case: a no-DB route (`/api/health`) answering in ~5 ms while every
   DB route takes tens of seconds is the signature of `SetMaxOpenConns(1)` contention, and it
   distinguishes contention from a starved runtime or a slow disk in one curl.
+- **The idle-profile trap, stated as a step and not a caveat.** Confirm the process is actually
+  burning CPU *before* sampling — read `TotalProcessorTime` twice, ten seconds apart, and if it is
+  under ~30% of a core, let it run and re-capture. A profile of an idle process is a near-empty file
+  whose top frame is `runtime.(*timers).run`, and it reads as evidence the bug does not exist. This
+  bit during GI-13's own investigation: two of its captures were of an idle process, and one of them
+  was written to a file named `cpu-top.txt`.
 
 ## Rationale
 
