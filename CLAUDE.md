@@ -27,16 +27,16 @@ schema, cost model, conventions, the CLI and API surfaces, and the decision reco
 specific slice you're changing as a hypothesis, not fact, until you check it against the real
 source; the code wins wherever they disagree.
 
-**The other half of that rule: fix the doc, don't just note it — except under `/develop-story`,
-where it's tracked instead.** Whether the staleness turns up mid-read (a doc claim that no longer
-matches the code) or your own change just created it (a new, renamed, or removed entity, endpoint,
-permission, flow, module, or convention):
-- **Ad hoc edit** — update the specific `docs/context/*.md` line(s) in the same change, not a
-  follow-up. There's no later phase that will catch it.
-- **Under `/develop-story`** — don't stop mid-implementation to fix it; that's Phase 5.6's job.
-  Append it to a running "Context docs to refresh" list in the story's plan file
-  (`docs/planning/{ticket-id}-{slug}.md`) as you go, so Phase 5.6 starts from that concrete
-  minimum instead of rediscovering scope from the whole diff.
+**The other half of that rule: track the doc, don't stop to fix it mid-change.** Whether the
+staleness turns up mid-read (a doc claim that no longer matches the code) or your own change just
+created it (a new, renamed, or removed entity, endpoint, permission, flow, module, or convention),
+add the specific `docs/context/*.md` file:line claim to a running list as you go rather than
+patching it inline:
+- **Ad hoc edit** — at the end of the task, surface that list to the user as a suggestion (name the
+  file:line and what's now stale) and offer to update it — don't fix it unprompted.
+- **Under `/develop-story`** — append it to a running "Context docs to refresh" list in the story's
+  plan file (`docs/planning/{ticket-id}-{slug}.md`) as you go; Phase 5.6 consumes that exact list
+  to drive its refresh instead of rediscovering scope from the whole diff.
 
 Skip only when the change is purely internal to the code (nothing a context doc would claim), and
 say so rather than skipping silently.
