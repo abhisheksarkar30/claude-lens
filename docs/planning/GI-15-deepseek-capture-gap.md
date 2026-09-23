@@ -1,7 +1,7 @@
 # GI#15: DeepSeek residual capture gap — close the two proxy-side blind spots
 
-**Version:** 6
-**Status:** converged
+**Version:** 7
+**Status:** revision pending re-review (beads 1-2 converged v6; beads 3-4 added, not yet reviewed)
 **Issue:** [GI#15](https://github.com/abhisheksarkar30/claude-lens/issues/15)
 **Branch:** `GI-15-deepseek-capture-gap`
 **Origin:** `memory/project_deepseek_capture_gap.md` from the reconciliation session that
@@ -191,7 +191,165 @@ never header or body content (which `CapturedCall`'s comments already establish 
 requiring redaction upstream of this struct). The bead description says exactly this so
 implementation doesn't accidentally log `call.ReqHeaders` or `call.ReqBody` for convenience.
 
+## Addendum: source_mismatch diagnostics (beads 3-4)
+
+### Findings (this session, live-data investigation)
+
+A dashboard review of the live `D:/clens/lens.db` (post-restart onto the beads-1/2 binary) found
+`source_mismatch` at 48 occurrences (0.09% of 53,828 calls) and trending up (13 → 14 → 21 per day,
+09-21 through 09-23) — small, but growing, and directly downstream of this story's own subject
+(DeepSeek capture reconciliation). Two rows were traced end-to-end: DB row → raw `resp_headers` →
+the matching `~/.claude/projects/**/*.jsonl` transcript line.
+
+1. **The key-matching itself is correct and already documented as intentional.** DeepSeek sends no
+   `Request-Id` response header at all (confirmed on event `130890`: its stored `resp_headers` has
+   `X-Ds-Trace-Id`, never `Request-Id`). `internal/jsonlogs/dedup.go:96-106`'s own comment states
+   this is exactly why both `internal/consumer.requestID()` and `jsonlogs.requestKey()` fall back to
+   the response body's `message.id` for DeepSeek traffic — "both sides fall to tier two and key
+   identically." Nothing here needs fixing; it's confirmation that the 48 merges are landing on the
+   right row, not a false collision.
+
+2. **What's actually missing is diagnostic content, and one severity is actively wrong.** Two
+   independent gaps, in the same function (`internal/store/merge.go`'s mismatch branch,
+   `applyMergeTx`/`mergeEvents`):
+   - `Warning.Detail` (`merge.go:143`) reads only `"sources %s and %s disagree on token counts for
+     request_id %s"` — it names neither which of the six compared fields (`InputTokens`,
+     `OutputTokens`, `CacheWrite5mTokens`, `CacheWrite1hTokens`, `CacheReadTokens`,
+     `ThinkingTokens`) differ nor their two values. Confirming an actual disagreement for this plan
+     required manually cross-referencing the DB row against the raw JSONL file by hand — the
+     warning itself gave no lead.
+   - One traced sample had `existing.Source == incoming.Source == "jsonl"` — the *same* collector
+     re-observing its own transcript with different numbers on a later tailer pass. This is real
+     and structurally different from a true cross-source (`proxy` vs `jsonl`) disagreement:
+     `internal/jsonlogs/jsonlogs.go:300-303` documents that a file-rotation re-read is "absorbed as
+     a merge, never a duplicate row" **only if the re-read content is byte-identical** to what was
+     already ingested. Claude Code can amend a previously-written transcript line (e.g. finalizing
+     usage once a stream that looked interrupted actually completes), which breaks that assumption
+     and produces a same-source pair that legitimately differs. The current code has no branch for
+     this — it reuses the identical `"sources %s and %s disagree..."` phrasing (reading as a
+     cross-source conflict when it is a self-correction) at `SeverityError` (reading as urgent when
+     it is expected and benign).
+
+   Root cause of the *volume* of proxy-vs-jsonl disagreements (the dominant case, not the one-off
+   jsonl-vs-jsonl sample) is one open hypothesis, not confirmed: Claude Code may stop consuming an
+   SSE stream once it has a complete `tool_use` block (all 48 samples checked had
+   `stop_reason=tool_use`) while `clens`'s cold-path parser processes bytes teed up to a possibly
+   different point in the frame sequence — two independent readers of one stream, snapshotting usage
+   at slightly different moments. **This plan does not attempt to fix or further diagnose that root
+   cause** (self-review below explains why); beads 3-4 make every future occurrence self-explanatory
+   instead.
+
+### What changes
+
+| File | Change | Why |
+|---|---|---|
+| `internal/store/merge.go` | **br-GI-15-03**: in the mismatch branch of `applyMergeTx`, build the `Warning.Detail` from the actual differing fields — only the ones `tokensDiffer` found unequal, each as `field existing_value vs incoming_value` — instead of the current field-free sentence. A small unexported helper (e.g. `diffTokenFields(existing, incoming *Event) string`) keeps `applyMergeTx` readable and gives the new behavior one place to test directly. | Turns the warning from "something disagreed, go look" into an actionable diagnostic — this plan's own investigation had to reconstruct this by hand from raw DB/JSONL data because the warning didn't say it |
+| `internal/store/merge.go` | **br-GI-15-04**: in the same branch, when `existing.Source == incoming.Source`, emit a distinct `Detail` phrasing (a same-source re-read/self-correction, naming the shared source) and `Severity: "info"` instead of `"error"`; the existing `"sources %s and %s disagree..."` phrasing and `SeverityError` stay exactly as they are for the `existing.Source != incoming.Source` case. `Kind` stays `"source_mismatch"` in both cases — see rationale below. | A same-source pair is a structurally different, generally benign event (a corrected re-read) from a true two-source parsing disagreement, and today's single wording/severity conflates them, overstating the benign case as an `error` |
+| `internal/store/merge_test.go` | New test(s): (a) a fixture that differs in exactly one known field (e.g. `OutputTokens`) asserts `Detail` names that field and both values, and does not name a field that didn't differ; (b) a same-source (`jsonl`/`jsonl`) fixture that differs on tokens asserts `Severity == "info"` and a detail phrasing distinct from the cross-source case; `TestMergeStillWarnsOnATrueDisagreement` (the existing cross-source pin) is checked to still pass unmodified — it only asserts `Kind`, not `Detail` text or `Severity`, so it is not expected to need a change, but the plan record's own convention (bead 2's precedent) is to verify existing tests explicitly rather than assume | Bead 3's acceptance check; bead 4's acceptance check; regression guard on the pre-existing cross-source case |
+
+**Rationale for keeping `Kind: "source_mismatch"` rather than adding a new kind for the same-source
+case:** `docs/context/testing-and-quality.md` and `internal/analyze/kinds.go` treat `Kind` as a
+single, README-enforced spelling with one declared (static) `Severity` per kind
+(`TestReadmeKindTableMatchesAllKinds`, `internal/analyze/readme_test.go:60-61` — checked against
+`kinds.go`'s `allKinds` table, not against any individual `Warning` row written at runtime). That
+static table's declared severity for `source_mismatch` (`error`) is unchanged by this addendum — it
+documents the worst case. Nothing in the schema, the store package, or that test ties a *written*
+`Warning.Severity` to the kind's declared value; `warnings.severity` is a free column, and
+`internal/store` cannot import `internal/analyze` (its own hardcoded `"source_mismatch"`/`"error"`
+string literals at `merge.go:141-142` are a pre-existing example of exactly this — the two packages
+already don't share the Kind/Severity constants). Introducing a second `Kind` would additionally
+require a new `README.md` table row, a `nonAnalyzeKinds` entry, and dashboard/kind-count surface
+changes for what is otherwise the same conceptual finding at a different severity — YAGNI here per
+this plan's own self-review (below) rejected it as unjustified surface area for a diagnostics-only
+fix.
+
+### Architecture / infrastructure changes
+
+None. Both beads stay inside `internal/store`, touching only `merge.go` (and its test file). No new
+import, no schema change, no new CLI command, no new route.
+
+### Test strategy
+
+- **Bead 3:** `diffTokenFields` (or equivalent) is tested directly against a hand-built pair of
+  `Event`s differing in one field and, separately, in more than one field, asserting the returned
+  string names exactly the differing field(s) with both values and omits identical fields. An
+  end-to-end `mergeEvents`/`applyMergeTx`-level test (extending or sitting beside
+  `TestMergeStillWarnsOnATrueDisagreement`) asserts the persisted `Warning.Detail` contains that
+  same content.
+- **Bead 4:** a same-source fixture (`existing.Source = incoming.Source = "jsonl"`, differing
+  tokens, both `CaptureComplete`) asserts the persisted warning's `Severity == "info"` and a
+  `Detail` that does not read as a cross-source claim (e.g. does not say "sources jsonl and jsonl
+  disagree" verbatim — the whole point is that phrasing is misleading here). A cross-source fixture
+  (`existing.Source = "proxy"`, `incoming.Source = "jsonl"`) in the same test table asserts
+  `Severity == "error"` is unchanged, so the branch is proven both ways rather than only in the new
+  direction.
+- Full suite: `go build ./...`, `go vet ./...`, `go test ./internal/store/`, then `go test ./...`
+  before pushing, per this repo's CLAUDE.md — same as beads 1-2.
+
+### Risk areas / edge cases
+
+- **`diffTokenFields`'s output must stay stable enough to test without being so rigid a future
+  sixth token column breaks the test suite for an unrelated reason.** Build it by iterating the
+  same six-field comparison `tokensDiffer` already lists (`merge.go:168-173`), naming each field
+  from one shared table, so the two can never drift into checking different fields.
+- **The `info`-severity same-source path must not swallow a *real* cross-source disagreement that
+  happens to reuse a source name coincidentally.** The condition is a plain `existing.Source ==
+  incoming.Source` string compare on the two merge inputs actually being merged — there is no third
+  case where that could be true except the one it's meant to catch (two `Event`s cannot both claim
+  `Source: "proxy"` and reach this branch by a different code path; `Source` is set once, at
+  capture time, per `internal/consumer` and `internal/jsonlogs` each writing their own literal
+  value).
+- **No database migration.** `warnings.severity` is already a free-text column
+  (`internal/store/schema.sql`); writing `"info"` instead of `"error"` for one case requires no
+  schema change and is fully backward-compatible with every existing reader (`ListWarnings`, the
+  dashboard's warnings tab, `AllKinds()`-driven kind descriptions).
+
+### Context docs to refresh
+
+- `internal/analyze/kinds.go`'s `KindSourceMismatch` `Description` string ("The same request_id
+  arrived from two sources with disagreeing token counts.") is a source comment, not a
+  `docs/context/*.md` file, and is not checked against `README.md` (only `Kind` + `Severity` +
+  `nonAnalyzeKinds` membership are, per `readme_test.go`). It stays accurate for the common case;
+  Phase 5.6 should check whether it's worth a short addition noting the same-source/`info` case
+  exists, but this is optional polish, not a correctness requirement.
+  `docs/context/testing-and-quality.md` and `architecture.md` were reviewed against beads 3-4: the
+  `source_mismatch`/merge-idempotency rows already describe the mechanism at the level these beads
+  operate within (a warning's content, not the merge's correctness rule), so Phase 5.6 should
+  confirm no wording there becomes inaccurate rather than assume it, per this repo's own
+  context-docs convention.
+
+### Self-review
+
+**As a senior engineer:** Scope is deliberately the two cheapest, highest-signal fixes from the
+brainstorm, not the "confirm the SSE-race hypothesis" option. That third option requires
+instrumenting a live tool-use call against DeepSeek and diffing byte-for-byte against Claude Code's
+own (external, unowned) client behavior — an open-ended investigation with no guaranteed fix at the
+end of it, since the divergence may originate entirely in Claude Code's own code. At 0.09% of calls
+and no evidence of cost/billing impact (both sides already report `CaptureComplete` and a real,
+if disagreeing, measurement — this is not the "zero vs measured" case `usageObserved` already
+guards against), spending further investigation budget there is not justified by current evidence;
+beads 3-4 are what make a future, better-resourced investigation of that root cause tractable (a
+detailed `Detail` string is exactly what such an investigation would want logged already).
+
+**As a QA engineer:** The two new tests must each stand on their own — bead 3's test should not
+depend on bead 4's severity branch existing yet, and vice versa, so beadify (Phase 3) should keep
+them independently implementable and independently revertible. Edge case worth naming: a mismatch
+where *only one* of the six fields differs (the common case, per the sampled data) versus more than
+one differing at once (also observed) — bead 3's test table should cover both, not just the
+multi-field case, since a naive implementation could hardcode a fixed-width message assuming all
+six are always reported.
+
+**As a security engineer:** `diffTokenFields` reports only token *counts* (integers), never body or
+header content — there is no new redaction surface here, unlike bead 2's log line. No new data
+leaves the process boundary; this only changes what's already written to the local `warnings` table.
+
 ## Change History
+
+### v7 (addendum — beads 3-4, source_mismatch diagnostics, not yet cross-reviewed)
+
+- Added the source_mismatch investigation findings, beads 3-4 (`Warning.Detail` enrichment;
+  same-source vs cross-source severity split), and their test/risk/context-doc sections. Beads 1-2
+  are unchanged and remain converged (v6); this addendum starts its own review cycle.
 
 ### v6 (round-6 review — convergence)
 
