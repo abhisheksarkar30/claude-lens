@@ -17,6 +17,7 @@ the bind address *is* the security boundary.
 | Dashboard reads | **none** — loopback is the control | deliberate |
 | Dashboard writes | same-origin guard (`originReject`) | [internal/api/origin.go](../../internal/api/origin.go) |
 | Replay (the billable route) | opt-in, off by default (`clens serve --replay`) | [internal/api/replay.go:42](../../internal/api/replay.go#L42) |
+| `POST /api/shutdown` (GI#13) | same-origin **plus** a loopback-caller check on `r.RemoteAddr`; **`--allow-remote` widens neither guard** | [internal/api/shutdown.go](../../internal/api/shutdown.go) |
 | `net/http/pprof` (`--pprof-addr`, GI#13) | off by default; loopback only, **and `--allow-remote` cannot widen it** | `config.Validate()` hardcodes `allowRemote=false` for this one field ([internal/config/config.go](../../internal/config/config.go)); `internal/cli`'s `startPprof` re-checks with the same `IsLoopbackHost` predicate before spawning the listener, so a `Config` built by anything other than `config.Load` can't skip `Validate` and open one anyway |
 
 `--allow-remote` is documented as the footgun flag, not a feature: it exists so that binding a
@@ -33,6 +34,19 @@ Every write route shares `originReject`:
 
 Rejections are counted in `replayRejected` on `GET /api/health`, so a probe against the one billable
 route leaves a trace.
+
+### The shutdown route's second guard (GI#13)
+
+`POST /api/shutdown` is the one route that stops the process, and same-origin alone is not enough
+for it: `originReject` reads only the `Host` header, so a caller that can already reach a dashboard
+bound to `0.0.0.0` (`--allow-remote`) can forge `Host: 127.0.0.1` and pass it regardless of where
+the connection actually came from. The handler additionally splits `r.RemoteAddr` with
+`net.SplitHostPort` (it may be `"[::1]:port"`) and tests the host with `loopbackHost` — a
+package-local predicate in [internal/api/origin.go](../../internal/api/origin.go), deliberately not
+`config.IsLoopbackHost`, since `internal/api` does not import `internal/config` (see Containment
+rules below). `--allow-remote` cannot widen this: the route is loopback-only unconditionally. The
+response is written, then the stop func runs on its own goroutine, so a shutdown that cancels the
+server's context first can never race its own response out of existence.
 
 ## Credential handling
 

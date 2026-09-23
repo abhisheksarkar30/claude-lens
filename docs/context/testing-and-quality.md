@@ -9,13 +9,20 @@
 | Unit + integration | Go's stdlib `testing` only — no assertion library, no mocking framework | `*_test.go` beside the code | [go.mod](../../go.mod) has no test dependency |
 | End-to-end | none — no suite; one recorded manual run instead | [docs/acceptance.md](../acceptance.md) | the doc states which half could not be run |
 
-**56 test files, 19,179 lines** against 16,255 lines of non-test Go (re-measured on
-`GI-13-session-pass-cost`, which added no new test file — every new case landed in an existing file:
-`internal/store/store_test.go`, `internal/consumer/consumer_test.go`,
+**59 test files, 19,841 lines** against 16,660 lines of non-test Go (re-measured at the branch tip
+of `GI-13-session-pass-cost`, all nine beads). Beads 01–06 added no new test file — every case
+landed in an existing file: `internal/store/store_test.go`, `internal/consumer/consumer_test.go`,
 `internal/jsonlogs/jsonlogs_test.go`, `internal/analyze/rules_test.go`,
 `internal/config/config_test.go`, `internal/cli/doctor_test.go`, `internal/cli/serve_test.go`, and
-`internal/session/session_test.go`). The file count held at 56 from
-`GI-11-cost-and-capture-fidelity`, which took it 52 → 56 on four new files —
+`internal/session/session_test.go`. Beads 07–09 (`req_tool_names`, the stats covering index, `clens
+shutdown`) then took the file count 56 → 59 on three new files —
+[internal/api/shutdown_test.go](../../internal/api/shutdown_test.go),
+[internal/cli/shutdown_test.go](../../internal/cli/shutdown_test.go), and
+[internal/cli/backfill_test.go](../../internal/cli/backfill_test.go) — plus further cases in
+`internal/store/store_test.go` (the `req_tool_names` backfill helpers and the stats-index tests,
+including `TestPurgeUnpricedUsesTheCostSourceIndex` and `BenchmarkInsertEvent`) and
+`internal/cli/doctor_test.go`/`internal/cli/serve_test.go` (the new checks and seam). The file count
+had held at 56 from `GI-11-cost-and-capture-fidelity`, which took it 52 → 56 on four new files —
 [internal/store/reprice_test.go](../../internal/store/reprice_test.go),
 [internal/cli/reprice_test.go](../../internal/cli/reprice_test.go),
 [internal/store/reflag_test.go](../../internal/store/reflag_test.go) and

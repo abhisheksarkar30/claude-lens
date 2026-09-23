@@ -61,10 +61,13 @@ body cannot reach one, because the field is not there to name, whereas a forgott
 `nil` where bytes were expected, and a body-less `jsonl` row is byte-identical on the wire to an
 unselected one. Fifty captured calls carry ~15 MB of stored bodies (measured), so the projection is
 what keeps the dashboard's hottest fetch at ~48 KB. `ListEventsFull` is the full-row read;
-`SessionEventsForRules` (GI#13) is a third, narrower projection — the nine columns the session-scoped
-analyzer pass actually reads, `req_body` included but the other five blobs omitted — and all three
-SELECTs derive from one column list so they cannot drift. See
-[storage-schema.md](storage-schema.md).
+`SessionEventsForRules` (GI#13) is the session-scoped analyzer pass's own read. It started as a
+narrower, nine-column projection that still included `req_body` (needed to compare tool names
+between two calls); **br-GI-13-07 moved that comparison onto the new `req_tool_names` column**, so
+`req_body` rejoined the omitted set and `SessionEventsForRules` now selects the same 42 columns as
+`EventSummary` — the two projections' omitted-column lists are identical, kept as separate named
+lists in code only because tests predating the change assert them by name. All three SELECTs still
+derive from one base column list so they cannot drift. See [storage-schema.md](storage-schema.md).
 
 `/api/requests/{id}` adds the decoded response body and the two fields that keep it honest:
 
@@ -86,8 +89,9 @@ Decoding is display-only: nothing here writes back, and replay sends the stored 
 | `POST` | `/api/accounts` | same-origin | save the accounts file | `503` without `SetAccountWriter` |
 | `POST` | `/api/secrets` | same-origin | store a credential | `503` without `SetCredentialWriter` |
 | `POST` | `/api/ingest` | same-origin | run every collector once | `503` without `SetIngestTrigger` |
+| `POST` | `/api/shutdown` | same-origin **+ loopback caller** (GI#13) | `clens shutdown`'s remote-triggered graceful stop — the same cancel func Ctrl+C already drives | `503` without `SetShutdown`; response is written before the func runs, on its own goroutine |
 
-### The two write guards
+### The write guards
 
 1. **Same-origin (`originReject`)** — every write route shares it
    ([internal/api/origin.go](../../internal/api/origin.go)). A request with **no** `Origin` header
@@ -96,8 +100,15 @@ Decoding is display-only: nothing here writes back, and replay sends the stored 
    `Host`, compared as host:port. A cross-origin POST gets `403`.
 2. **Opt-in for the one billable route** — replay sends a real, billable call, so it is off unless
    the server was started with `--replay`.
+3. **Loopback caller, for the one process-stopping route** (GI#13) — `originReject` alone checks
+   only the `Host` header, which is the DNS-rebinding case (a page whose own hostname resolves to
+   `127.0.0.1`). A caller that can already reach a dashboard bound to `0.0.0.0` (`--allow-remote`)
+   can send `Host: 127.0.0.1` and pass that guard regardless of where the connection actually came
+   from. `/api/shutdown` additionally checks `r.RemoteAddr` itself against a loopback predicate —
+   `--allow-remote` widens neither guard for this route; it is loopback-only unconditionally. See
+   [security-and-permissions.md](security-and-permissions.md).
 
-Every rejection is counted in `replayRejected`, surfaced on `GET /api/health` — without it, a
+Every replay rejection is counted in `replayRejected`, surfaced on `GET /api/health` — without it, a
 rejected probe against the one billable route would leave no server-side trace at all.
 
 ### 503, not empty

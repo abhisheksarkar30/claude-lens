@@ -3,7 +3,7 @@
 # CLI & Tooling
 
 One entry point: [cmd/clens/main.go](../../cmd/clens/main.go), a `map[string]func([]string) error`
-of 21 subcommands dispatching into [internal/cli](../../internal/cli/). Every subcommand accepts
+of 23 subcommands dispatching into [internal/cli](../../internal/cli/). Every subcommand accepts
 the same config flag set (`--proxy-addr`, `--dashboard-addr`, `--upstream-url`, `--db-path`,
 `--body-policy`, `--body-cap-bytes`, `--allow-remote`, `--session-gap-minutes`, `--retention-days`,
 `--replay`, `--accounts-path`, `--pprof-addr`) — see [build-and-run.md](build-and-run.md).
@@ -15,7 +15,7 @@ An unknown name prints `clens <name>: not implemented yet` and exits non-zero.
 | Command | Flags | What it does | Evidence |
 |---|---|---|---|
 | `serve` | `--replay` | **The only long-running command.** proxy + dashboard in one process; owns every goroutine. Blocks until interrupted. | [internal/cli/serve.go](../../internal/cli/serve.go) |
-| `doctor` | — | prints the effective config, the bind addresses, and a PASS/WARN/FAIL per check — including the *observed* protection level of `secrets.toml` and the database's `db_schema` version beside the one this binary knows. `db_schema` reports Open's own outcome, since Open migrates before returning: a skew is refused there, so the check FAILs rather than reporting a mismatch. Also names `--pprof-addr` when it is unset, rather than printing an empty value — the flag is otherwise discoverable only by reading the source | [internal/cli/doctor.go](../../internal/cli/doctor.go) |
+| `doctor` | — | prints the effective config, the bind addresses, and a PASS/WARN/FAIL per check — including the *observed* protection level of `secrets.toml` and the database's `db_schema` version beside the one this binary knows. `db_schema` reports Open's own outcome, since Open migrates before returning: a skew is refused there, so the check FAILs rather than reporting a mismatch. Also names `--pprof-addr` when it is unset, rather than printing an empty value — the flag is otherwise discoverable only by reading the source. `tool_names_backfill` (GI#13) WARNs with the outstanding row count when rows still await `backfill-tool-names`, rather than FAILing — a maintenance gap, not a broken database | [internal/cli/doctor.go](../../internal/cli/doctor.go) |
 | `ingest` | `--rebuild` | backfill from Claude Code's JSONL transcripts; `--rebuild` restarts from zero rather than from the byte cursor, so an added rate row or a changed prefix is applied to rows already captured without duplicating them. It is **not** the general re-pricing path (it was described as one before GI-11): a re-read produces a *JSONL* row, priced with `speed=""` / `serviceTier=""`, and the `request_id` merge never replaces the proxy's bodies — so it cannot reach the proxy-only rows. Use `reprice` for stored costs | [internal/cli/ingest.go](../../internal/cli/ingest.go) |
 | `refresh` | — | run every non-proxy collector once. **The cron / Task Scheduler target.** | [internal/cli/refresh.go](../../internal/cli/refresh.go) |
 | `ls` | filters | the call log, newest first | [internal/cli/ls.go](../../internal/cli/ls.go) |
@@ -35,10 +35,12 @@ An unknown name prints `clens <name>: not implemented yet` and exits non-zero.
 | `rekey` | `--yes`, `--dry-run` | the one-off historical backfill: pass 1 re-keys `proxy:`-synthetic rows from the body id already inside `resp_body`, pass 2 re-attributes proxy rows from the conversation id already inside `req_headers`, pass 3 deletes and re-derives the `jsonl:`-keyed rows whose identity was never stored. `--dry-run` reports N/M/K/L plus the dangling-`replay_of` count and a re-pricing note; run with `clens serve` stopped | [internal/cli/rekey.go](../../internal/cli/rekey.go) |
 | `reprice` | `--yes`, `--dry-run` | re-price stored rows in place from the current rate table: `cost_usd` / `api_equivalent_cost_usd` / `cost_source` are recomputed over **every** event row, and no row is inserted or deleted. Rows whose `cost_source` does not name a reconstructible input set are skipped rather than repriced (`repriceInScope`): `unpriced`, and any `approximate:<reason>` except `cache_ttl_unknown`. The repair for the per-class cent rounding GI-11 fixed — and, unlike `ingest --rebuild`, a path to the proxy-only rows that carry an understated cost. `--dry-run` prints the moved/unchanged/skipped split and writes nothing | [internal/cli/reprice.go](../../internal/cli/reprice.go) |
 | `reflag` | `--yes`, `--dry-run` | re-derive `capture_complete` from a `Content-Length` witness: a stored body that is a strict prefix of the client's declared length flips the flag to `incomplete`. Reports flipped / already honest / residual, where a residual row is one the merge laundered with no witness left to prove it — **not repairable**, and reported rather than guessed at. The matching historical repair for RC-B | [internal/cli/reflag.go](../../internal/cli/reflag.go) |
+| `backfill-tool-names` | `--yes`, `--dry-run` | fills `req_tool_names` (GI#13) on rows written before that column existed, so `ruleCacheInvalidatedByTools` does not silently decline on real history. A page-at-a-time read-parse-write loop through `parse.ExtractMeta`, not a single `UPDATE`: a `json_extract`-based SQL backfill would be a second, independent definition of "tool names." `--dry-run` reports the row count only | [internal/cli/backfill.go](../../internal/cli/backfill.go) |
+| `shutdown` | — | `POST /api/shutdown` to a running `clens serve`, triggering the same cancel func Ctrl+C already drives — the graceful path (drain, sink flush, store close) that a hard kill from a second shell skips. Resolves `--dashboard-addr` the same way `serve` does, then dials it as loopback if it is a wildcard bind (`0.0.0.0`/`::`/empty), since this is the common case for an operator config with `AllowRemote = true`. Reports "contacted" once the request succeeds — the process has not necessarily stopped yet, only started its drain (bounded by `serve`'s own 5s grace) | [internal/cli/shutdown.go](../../internal/cli/shutdown.go) |
 
-## The `--yes`-gated writers: four writers, two destructive
+## The `--yes`-gated writers: five writers, two destructive
 
-Four subcommands refuse to write without `--yes`, and it is worth keeping the two groups apart,
+Five subcommands refuse to write without `--yes`, and it is worth keeping the groups apart,
 because **the shared gate is not a shared property**:
 
 | | Deletes rows? | What it rewrites |
@@ -47,13 +49,15 @@ because **the shared gate is not a shared property**:
 | `rekey` | **yes** | pass 3 deletes and re-derives the `jsonl:`-keyed rows |
 | `reprice` | no | `cost_usd` / `api_equivalent_cost_usd` / `cost_source` |
 | `reflag` | no | `capture_complete` |
+| `backfill-tool-names` | no | `req_tool_names`, on rows where it is currently NULL |
 
-`reprice` and `reflag` delete nothing and insert nothing — they recompute a column from the row's own
-stored inputs, which is why a wrong or unwanted run is repaired by running it again, not by
-restoring a backup. The destructive set is still exactly `purge` and `rekey`, and the comments in
-`internal/cli/purge.go` and `internal/cli/rekey.go` say "two" deliberately.
+`reprice`, `reflag`, and `backfill-tool-names` delete nothing and insert nothing — they fill or
+recompute a column from the row's own stored inputs, which is why a wrong or unwanted run is
+repaired by running it again, not by restoring a backup. The destructive set is still exactly
+`purge` and `rekey`, and the comments in `internal/cli/purge.go` and `internal/cli/rekey.go` say
+"two" deliberately.
 
-All four default to the **opposite of destructive**:
+All five default to the **opposite of destructive**:
 
 - nothing is written without `--yes`
 - `--dry-run` prints what `--yes` would have written
