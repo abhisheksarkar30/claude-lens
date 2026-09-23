@@ -119,7 +119,12 @@ knob, no migration, no workflow change.
   that the captured log output does **not** contain that distinctive body value:
   `if strings.Contains(logOutput, sentinel) { t.Errorf("drop log leaked body: %q", logOutput) }`.
   This turns the security self-review's prose guarantee into an enforced regression test — a lazy
-  `log.Printf("dropped: %+v", call)` struct-dump would carry body content and would fail this check.
+  `log.Printf("dropped: %s", call.ReqBody)` convenience leak would carry body content and would
+  fail this check. (A `%+v` whole-struct dump would not trip this specific check: Go's `fmt`
+  renders a `[]byte` field under `%+v` as decimal integers, not text, so the sentinel never
+  appears verbatim in that output — the `%s`/string-conversion leak class is the realistic one
+  this check guards against; verified during implementation by temporarily reverting to each shape
+  and confirming which one the test actually catches.)
   The `Authorization` header is not a valid sentinel: `redactHeaders` replaces it with the literal
   `"[redacted]"` at `proxy.go:122`, before `captureState` is constructed, so `ReqHeaders.Authorization`
   is always `"[redacted]"` inside `submit()` regardless of what the test sends — a negative-containment
