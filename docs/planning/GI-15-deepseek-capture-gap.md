@@ -1,5 +1,7 @@
 # GI#15: DeepSeek residual capture gap — close the two proxy-side blind spots
 
+**Version:** 6
+**Status:** converged
 **Issue:** [GI#15](https://github.com/abhisheksarkar30/claude-lens/issues/15)
 **Branch:** `GI-15-deepseek-capture-gap`
 **Origin:** `memory/project_deepseek_capture_gap.md` from the reconciliation session that
@@ -41,8 +43,11 @@ export and found:
    `internal/sink/sink.go`'s own doc comment anticipates this ("callers may inspect the return
    value to log a drop"), but no caller does. `docs/context/architecture.md`'s Fail-open invariant
    #1 states "a capture failure is logged" — true for the consumer's write failures
-   (`consumer.go:218`), **not true for a sink-drop**, which is the one failure mode that would
-   directly produce the "proxy never saw this call" signature the memory describes. Confirmed live:
+   (`consumer.go:218`), **not true for a sink-drop**. Note: the observed 09-21 anomaly shows *over*-counting (105%
+   proxy events, 95% cost) — a sink-drop produces strictly *fewer* rows, not more, so a drop is
+   not the mechanism behind that specific historical shape. Bead 2 is a forward-looking fix that
+   closes a real fail-open gap for future occurrences; it does not explain or repair the
+   historical 09-20→09-23 numbers, whose actual mechanism remains unidentified. Confirmed live:
    `GET /api/health` exposes `sink_dropped`/`consumer_failed`, but both are in-memory and reset on
    every restart — the current process (started after today's migrations) shows `sink_dropped: 0`
    with no way to know what it was during the actual 09-20→09-23 gap window. That window's evidence
@@ -75,9 +80,9 @@ export and found:
 
 | File | Change | Why |
 |---|---|---|
-| `internal/sink/sink.go` | Correct the `CapturedCall.CaptureComplete` doc comment (finding 1) | Stop the comment from asserting behavior the hot path cannot perform; align it with `storage-schema.md`'s already-correct description |
+| `internal/sink/sink.go`, `internal/store/types.go`, `internal/analyze/rules.go`, `internal/analyze/kinds.go`, `internal/web/app.js` | Correct all five doc comments repeating the false claim that `CaptureComplete` can be false because "the SSE stream ended without `message_stop`" (finding 1): `sink.go:41-43`, `store/types.go:74-75`, `rules.go:174-175`, the `KindStreamIncomplete` Description string in `kinds.go:74`, and `app.js:191-193` (`captureMarker`'s doc comment). Note: `docs/context/dashboard.md` and `INDEX.md` both pin `app.js` at exactly 1142 lines; if the corrected comment changes `app.js`'s total line count, those two docs' "1142 lines" figure needs a one-line update (a `grep`/`wc -l` check, not a full context-doc REFRESH pass) in the same commit. | Stop all five from asserting behavior the hot path cannot perform; align them with `storage-schema.md`'s already-correct description — the flag is driven only by the two body-cap `truncated` bits |
 | `internal/proxy/proxy.go` | In `captureState.submit`, keep the `*sink.CapturedCall` in a local variable, check `st.sk.Submit(call)`'s return value, and `log.Printf` a drop with the fields already available at that point (method, path, auth kind, started_at, the call's assigned ID) (finding 2) | Restores the "a capture failure is logged" invariant for the one path it doesn't currently cover; gives the next investigation a timestamped trace instead of an unrecoverable in-memory counter |
-| `internal/proxy/proxy_test.go` | New test: a capacity-1 sink, two sequential requests with nothing draining between them, asserting the second is dropped (`sk.Stats()`) **and** that the redirected standard-library log output contains the drop | Same-bead verification, following this package's existing pattern of redirecting log output in a test (`proxyServer`'s `srv.Config.ErrorLog` redirection is the precedent, though that captures `net/http`'s panic log rather than this package's own `log.Printf`, so this test uses `log.SetOutput` for the standard logger instead) |
+| `internal/proxy/proxy_test.go` | New test: a capacity-1 sink, two sequential requests with nothing draining between them, asserting the second is dropped (`sk.Stats()`) **and** that the redirected standard-library log output contains the drop | Same-bead verification, following this package's existing pattern of redirecting log output in a test (`proxyServer`'s `srv.Config.ErrorLog` redirection is the precedent, though that captures `net/http`'s panic log rather than this package's own `log.Printf`, so this test uses `log.SetOutput` for the standard logger instead; the test saves `log.Writer()`'s current output before `log.SetOutput` and restores it via `t.Cleanup`, matching the same discipline `proxyServer` already applies to `srv.Config.ErrorLog`) |
 
 **Profiler flag — already shipped, not a bead here.** This session was asked to add an optional
 `--pprof-addr` CLI flag as part of this PR. Before implementing it, this branch was fast-forwarded
@@ -95,9 +100,10 @@ new dependency, no new route on the dashboard or proxy listener.
 
 ## Architecture / infrastructure changes
 
-None. Both fixes are within `internal/proxy`'s existing import boundary (`sink` + `config` only —
-`internal/proxy/importguard_test.go` already enforces this and nothing here needs to add an
-import). No config knob, no migration, no workflow change.
+None. Both fixes stay within `internal/proxy`'s existing *internal-package* import boundary
+(`sink` + `config` only — `internal/proxy/importguard_test.go` already enforces this). Bead 2
+adds a stdlib `log` import to `proxy.go`, which the import guard does not restrict. No config
+knob, no migration, no workflow change.
 
 ## Test strategy
 
@@ -106,7 +112,19 @@ import). No config knob, no migration, no workflow change.
 - **Bead 2 (drop logging):** the new test described above is the acceptance check: build
   `sink.New(1)`, issue two requests through the handler without draining the sink between them,
   assert `sk.Stats()` reports `dropped == 1` (this part already passes today — it's the log line
-  that's new), and assert the log capture contains the dropped call's method/path. Existing
+  that's new), and assert the log capture contains the dropped call's method/path. The test request
+  must carry a distinctive JSON body payload as the sentinel — a value not likely to appear in any
+  log line by coincidence; after asserting the log line is non-empty and contains the path, assert
+  with the negative-containment idiom already established in `internal/analyze/rules_test.go:345-347`
+  that the captured log output does **not** contain that distinctive body value:
+  `if strings.Contains(logOutput, sentinel) { t.Errorf("drop log leaked body: %q", logOutput) }`.
+  This turns the security self-review's prose guarantee into an enforced regression test — a lazy
+  `log.Printf("dropped: %+v", call)` struct-dump would carry body content and would fail this check.
+  The `Authorization` header is not a valid sentinel: `redactHeaders` replaces it with the literal
+  `"[redacted]"` at `proxy.go:122`, before `captureState` is constructed, so `ReqHeaders.Authorization`
+  is always `"[redacted]"` inside `submit()` regardless of what the test sends — a negative-containment
+  check on the real header value would pass for any implementation, including a careless struct-dump,
+  providing zero regression coverage. Existing
   `TestFailOpenOnUpstreamFailure` and the rest of `proxy_test.go` continue to cover the invariant
   that a capture failure never reaches the client — this bead only adds visibility, it does not
   change what the client sees.
@@ -163,7 +181,41 @@ internal format, not stable API). Edge case covered: two *sequential* (not concu
 enough to force a capacity-1 sink to drop deterministically — no goroutine-timing flakiness.
 
 **As a security engineer:** The new log line must not leak anything the row-level redaction
-already protects — it should log method, path, timing, and the assigned capture ID, never header
-or body content (which `CapturedCall`'s comments already establish are the values requiring
-redaction upstream of this struct). The bead description says exactly this so implementation
-doesn't accidentally log `call.ReqHeaders` or `call.ReqBody` for convenience.
+already protects — it should log method, path, auth kind, timing, and the assigned capture ID,
+never header or body content (which `CapturedCall`'s comments already establish are the values
+requiring redaction upstream of this struct). The bead description says exactly this so
+implementation doesn't accidentally log `call.ReqHeaders` or `call.ReqBody` for convenience.
+
+## Change History
+
+### v6 (round-6 review — convergence)
+
+- No findings raised. Added `**Status:** converged` to the header block to record that two consecutive clean rounds have been completed and the plan has converged.
+
+### v5 (round-4 review)
+
+- **F4.1 (JUSTIFIED + CONDUCTOR OVERRIDE):** Dropped the `Authorization`-header sentinel option from bead 2's test spec entirely. The sentinel must now be a distinctive JSON body value only. Added explicit rationale in the test spec: `redactHeaders` replaces `Authorization` with `"[redacted]"` at `proxy.go:122` before `captureState` is constructed, so the header value is structurally unreachable inside `submit()` — a negative-containment check on it would always pass regardless of implementation quality and provides zero regression coverage.
+
+### v4 (round-3 review)
+
+- **F3.1 (JUSTIFIED + CONDUCTOR OVERRIDE):** Extended bead-2 test spec to require a negative-containment assertion: the test request must carry a distinctive `Authorization` value or JSON body sentinel; after the positive path/method assertion, the test must assert via `if strings.Contains(logOutput, sentinel) { t.Errorf(...) }` (mirroring `rules_test.go:345-347`) that the drop-log output does not contain that sentinel. Turns the security self-review's prose guarantee into an enforced regression test.
+
+### v3 (round-2 review)
+
+- **F2.1 + CONDUCTOR OVERRIDE:** Widened bead 1 scope to five locations, adding `internal/web/app.js:191-193` (`captureMarker`'s doc comment). Added explicit note in the "What changes" row that `docs/context/dashboard.md` and `INDEX.md` both pin `app.js` at exactly 1142 lines, so if the corrected comment changes `app.js`'s total line count, those two docs' "1142 lines" figure requires a one-line update (grep/wc-l check, not a full REFRESH pass) in the same commit.
+- **F2.2 (REJECTED):** No change — conductor directed this optional footnote be skipped; see round-2 changelog for rebuttal.
+
+### v2 (round-1 review)
+
+- **F1.1 + CONDUCTOR OVERRIDE:** Widened bead 1 scope in "What changes" table from `sink.go`
+  alone to all four stale-comment locations (`sink.go:41-43`, `store/types.go:74-75`,
+  `rules.go:174-175`, `kinds.go:74` Description).
+- **F1.2 (PARTIAL):** Fixed the finding-2 narrative to acknowledge the observed 09-21 signature
+  is over-counting (not under-counting), clarifying bead 2 as a forward-looking fail-open fix
+  rather than the explanation for the historical anomaly.
+- **F1.3 (JUSTIFIED):** Corrected "Architecture / infrastructure changes" to say no new
+  *internal-package* import, while noting bead 2 does add a stdlib `log` import.
+- **F1.4 (JUSTIFIED):** Added `t.Cleanup` restore discipline for `log.SetOutput` to the
+  `proxy_test.go` row description.
+- **F1.5 (JUSTIFIED):** Unified the drop log field list — added "auth kind" to the security
+  self-review section to match the "What changes" table.
