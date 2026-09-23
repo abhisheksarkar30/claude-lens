@@ -5,8 +5,9 @@
 - **Bead ID**: br-GI-13-06
 - **Priority**: P2 (medium)
 - **Original Estimate**: 1h
-- **Dependencies**: br-GI-13-01, br-GI-13-02, br-GI-13-03, br-GI-13-04, br-GI-13-05 (every code change
-  must have landed)
+- **Dependencies**: br-GI-13-01, br-GI-13-02, br-GI-13-03, br-GI-13-04, br-GI-13-05, br-GI-13-07,
+  br-GI-13-08 (every code change must have landed; the last two are post-convergence beads added
+  after this file was written, and the profile must measure them too)
 - **Blocks**: None
 
 > **This bead is a manual verification step, not code.** It has no files to touch and no in-repo test:
@@ -16,7 +17,8 @@
 
 ## Description
 
-After br-GI-13-01…05 land, take the **same 30-second CPU profile**, against the **same store** and
+After br-GI-13-01…05 land — and then br-GI-13-07 and br-GI-13-08, whose fixes this profile is what
+measures — take the **same 30-second CPU profile**, against the **same store** and
 under the **same traffic**, that produced §1's signature:
 
 1. Run `clens serve` with the profiler enabled (`--pprof-addr`/`CLENS_PPROF_ADDR`, br-GI-13-04) against
