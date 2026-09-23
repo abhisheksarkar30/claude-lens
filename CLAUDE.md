@@ -35,8 +35,11 @@ patching it inline:
 - **Ad hoc edit** — at the end of the task, surface that list to the user as a suggestion (name the
   file:line and what's now stale) and offer to update it — don't fix it unprompted.
 - **Under `/develop-story`** — append it to a running "Context docs to refresh" list in the story's
-  plan file (`docs/planning/{ticket-id}-{slug}.md`) as you go; Phase 5.6 consumes that exact list
-  to drive its refresh instead of rediscovering scope from the whole diff.
+  plan file (`docs/planning/{ticket-id}-{slug}.md`) as you go. Phase 5.6 still does its normal
+  full-PR-diff scoping (new/changed/removed entities, endpoints, permissions, flows, modules,
+  conventions across every commit on the branch) — that list is a guaranteed floor on top of it,
+  not a replacement, so a claim spotted mid-story can't fall out of scope if the later diff-based
+  pass misses it.
 
 Skip only when the change is purely internal to the code (nothing a context doc would claim), and
 say so rather than skipping silently.
