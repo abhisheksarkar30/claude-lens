@@ -172,7 +172,7 @@ func ruleRefusal(_ parse.Meta, usage parse.Usage, _ *store.Event) (store.Warning
 
 // ruleStreamIncomplete fires on a streamed response the store recorded as an
 // incomplete capture -- CaptureComplete is false exactly when a body was
-// truncated at the read cap or the SSE stream ended without message_stop.
+// truncated at the read cap.
 //
 // The detail states the disjunction rather than picking a cause, because the
 // rule cannot tell the two apart and this is the only place that ever claimed
