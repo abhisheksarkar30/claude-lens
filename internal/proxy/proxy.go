@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -222,7 +223,7 @@ func (st *captureState) submit(status int, respHeaders http.Header, respBody []b
 	if st.reqBody != nil {
 		reqBody = st.reqBody.Bytes()
 	}
-	st.sk.Submit(&sink.CapturedCall{
+	call := &sink.CapturedCall{
 		StartedAt:       st.start,
 		TTFB:            st.ttfb,
 		Duration:        time.Since(st.start),
@@ -240,7 +241,12 @@ func (st *captureState) submit(status int, respHeaders http.Header, respBody []b
 		ReplayEdits:     st.replayEdits,
 		RequestIDHeader: requestIDHeader(respHeaders),
 		Err:             callErr,
-	})
+	}
+	if !st.sk.Submit(call) {
+		log.Printf("proxy: dropped capture id=%s method=%s path=%s auth=%s started=%s duration=%s",
+			call.ID, call.Method, call.Path, call.AuthKind,
+			call.StartedAt.Format(time.RFC3339Nano), call.Duration)
+	}
 }
 
 // requestIDHeader returns the upstream Request-Id header value, or "" when
