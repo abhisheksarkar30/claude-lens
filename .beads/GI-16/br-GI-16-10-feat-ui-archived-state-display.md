@@ -5,7 +5,7 @@
 - **Bead ID**: br-GI-16-10
 - **Priority**: P2 (medium)
 - **Original Estimate**: 1.5h
-- **Dependencies**: br-GI-16-06 (`Event.BodiesArchived` and hydration). Also edits `internal/web/app.js`/`assets_test.go`, which br-GI-16-01 edits: land after 01 (sequencing only).
+- **Dependencies**: br-GI-16-06 (`Event.BodiesArchived` and hydration), br-GI-16-01 (both edit `internal/web/app.js` and `assets_test.go`; 01 lands first so 10 builds on its guard rewrites).
 - **Blocks**: None
 
 ## Description
