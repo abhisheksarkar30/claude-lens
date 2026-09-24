@@ -11,7 +11,8 @@ import (
 // doctor and serve, br-GI-1-15's six collectors, br-GI-1-17's ten readers and
 // writers, br-GI-9-04's rekey, br-GI-11-03's reprice with br-GI-11-06's
 // reflag (2 + 6 + 10 + 1 + 2 = 21), and br-GI-13-07's backfill-tool-names
-// with br-GI-13-09's shutdown, two post-convergence additions (23). It is
+// with br-GI-13-09's shutdown, two post-convergence additions (23), and
+// br-GI-16-03's restart (24). It is
 // written out rather than derived from the map, because a list derived from
 // the thing under test cannot notice a missing entry.
 var carriedOver = []string{
@@ -27,6 +28,8 @@ var carriedOver = []string{
 	"reprice", "reflag",
 	// br-GI-13-07 / br-GI-13-09, post-convergence additions
 	"backfill-tool-names", "shutdown",
+	// br-GI-16-03
+	"restart",
 }
 
 // TestEveryCarriedOverCommandIsDispatched is the bead's "all 21 subcommands
