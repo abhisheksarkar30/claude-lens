@@ -74,6 +74,9 @@ func runRekey(args []string, w io.Writer) error {
 		fmt.Fprintf(w, "would re-key %d, would leave %d synthetic (no body id), would re-attribute %d, would leave %d unattributed\n",
 			pass1.ReKeyed, pass1.Synthetic, pass2.Reattributed, pass2.Unattributed)
 		fmt.Fprintf(w, "would leave %d dangling replay_of\n", dangling)
+		if pass1.Skipped > 0 {
+			fmt.Fprintf(w, "would skip %d archived row(s) in pass 1 -- run `clens archive restore` first to include them\n", pass1.Skipped)
+		}
 		fmt.Fprintf(w, "would delete %d jsonl-keyed row(s) and re-derive them from the transcripts, re-pricing against the current rate table\n", n)
 		return nil
 	}
@@ -81,6 +84,9 @@ func runRekey(args []string, w io.Writer) error {
 	fmt.Fprintf(w, "pass 1 (proxy body id): re-keyed %d, left %d synthetic (no body id)\n", pass1.ReKeyed, pass1.Synthetic)
 	fmt.Fprintf(w, "pass 2 (proxy session): re-attributed %d, left %d unattributed\n", pass2.Reattributed, pass2.Unattributed)
 	fmt.Fprintf(w, "dangling replay_of: %d\n", dangling)
+	if pass1.Skipped > 0 {
+		fmt.Fprintf(w, "pass 1 skipped %d archived row(s) -- run `clens archive restore` first to include them\n", pass1.Skipped)
+	}
 
 	deleted, err := st.DeleteJSONLKeyedEvents(ctx)
 	if err != nil {

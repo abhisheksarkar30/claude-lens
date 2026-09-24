@@ -937,7 +937,21 @@ func (s *Store) PurgeOlderThan(ctx context.Context, cutoff time.Time) (int64, er
 	if err != nil {
 		return 0, fmt.Errorf("store: PurgeOlderThan: %w", err)
 	}
-	return res.RowsAffected()
+	return s.afterPurge(ctx, res)
+}
+
+// afterPurge reports the deleted count and collects the day-file rows the
+// delete just orphaned (the cascade removed their markers), so a purge leaves no
+// body bytes behind in the archive.
+func (s *Store) afterPurge(ctx context.Context, res sql.Result) (int64, error) {
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if _, err := s.GCArchive(ctx); err != nil {
+		return n, fmt.Errorf("store: purge: archive gc: %w", err)
+	}
+	return n, nil
 }
 
 // CountPurgeable counts the events PurgeOlderThan(cutoff) would delete.
@@ -950,17 +964,71 @@ func (s *Store) CountPurgeable(ctx context.Context, cutoff time.Time) (int, erro
 	return n, nil
 }
 
-// PurgeableBytes estimates the body bytes PurgeOlderThan(cutoff) would free.
-func (s *Store) PurgeableBytes(ctx context.Context, cutoff time.Time) (int64, error) {
+// PurgeableBytes estimates the body bytes PurgeOlderThan(cutoff) would free:
+// the hot bodies plus the archived req_len+resp_len of every marked row, one day
+// file opened per day. A day file that is missing or unreadable is skipped and
+// counted in skippedDays rather than failing the estimate.
+func (s *Store) PurgeableBytes(ctx context.Context, cutoff time.Time) (bytes int64, skippedDays int, err error) {
 	var n sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `
+	err = s.db.QueryRowContext(ctx, `
 		SELECT SUM(COALESCE(LENGTH(req_body), 0) + COALESCE(LENGTH(resp_body), 0))
 		FROM events WHERE started_at < ?
 	`, cutoff.UnixNano()).Scan(&n)
 	if err != nil {
-		return 0, fmt.Errorf("store: PurgeableBytes: %w", err)
+		return 0, 0, fmt.Errorf("store: PurgeableBytes: %w", err)
 	}
-	return n.Int64, nil
+	bytes = n.Int64
+
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT a.day, a.event_id FROM body_archive a JOIN events e ON e.id = a.event_id
+		WHERE e.started_at < ? ORDER BY a.day`, cutoff.UnixNano())
+	if err != nil {
+		return 0, 0, fmt.Errorf("store: PurgeableBytes: markers: %w", err)
+	}
+	byDay := map[string][]int64{}
+	for rows.Next() {
+		var day string
+		var id int64
+		if err := rows.Scan(&day, &id); err != nil {
+			rows.Close()
+			return 0, 0, fmt.Errorf("store: PurgeableBytes: %w", err)
+		}
+		byDay[day] = append(byDay[day], id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, 0, err
+	}
+	for day, ids := range byDay {
+		if !validDay(day) {
+			skippedDays++
+			continue
+		}
+		path := s.dayPath(day)
+		if _, statErr := os.Stat(path); statErr != nil {
+			skippedDays++
+			continue
+		}
+		var dayBytes int64
+		werr := s.arch.with(path, func(db *sql.DB) error {
+			for i := 0; i < len(ids); i += 500 {
+				chunk := ids[i:min(i+500, len(ids))]
+				var sum sql.NullInt64
+				q := `SELECT SUM(COALESCE(req_len, 0) + COALESCE(resp_len, 0)) FROM bodies WHERE event_id IN (` + placeholders(len(chunk)) + `)`
+				if err := db.QueryRowContext(ctx, q, idArgs(chunk)...).Scan(&sum); err != nil {
+					return err
+				}
+				dayBytes += sum.Int64
+			}
+			return nil
+		})
+		if werr != nil {
+			skippedDays++
+			continue
+		}
+		bytes += dayBytes
+	}
+	return bytes, skippedDays, nil
 }
 
 // PurgeUnpriced deletes every event whose cost_source is "unpriced",
@@ -970,7 +1038,7 @@ func (s *Store) PurgeUnpriced(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("store: PurgeUnpriced: %w", err)
 	}
-	return res.RowsAffected()
+	return s.afterPurge(ctx, res)
 }
 
 // Vacuum runs SQLite's VACUUM to reclaim space after a purge.
@@ -1359,7 +1427,10 @@ func EncodeToolNames(names []string) string {
 // must also backfill ToolNames (see mergeEvents), and this is what makes an
 // unset ToolNames on a body-less row write NULL rather than an empty string.
 func reqToolNamesArg(ev *Event) any {
-	if len(ev.ReqBody) == 0 {
+	// An archived request body counts as present: the merge write-back reloads
+	// a row whose req_body column is already cleared, and NULLing its tool
+	// names there would break the contract on exactly the rows that keep it.
+	if len(ev.ReqBody) == 0 && ev.ArchivedBodyMask&MaskReqBody == 0 {
 		return nil
 	}
 	return ev.ToolNames
@@ -1489,8 +1560,8 @@ func (v *eventScanVals) apply(es *EventSummary) {
 	es.Method = v.method.String
 	es.Path = v.path.String
 	es.Status = int(v.status.Int64)
-	// req_tool_names is NULL exactly when the row has no request body (the
-	// column's own contract, schema.sql); Valid is therefore HasReqBody
+	// req_tool_names is NULL exactly when the call had no request body, hot or
+	// archived (the column's own contract, schema.sql); Valid is therefore HasReqBody
 	// itself, not a separate derivation.
 	es.HasReqBody = v.reqToolNames.Valid
 	es.ToolNames = v.reqToolNames.String
@@ -1702,9 +1773,15 @@ func (s *Store) StatsByCostSource(ctx context.Context, filter EventFilter) ([]Co
 // RekeyPass1Report is pass 1's dry-run/live count pair: ReKeyed is N (a
 // body-id was read), Synthetic is M (it was not, so the row keeps its
 // "proxy:" key forever).
+//
+// Skipped is the rows left untouched because their bodies live in the archive
+// (a body_archive marker): re-keying one would need its resp_body, and an
+// absorbing merge could not carry the archived bytes across. The remedy is
+// `clens archive restore` first.
 type RekeyPass1Report struct {
 	ReKeyed   int
 	Synthetic int
+	Skipped   int
 }
 
 // RekeyProxyBodyIDs is pass 1: every "proxy:"-keyed row's true identity is
@@ -1734,8 +1811,17 @@ func (s *Store) RekeyProxyBodyIDs(ctx context.Context, bodyCapBytes int, dryRun 
 	}
 	rows.Close()
 
+	archived, err := s.archivedEventIDs(ctx)
+	if err != nil {
+		return RekeyPass1Report{}, fmt.Errorf("store: RekeyProxyBodyIDs: markers: %w", err)
+	}
+
 	var report RekeyPass1Report
 	for _, ev := range candidates {
+		if archived[ev.ID] {
+			report.Skipped++
+			continue
+		}
 		id := rekeyBodyMessageID(ev, bodyCapBytes)
 		if id == "" {
 			report.Synthetic++
@@ -1750,6 +1836,24 @@ func (s *Store) RekeyProxyBodyIDs(ctx context.Context, bodyCapBytes int, dryRun 
 		}
 	}
 	return report, nil
+}
+
+// archivedEventIDs is the set of events carrying a body_archive marker.
+func (s *Store) archivedEventIDs(ctx context.Context) (map[int64]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT event_id FROM body_archive`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
 }
 
 // rekeyBodyMessageID reads ev's true identity out of its own stored
@@ -1986,7 +2090,7 @@ func (s *Store) DeleteJSONLKeyedEvents(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("store: DeleteJSONLKeyedEvents: %w", err)
 	}
-	return res.RowsAffected()
+	return s.afterPurge(ctx, res)
 }
 
 // DanglingReplayOfCount reports how many rows' replay_of names an id no
@@ -2242,7 +2346,11 @@ func (s *Store) RepriceCosts(ctx context.Context, table PriceComputer, dryRun bo
 // ever assigns it, so `instr(source_refs,'proxy') > 0` alone drops every
 // unmerged proxy row, while `source = 'proxy'` alone misses the rows a merge
 // re-sourced.
-const reflagScope = `(source = 'proxy' OR instr(source_refs, 'proxy') > 0)`
+//
+// Archived rows (a body_archive marker) are excluded: their prefix witness needs
+// the body length, which the hot row no longer holds. ReflagCounts.Archived
+// reports how many were left out.
+const reflagScope = `(source = 'proxy' OR instr(source_refs, 'proxy') > 0) AND NOT EXISTS (SELECT 1 FROM body_archive ba WHERE ba.event_id = events.id)`
 
 // capturePrefixWitness is the one witness predicate: a stored body that is a
 // strict prefix of the client Content-Length it was captured against, on
@@ -2272,6 +2380,7 @@ type ReflagCounts struct {
 	Flipped       int // capture_complete=1 with a provable prefix witness
 	AlreadyHonest int // capture_complete=0 already
 	Residual      int // capture_complete=1, warned, and no provable witness
+	Archived      int // in the proxy scope but archived, so not considered
 }
 
 // ReflagIncompleteCaptures repairs the capture_complete flags a cross-source
@@ -2319,6 +2428,12 @@ func (s *Store) ReflagIncompleteCaptures(ctx context.Context, dryRun bool) (Refl
 		FROM events WHERE `+reflagScope,
 	).Scan(&counts.Flipped, &counts.AlreadyHonest, &counts.Residual); err != nil {
 		return counts, fmt.Errorf("store: ReflagIncompleteCaptures: count: %w", err)
+	}
+
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM events WHERE (source = 'proxy' OR instr(source_refs, 'proxy') > 0)
+		AND EXISTS (SELECT 1 FROM body_archive ba WHERE ba.event_id = events.id)`).Scan(&counts.Archived); err != nil {
+		return counts, fmt.Errorf("store: ReflagIncompleteCaptures: archived count: %w", err)
 	}
 
 	if dryRun {
