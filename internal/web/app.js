@@ -360,6 +360,24 @@ function mountWindowPicker(granSel, valueInput, freeLabels, onChange) {
 
 const callState = { offset: 0, limit: 50 };
 
+// customWindow turns the Calls from/to hour pickers into a since/until pair.
+// Both bounds go through timeWindow('hour', ...) -- the one place the +-hh:mm
+// offset is built -- so the range is inclusive of the hour picked at each end
+// and agrees with the Stats tab. One side empty leaves that side open; an
+// inverted range applies no window and says so.
+function customWindow(fromVal, toVal) {
+  const msg = $('c-range-msg');
+  const from = timeWindow('hour', fromVal);
+  const to = timeWindow('hour', toVal);
+  msg.textContent = '';
+  if (from && to && new Date(to.until) <= new Date(from.since)) {
+    msg.textContent = '"to" is before "from" -- no window applied';
+    return null;
+  }
+  if (!from && !to) return null;
+  return { since: from && from.since, until: to && to.until };
+}
+
 function callFilter() {
   const q = new URLSearchParams();
   const src = $('f-source').value.trim();
@@ -368,10 +386,13 @@ function callFilter() {
   if (src) q.set('source', src);
   if (model) q.set('model', model);
   if (billing) q.set('billing_mode', billing);
-  const win = timeWindow($('c-window-gran').value, $('c-window-value').value);
+  const gran = $('c-window-gran').value;
+  const win = gran === 'custom'
+    ? customWindow($('c-from').value, $('c-to').value)
+    : timeWindow(gran, $('c-window-value').value);
   if (win) {
-    q.set('since', win.since);
-    q.set('until', win.until);
+    if (win.since) q.set('since', win.since);
+    if (win.until) q.set('until', win.until);
   }
   q.set('limit', String(callState.limit));
   q.set('offset', String(callState.offset));
@@ -1040,10 +1061,14 @@ $('calls-next').addEventListener('click', () => {
 // A picker change reloads on its own -- there is nothing to compose, unlike the
 // free-text pair beside it, which keeps the Apply button. Both mounts reset the
 // pager first: page 4 of the old window is not page 4 of the new one.
-mountWindowPicker($('c-window-gran'), $('c-window-value'), [], () => {
+const callsReload = () => {
   callState.offset = 0;
   loadCalls();
-});
+};
+mountWindowPicker($('c-window-gran'), $('c-window-value'),
+  [$('c-from').closest('label'), $('c-to').closest('label')], callsReload);
+$('c-from').addEventListener('change', callsReload);
+$('c-to').addEventListener('change', callsReload);
 mountWindowPicker($('s-window-gran'), $('s-window-value'),
   [$('s-since').closest('label'), $('s-until').closest('label')], loadStats);
 $('s-apply').addEventListener('click', loadStats);

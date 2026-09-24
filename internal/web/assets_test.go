@@ -621,13 +621,15 @@ func TestAssetsTimeWindowBuildsTheOffsetByHand(t *testing.T) {
 
 // TestAssetsThePickerMountsBothTabs pins the wiring an id-existence check
 // cannot see: that both tabs actually route their bounds through timeWindow,
-// that only Stats offers `custom`, and that Stats keeps its free-text pair.
+// that both offer `custom` (Calls with a from/to datetime-local pair, Stats
+// with its free-text pair), and that Stats keeps its free-text pair.
 //
 // Each of those is an Outcome Definition clause with no other coverage. A
 // picker mounted but never consulted would leave the id guard green and the
-// filter dead; a `custom` option on Calls would be a control offering a
-// capability that tab does not have; and dropping the free-text inputs would
-// silently narrow `24h` and arbitrary RFC3339 ranges out of existence.
+// filter dead; a `custom` option on Calls whose from/to inputs are unmounted
+// or unread would be a control that filters nothing; and dropping the
+// free-text inputs would silently narrow `24h` and arbitrary RFC3339 ranges
+// out of existence.
 func TestAssetsThePickerMountsBothTabs(t *testing.T) {
 	js := readAsset(t, "app.js")
 	html := readAsset(t, "index.html")
@@ -642,6 +644,22 @@ func TestAssetsThePickerMountsBothTabs(t *testing.T) {
 		}
 	}
 
+	// Calls `custom`: callFilter reaches customWindow, which builds both bounds
+	// through timeWindow (the one place the offset is built) and never toISOString.
+	if body, _ := funcBody(js, "callFilter"); !strings.Contains(body, "customWindow(") {
+		t.Error("callFilter never calls customWindow(): the Calls `custom` option is offered but not applied")
+	}
+	cw, ok := funcBody(js, "customWindow")
+	if !ok {
+		t.Fatal("app.js has no top-level customWindow")
+	}
+	if strings.Count(cw, "timeWindow(") < 2 {
+		t.Error("customWindow must call timeWindow() for each bound, not build its own offset")
+	}
+	if strings.Contains(cw, "toISOString") {
+		t.Error("customWindow calls toISOString(), which emits a trailing Z and shifts the window by the zone offset")
+	}
+
 	// The option sets, sliced per select so the two cannot be confused.
 	callsOpts, ok := selectOptions(html, "c-window-gran")
 	if !ok {
@@ -651,8 +669,23 @@ func TestAssetsThePickerMountsBothTabs(t *testing.T) {
 	if !ok {
 		t.Fatal("index.html has no s-window-gran select")
 	}
-	if strings.Contains(callsOpts, `value="custom"`) {
-		t.Error("the Calls picker offers `custom`, but that row has no free-text pair for it to reveal: a selectable entry that filters nothing is a dead control")
+	if !strings.Contains(callsOpts, `value="custom"`) {
+		t.Error("the Calls picker has no `custom` option, so its from/to range is unreachable")
+	}
+	for _, id := range []string{"c-from", "c-to"} {
+		tag := `id="` + id + `" type="datetime-local"`
+		i := strings.Index(html, tag)
+		if i < 0 {
+			t.Errorf("index.html does not mount %s as a datetime-local input", id)
+			continue
+		}
+		// A `hidden` on the input itself is permanent; the labels carry it.
+		if end := strings.Index(html[i:], ">"); strings.Contains(html[i:i+end], "hidden") {
+			t.Errorf("%s carries `hidden` itself: un-hiding its label would never reveal it", id)
+		}
+	}
+	if !strings.Contains(js, "$('c-from').closest('label'), $('c-to').closest('label')") {
+		t.Error("the Calls mountWindowPicker is not given the from/to labels as freeLabels")
 	}
 	if !strings.Contains(statsOpts, `value="custom"`) {
 		t.Error("the Stats picker has no `custom` option, so the retained free-text pair is unreachable")
@@ -666,9 +699,8 @@ func TestAssetsThePickerMountsBothTabs(t *testing.T) {
 	// while timeWindow() returns null -- the value input is empty, and the
 	// function's own `if (!gran || !value) return null` makes that the same
 	// no-window path. The control would be advertising a granularity it is not
-	// applying, which is the dead-option misdescription the Calls mount already
-	// avoids by omitting `custom`. Stats' `custom` is the deliberate exception:
-	// it is what reveals the free-text pair.
+	// applying. `custom` is safe on both because it reveals a from/to pair, so
+	// it is never the dead option; it is still not the default on Calls.
 	if strings.Contains(callsOpts, "selected") {
 		t.Error("the Calls picker marks an option `selected`: its default must be the neutral \"any time\" (the first, empty-valued option), or the select displays a granularity that is not being applied")
 	}
