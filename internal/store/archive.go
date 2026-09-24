@@ -175,6 +175,15 @@ func validDay(day string) bool {
 // INSERT OR REPLACE -- that deletes then inserts and would lose a wider
 // writer's column.
 func (s *Store) writeDayRows(day string, rows []archiveRow) error {
+	return s.writeDay(day, rows, false, nil)
+}
+
+// writeDay is writeDayRows plus, when verify is set, a read-back inside the same
+// archive transaction and before commit: every written column's recorded length
+// and the mask must match what was just written, or the transaction is rolled
+// back. hook (tests) is called with 2 after the upserts and 3 after the commit;
+// an error from it aborts, which is how a crash between the steps is simulated.
+func (s *Store) writeDay(day string, rows []archiveRow, verify bool, hook func(step int) error) error {
 	if !validDay(day) {
 		return fmt.Errorf("store: archive: bad day %q", day)
 	}
@@ -225,8 +234,45 @@ func (s *Store) writeDayRows(day string, rows []archiveRow) error {
 			return fmt.Errorf("store: archive: event %d: %w", r.EventID, err)
 		}
 	}
+	if hook != nil {
+		if err := hook(2); err != nil {
+			return err
+		}
+	}
+	if verify {
+		if err := verifyDayRows(tx, rows); err != nil {
+			return err
+		}
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: archive: %w", err)
+	}
+	if hook != nil {
+		return hook(3)
+	}
+	return nil
+}
+
+// verifyDayRows reads back what writeDay just wrote, in the same transaction.
+func verifyDayRows(tx *sql.Tx, rows []archiveRow) error {
+	for _, r := range rows {
+		var mask int64
+		var rl, pl, tl sql.NullInt64
+		if err := tx.QueryRow(`SELECT body_mask, req_len, resp_len, tc_len FROM bodies WHERE event_id = ?`, r.EventID).
+			Scan(&mask, &rl, &pl, &tl); err != nil {
+			return fmt.Errorf("store: archive: verify event %d: %w", r.EventID, err)
+		}
+		if uint8(mask)&r.mask() != r.mask() {
+			return fmt.Errorf("store: archive: verify event %d: mask %d does not cover %d", r.EventID, mask, r.mask())
+		}
+		for _, c := range []struct {
+			got  sql.NullInt64
+			want []byte
+		}{{rl, r.ReqBody}, {pl, r.RespBody}, {tl, r.TranscriptContent}} {
+			if c.want != nil && (!c.got.Valid || c.got.Int64 != int64(len(c.want))) {
+				return fmt.Errorf("store: archive: verify event %d: length read back %v, wrote %d", r.EventID, c.got, len(c.want))
+			}
+		}
 	}
 	return nil
 }
