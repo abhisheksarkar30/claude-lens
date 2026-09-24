@@ -208,6 +208,27 @@ func TestReloadAppliesHotDays(t *testing.T) {
 	}
 }
 
+// Both HotDays and RetentionDays changing together must both appear in Applied
+// and both live values must update — confirming they are applied under one lock.
+func TestReloadAppliesHotDaysAndRetentionDaysTogether(t *testing.T) {
+	boot := config.Config{RetentionDays: 30, HotDays: 7}
+	next := boot
+	next.RetentionDays = 14
+	next.HotDays = 3
+	rl, _ := testReloader(boot, &next, nil)
+	rep, err := rl.Reload(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rep.Applied, []string{"HotDays", "RetentionDays"}) {
+		t.Fatalf("rep.Applied = %v, want [HotDays RetentionDays]", rep.Applied)
+	}
+	if rl.live.HotDays() != 3 || rl.live.RetentionDays() != 14 {
+		t.Fatalf("live: hot=%d retention=%d, want hot=3 retention=14",
+			rl.live.HotDays(), rl.live.RetentionDays())
+	}
+}
+
 // An invalid HotDays (beyond retention) is refused by the loader, so nothing
 // is applied.
 func TestReloadRejectsHotDaysBeyondRetention(t *testing.T) {

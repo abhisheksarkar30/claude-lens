@@ -393,6 +393,7 @@ function customWindow(fromVal, toVal) {
 }
 
 function callFilter() {
+  $('c-range-msg').textContent = '';
   const q = new URLSearchParams();
   const src = $('f-source').value.trim();
   const model = $('f-model').value.trim();

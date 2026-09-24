@@ -104,6 +104,16 @@ func runRestart(args []string, w io.Writer, spawn spawner) error {
 		if err := waitClosed(timeout, dash, proxy); err != nil {
 			return fmt.Errorf("restart: %w", err)
 		}
+		// The ports close before the consumer's final flush, so a refused dial does
+		// not mean the old process is done with the database. serve removes its
+		// state file only after that drain, so wait for it -- otherwise a new
+		// binary that migrates the schema could start under a still-flushing one.
+		if havePrev && !poll(timeout, func() bool {
+			cur, ok, _ := readServeState(cfg.DBPath)
+			return !ok || cur.PID != prev.PID
+		}) {
+			return fmt.Errorf("restart: the old process (pid %d) closed its ports but has not finished draining within %s", prev.PID, timeout)
+		}
 	} else {
 		fmt.Fprintln(w, "was not running; starting it")
 	}
@@ -130,10 +140,10 @@ func runRestart(args []string, w io.Writer, spawn spawner) error {
 		return fmt.Errorf("restart: %w; the previous exe is unknown, so nothing was rolled back and nothing is serving", err)
 	}
 	fmt.Fprintf(w, "rolling back to %s\n", prev.Exe)
-	if _, _, rerr := spawn(prev.Exe, prev.Args, prev.LogPath); rerr == nil && waitHealthy(dash, timeout) {
+	if _, _, rerr := spawn(prev.Exe, prev.Args, logPath); rerr == nil && waitHealthy(dash, timeout) {
 		return fmt.Errorf("restart: %w; rolled back, the PREVIOUS binary %s is serving", err, prev.Exe)
 	}
-	printLogTail(w, prev.LogPath)
+	printLogTail(w, logPath)
 	return fmt.Errorf("restart: %w; rollback to %s also failed, nothing is serving", err, prev.Exe)
 }
 

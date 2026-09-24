@@ -221,6 +221,33 @@ func TestRestartRollbackImpossibleWithoutPreviousExe(t *testing.T) {
 	}
 }
 
+// A state file with an empty log_path must not cause the rollback spawn to fail
+// on OpenFile(""). The restart command resolves the path to defaultLogPath before
+// spawning, so both the first spawn and any rollback use the resolved path.
+func TestRestartRollbackUsesResolvedLogPathWhenStateFileHasNone(t *testing.T) {
+	r := newRig(t)
+	// Write a state file with no LogPath (simulates an older version or a
+	// hand-crafted file).
+	s := serveState{
+		PID: 1, Exe: "old.exe", Args: []string{"serve"},
+		DashboardAddr: r.dash, ProxyAddr: r.proxy, LogPath: "",
+	}
+	if err := writeServeState(r.db, s); err != nil {
+		t.Fatal(err)
+	}
+	r.startRunning()
+	out, err := runRig(r, r.spawner(map[string]bool{"old.exe": true}), "--exe", "new.exe", "--timeout", "2s")
+	if err == nil || !strings.Contains(err.Error(), "PREVIOUS binary old.exe") {
+		t.Fatalf("err = %v, want rollback naming old.exe\n%s", err, out)
+	}
+	// Both spawns must have received a non-empty log path.
+	for i, c := range r.calls {
+		if c.log == "" {
+			t.Fatalf("spawn call[%d] received empty log path; spawnDetached would fail on OpenFile(\"\")", i)
+		}
+	}
+}
+
 func TestRestartTimesOutWaitingForPortsToClose(t *testing.T) {
 	r := newRig(t)
 	r.writeState("old.exe", "serve")
@@ -309,5 +336,31 @@ func TestSpawnDetachedChildSurvivesParentExit(t *testing.T) {
 	}
 	if err := p.Kill(); err != nil {
 		t.Fatalf("child %d did not survive its parent's exit: %v", pid, err)
+	}
+}
+
+// The ports close before serve's final flush, so restart must also wait for the
+// state file (removed only after the drain) before it starts the successor.
+func TestRestartWaitsForTheOldProcessToFinishDraining(t *testing.T) {
+	r := newRig(t)
+	r.writeState("old.exe", "serve")
+	// Ports close at once; the state file lingers as if the consumer were still flushing.
+	startFake(t, r.dash, r.proxy, false, func() {
+		go func() {
+			time.Sleep(700 * time.Millisecond)
+			removeServeState(r.db, 1)
+		}()
+	})
+	stateAtSpawn := true
+	sp := func(exe string, args []string, logPath string) (int, func(), error) {
+		_, stateAtSpawn, _ = readServeState(r.db)
+		startFake(t, r.dash, r.proxy, false, nil)
+		return 1234, func() {}, nil
+	}
+	if out, err := runRig(r, sp, "--timeout", "10s"); err != nil {
+		t.Fatalf("restart: %v\n%s", err, out)
+	}
+	if stateAtSpawn {
+		t.Fatal("the successor was started while the old process's state file still existed, i.e. before it finished draining")
 	}
 }

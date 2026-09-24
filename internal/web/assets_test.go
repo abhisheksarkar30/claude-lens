@@ -661,8 +661,15 @@ func TestAssetsThePickerMountsBothTabs(t *testing.T) {
 
 	// Calls `custom`: callFilter reaches customWindow, which builds both bounds
 	// through timeWindow (the one place the offset is built) and never toISOString.
-	if body, _ := funcBody(js, "callFilter"); !strings.Contains(body, "customWindow(") {
+	cfBody, _ := funcBody(js, "callFilter")
+	if !strings.Contains(cfBody, "customWindow(") {
 		t.Error("callFilter never calls customWindow(): the Calls `custom` option is offered but not applied")
+	}
+	// callFilter must clear the range message before building the filter so a
+	// stale inverted-range error from a previous custom selection does not
+	// persist after switching to any-time or a preset.
+	if !strings.Contains(cfBody, "c-range-msg") {
+		t.Error("callFilter does not clear c-range-msg; a stale inverted-range message outlives a switch to any-time")
 	}
 	cw, ok := funcBody(js, "customWindow")
 	if !ok {

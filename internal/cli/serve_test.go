@@ -302,6 +302,43 @@ func TestProxyModeObservedWindow(t *testing.T) {
 	}
 }
 
+// TestSchedulerArchivesAfterPurgeNotOnBootPath reads serve.go to verify the two
+// ordering requirements from bead br-GI-16-09:
+//  1. The boot archiver run is a goroutine (never blocks the boot path).
+//  2. In the 24-hour ticker branch, archiveCycle comes after purgeOnStartup.
+//
+// Source-shape guard: ordering is static code and cannot be verified by any
+// runtime test without either injecting a hook into Serve or seeding a
+// multi-day backlog, so a regression would otherwise be invisible.
+func TestSchedulerArchivesAfterPurgeNotOnBootPath(t *testing.T) {
+	src, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatalf("read serve.go: %v", err)
+	}
+	s := strings.ReplaceAll(string(src), "\r\n", "\n")
+
+	// Boot: the archiver is launched as a goroutine so it never delays capture.
+	if !strings.Contains(s, "go archiveCycle(") {
+		t.Error("boot archiveCycle must be a goroutine (go archiveCycle); currently blocks the boot path")
+	}
+
+	// Ticker: in the purgeTicker.C branch, purgeOnStartup must appear before archiveCycle.
+	tickerPos := strings.Index(s, "purgeTicker.C")
+	if tickerPos < 0 {
+		t.Fatal("serve.go has no purgeTicker.C case; scheduler may have been removed")
+	}
+	tickerBody := s[tickerPos:]
+	purgePos := strings.Index(tickerBody, "purgeOnStartup(")
+	archivePos := strings.Index(tickerBody, "archiveCycle(")
+	if purgePos < 0 || archivePos < 0 {
+		t.Error("ticker branch is missing purgeOnStartup or archiveCycle")
+		return
+	}
+	if purgePos > archivePos {
+		t.Error("ticker branch: archiveCycle appears before purgeOnStartup; scheduler ordering is wrong")
+	}
+}
+
 // checkRedaction runs on the boot path and reads up to redactScanLimit full
 // rows. It must never decompress an archive to do it: the redaction check reads
 // headers, and headers are never archived. A source-shape guard, because the

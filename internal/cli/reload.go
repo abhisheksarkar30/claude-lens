@@ -36,6 +36,15 @@ func (l *liveSettings) HotDays() int {
 	return l.hotDays
 }
 
+// set writes both live fields under a single lock acquisition so a reader
+// can never see the new HotDays with the old RetentionDays (or vice-versa).
+func (l *liveSettings) set(retentionDays, hotDays int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.retentionDays = retentionDays
+	l.hotDays = hotDays
+}
+
 // reloader re-reads the config and applies the live-safe subset: exactly
 // Accounts, RetentionDays and HotDays. Prices already hot-reload through their own
 // loader. All-or-nothing: the new config is fully loaded and validated before
@@ -101,17 +110,15 @@ func (r *reloader) Reload(context.Context) (api.ReloadReport, error) {
 		r.accounts = next.Accounts
 		rep.Applied = append(rep.Applied, "Accounts")
 	}
-	if next.HotDays != r.live.HotDays() {
-		r.live.mu.Lock()
-		r.live.hotDays = next.HotDays
-		r.live.mu.Unlock()
-		rep.Applied = append(rep.Applied, "HotDays")
-	}
-	if retentionChanged {
-		r.live.mu.Lock()
-		r.live.retentionDays = next.RetentionDays
-		r.live.mu.Unlock()
-		rep.Applied = append(rep.Applied, "RetentionDays")
+	hotChanged := next.HotDays != r.live.HotDays()
+	if hotChanged || retentionChanged {
+		r.live.set(next.RetentionDays, next.HotDays)
+		if hotChanged {
+			rep.Applied = append(rep.Applied, "HotDays")
+		}
+		if retentionChanged {
+			rep.Applied = append(rep.Applied, "RetentionDays")
+		}
 	}
 	rep.Unchanged = len(rep.Applied) == 0 && len(rep.RestartRequired) == 0
 	return rep, nil
