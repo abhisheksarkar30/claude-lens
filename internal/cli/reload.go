@@ -21,6 +21,7 @@ import (
 type liveSettings struct {
 	mu            sync.RWMutex
 	retentionDays int
+	hotDays       int
 }
 
 func (l *liveSettings) RetentionDays() int {
@@ -29,8 +30,14 @@ func (l *liveSettings) RetentionDays() int {
 	return l.retentionDays
 }
 
+func (l *liveSettings) HotDays() int {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	return l.hotDays
+}
+
 // reloader re-reads the config and applies the live-safe subset: exactly
-// Accounts and RetentionDays. Prices already hot-reload through their own
+// Accounts, RetentionDays and HotDays. Prices already hot-reload through their own
 // loader. All-or-nothing: the new config is fully loaded and validated before
 // anything is applied.
 type reloader struct {
@@ -62,7 +69,7 @@ func newReloader(bootArgs []string, boot *config.Config, live *liveSettings, set
 
 // liveFields are the only settings applied live; every other differing field
 // is reported as restart_required.
-var liveFields = map[string]bool{"Accounts": true, "RetentionDays": true}
+var liveFields = map[string]bool{"Accounts": true, "RetentionDays": true, "HotDays": true}
 
 // Accounts is the currently applied account list, which a reload can change.
 func (r *reloader) Accounts() []config.Account {
@@ -93,6 +100,12 @@ func (r *reloader) Reload(context.Context) (api.ReloadReport, error) {
 		r.setAccounts(next.Accounts)
 		r.accounts = next.Accounts
 		rep.Applied = append(rep.Applied, "Accounts")
+	}
+	if next.HotDays != r.live.HotDays() {
+		r.live.mu.Lock()
+		r.live.hotDays = next.HotDays
+		r.live.mu.Unlock()
+		rep.Applied = append(rep.Applied, "HotDays")
 	}
 	if retentionChanged {
 		r.live.mu.Lock()

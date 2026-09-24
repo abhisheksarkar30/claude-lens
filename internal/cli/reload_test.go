@@ -29,7 +29,7 @@ func testReloader(boot config.Config, next *config.Config, loadErr *error) (*rel
 			return &c, nil
 		},
 		boot: boot, accounts: boot.Accounts,
-		live:        &liveSettings{retentionDays: boot.RetentionDays},
+		live:        &liveSettings{retentionDays: boot.RetentionDays, hotDays: boot.HotDays},
 		setAccounts: func(a []config.Account) { swapped = a },
 	}
 	return rl, &swapped
@@ -99,7 +99,7 @@ func TestReloadKeepsBootFlags(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rl := newReloader(args, boot, &liveSettings{retentionDays: boot.RetentionDays}, func([]config.Account) {})
+	rl := newReloader(args, boot, &liveSettings{retentionDays: boot.RetentionDays, hotDays: boot.HotDays}, func([]config.Account) {})
 	rep, err := rl.Reload(context.Background())
 	if err != nil || !rep.Unchanged {
 		t.Fatalf("rep %+v err %v, want unchanged with the boot flags honoured", rep, err)
@@ -183,5 +183,42 @@ func TestReloadAppliesAccountsToARunningServe(t *testing.T) {
 	case <-done:
 	case <-time.After(15 * time.Second):
 		t.Fatal("serve did not stop")
+	}
+}
+
+// HotDays is the third live-applied field: reported under applied, and read by
+// the archiver on its next cycle.
+func TestReloadAppliesHotDays(t *testing.T) {
+	boot := config.Config{RetentionDays: 30, HotDays: 7}
+	next := boot
+	next.HotDays = 3
+	rl, _ := testReloader(boot, &next, nil)
+	rep, err := rl.Reload(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(rep.Applied, []string{"HotDays"}) || len(rep.RestartRequired) != 0 {
+		t.Fatalf("rep = %+v, want HotDays applied and nothing restart-required", rep)
+	}
+	if rl.live.HotDays() != 3 {
+		t.Fatalf("live HotDays = %d, want 3", rl.live.HotDays())
+	}
+	if rep, _ := rl.Reload(context.Background()); !rep.Unchanged {
+		t.Fatalf("second reload rep = %+v, want unchanged", rep)
+	}
+}
+
+// An invalid HotDays (beyond retention) is refused by the loader, so nothing
+// is applied.
+func TestReloadRejectsHotDaysBeyondRetention(t *testing.T) {
+	withHome(t)
+	boot := config.Config{RetentionDays: 30, HotDays: 7}
+	live := &liveSettings{retentionDays: 30, hotDays: 7}
+	rl := newReloader([]string{"--retention-days", "5", "--hot-days", "9"}, &boot, live, func([]config.Account) {})
+	if _, err := rl.Reload(context.Background()); err == nil {
+		t.Fatal("hot_days > retention_days must be rejected")
+	}
+	if live.HotDays() != 7 || live.RetentionDays() != 30 {
+		t.Fatalf("a rejected reload changed state: hot %d retention %d", live.HotDays(), live.RetentionDays())
 	}
 }

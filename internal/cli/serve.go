@@ -74,7 +74,7 @@ func Serve(args []string) error {
 	// open", CLAUDE.md).
 	checkRedaction(ctx, st, log.Printf)
 	purgeOnStartup(ctx, st, cfg.RetentionDays, log.Printf)
-	live := &liveSettings{retentionDays: cfg.RetentionDays}
+	live := &liveSettings{retentionDays: cfg.RetentionDays, hotDays: cfg.HotDays}
 
 	sk := sink.New(sink.DefaultCapacity)
 	broker := api.NewBroker()
@@ -282,6 +282,10 @@ func Serve(args []string) error {
 	// The 24-hour ticker alongside the startup run: a tool opened and closed
 	// around work sessions may never see a 24-hour boundary on its own, but a
 	// long-lived process should not purge only once.
+	// The archiver's boot run starts here, after both listeners are up and after
+	// the boot purge above, so it never delays capture or the boot self-tests.
+	go archiveCycle(ctx, st, live.HotDays, log.Printf)
+
 	purgeTicker := time.NewTicker(24 * time.Hour)
 	defer purgeTicker.Stop()
 	go func() {
@@ -291,6 +295,7 @@ func Serve(args []string) error {
 				return
 			case <-purgeTicker.C:
 				purgeOnStartup(ctx, st, live.RetentionDays(), log.Printf)
+				archiveCycle(ctx, st, live.HotDays, log.Printf)
 			}
 		}
 	}()
@@ -396,6 +401,22 @@ func checkRedaction(ctx context.Context, st *store.Store, logf func(string, ...a
 			logf("serve: %v", err)
 			return // one is the finding; the rest are the same bug
 		}
+	}
+}
+
+// archiveCycle moves aged bodies into the archive, then collects any day-file
+// rows a purge orphaned. Fail-open: an error is logged, never fatal -- a broken
+// archive must not stop capture. hotDays is read per cycle so a reload applies
+// on the next one; 0 leaves archival disabled.
+func archiveCycle(ctx context.Context, st *store.Store, hotDays func() int, logf func(string, ...any)) {
+	res, err := st.NewArchiver(hotDays).Run(ctx)
+	if err != nil {
+		logf("serve: archive: %v (archived %d row(s) first)", err, res.Archived)
+	} else if res.Archived > 0 {
+		logf("serve: archived the bodies of %d row(s)", res.Archived)
+	}
+	if _, err := st.GCArchive(ctx); err != nil {
+		logf("serve: archive gc: %v", err)
 	}
 }
 
