@@ -137,6 +137,9 @@ type api struct {
 	// func Ctrl+C drives, wired by SetShutdown from the composition root.
 	// Unset is supported: the route answers 503 rather than a nil call.
 	shutdownFunc func()
+
+	// reloadFunc backs POST /api/reload (br-GI-16-04), wired by SetReload.
+	reloadFunc func(context.Context) (ReloadReport, error)
 }
 
 // SetPricing wires GET/POST /api/prices to loader's table and override file.
@@ -215,6 +218,7 @@ func New(st Store, sk *sink.Sink, cons *consumer.Consumer, broker *Broker, asset
 	mux.HandleFunc("POST /api/secrets", a.setSecret)
 	mux.HandleFunc("POST /api/ingest", a.triggerIngest)
 	mux.HandleFunc("POST /api/shutdown", a.shutdown)
+	mux.HandleFunc("POST /api/reload", a.reload)
 
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 	a.mux = mux

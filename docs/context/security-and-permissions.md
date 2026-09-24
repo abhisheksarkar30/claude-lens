@@ -18,6 +18,8 @@ the bind address *is* the security boundary.
 | Dashboard writes | same-origin guard (`originReject`) | [internal/api/origin.go](../../internal/api/origin.go) |
 | Replay (the billable route) | opt-in, off by default (`clens serve --replay`) | [internal/api/replay.go:42](../../internal/api/replay.go#L42) |
 | `POST /api/shutdown` (GI#13) | same-origin **plus** a loopback-caller check on `r.RemoteAddr`; **`--allow-remote` widens neither guard** | [internal/api/shutdown.go](../../internal/api/shutdown.go) |
+| `POST /api/reload` (GI#16) | same guards as shutdown: same-origin **plus** a loopback-caller check; `--allow-remote` widens neither | [internal/api](../../internal/api/) |
+| `archive/` directory (GI#16) | `0700` dir, `0600` day files on Unix; **no-ops on Windows** (no ACL is applied, unlike `secrets.toml`). Holds full bodies, so as sensitive as `lens.db` | [internal/store/archive.go](../../internal/store/archive.go) |
 | `net/http/pprof` (`--pprof-addr`, GI#13) | off by default; loopback only, **and `--allow-remote` cannot widen it** | `config.Validate()` hardcodes `allowRemote=false` for this one field ([internal/config/config.go](../../internal/config/config.go)); `internal/cli`'s `startPprof` re-checks with the same `IsLoopbackHost` predicate before spawning the listener, so a `Config` built by anything other than `config.Load` can't skip `Validate` and open one anyway |
 
 `--allow-remote` is documented as the footgun flag, not a feature: it exists so that binding a
@@ -36,6 +38,8 @@ Rejections are counted in `replayRejected` on `GET /api/health`, so a probe agai
 route leaves a trace.
 
 ### The shutdown route's second guard (GI#13)
+
+(GI#16: `POST /api/reload` reuses this guard verbatim. It rewrites live retention/archival settings, so it is loopback-only for the same reason.)
 
 `POST /api/shutdown` is the one route that stops the process, and same-origin alone is not enough
 for it: `originReject` reads only the `Host` header, so a caller that can already reach a dashboard

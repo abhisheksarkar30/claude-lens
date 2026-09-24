@@ -80,7 +80,19 @@ func updateEventTx(ctx context.Context, tx *sql.Tx, ev *Event) error {
 }
 
 func getEventByRequestIDTx(ctx context.Context, tx *sql.Tx, requestID string) (*Event, error) {
-	return scanEvent(tx.QueryRowContext(ctx, eventSelectColumns+" FROM events WHERE request_id = ?", requestID))
+	ev, err := scanEvent(tx.QueryRowContext(ctx, eventSelectColumns+" FROM events WHERE request_id = ?", requestID))
+	if err != nil {
+		return nil, err
+	}
+	// Only the marker is read: which bodies live in the archive, not the bodies
+	// (br-GI-16-08). A merge needs to know a column is *present*, not its bytes.
+	var mask sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT body_mask FROM body_archive WHERE event_id = ?`, ev.ID).Scan(&mask)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, err
+	}
+	ev.ArchivedBodyMask = uint8(mask.Int64)
+	return ev, nil
 }
 
 func isUniqueConstraintError(err error) bool {
@@ -384,10 +396,17 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	// need not be the response body's, and the capture_complete derivation
 	// below needs to know which -- a single row-level bool cannot say *which*
 	// body was cut.
+	//
+	// An archived body is a present body: its column is empty in the hot row
+	// but the row still holds it, so the emptiness tests below also ask the
+	// marker's mask (zero mask = the unarchived behaviour). Without that a
+	// merge would backfill from incoming over a body that is safely archived,
+	// and the two copies would then disagree forever.
 	bodySides := 0
-	if len(existing.ReqBody) == 0 {
+	if len(existing.ReqBody) == 0 && existing.ArchivedBodyMask&MaskReqBody == 0 {
 		merged.ReqBody = incoming.ReqBody
-		// req_tool_names is a function of whichever body the row ends up
+		// req_tool_names is populated iff the call had a request body, hot or
+		// archived, and is a function of whichever body the row ends up
 		// holding (br-GI-13-07), not of whichever side merged := *existing
 		// happened to carry over. Left to existing alone, a merge that
 		// backfills a body from incoming would produce a row with a body and
@@ -402,7 +421,7 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	} else {
 		bodySides |= bodyFromExisting
 	}
-	if len(existing.RespBody) == 0 {
+	if len(existing.RespBody) == 0 && existing.ArchivedBodyMask&MaskRespBody == 0 {
 		merged.RespBody = incoming.RespBody
 		if len(incoming.RespBody) > 0 {
 			bodySides |= bodyFromIncoming
@@ -440,7 +459,7 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	// is the merge's general one -- the first-written side keeps its value --
 	// stated here so a future column written by both sides is a decision rather
 	// than an accident of the copy.
-	if len(existing.TranscriptContent) == 0 {
+	if len(existing.TranscriptContent) == 0 && existing.ArchivedBodyMask&MaskTranscriptContent == 0 {
 		merged.TranscriptContent = incoming.TranscriptContent
 	}
 	merged.TranscriptRole = preferNonEmpty(existing.TranscriptRole, incoming.TranscriptRole)

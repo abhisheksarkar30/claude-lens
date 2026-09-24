@@ -3,10 +3,10 @@
 # CLI & Tooling
 
 One entry point: [cmd/clens/main.go](../../cmd/clens/main.go), a `map[string]func([]string) error`
-of 23 subcommands dispatching into [internal/cli](../../internal/cli/). Every subcommand accepts
+of 26 subcommands dispatching into [internal/cli](../../internal/cli/). Every subcommand accepts
 the same config flag set (`--proxy-addr`, `--dashboard-addr`, `--upstream-url`, `--db-path`,
 `--body-policy`, `--body-cap-bytes`, `--allow-remote`, `--session-gap-minutes`, `--retention-days`,
-`--replay`, `--accounts-path`, `--pprof-addr`) — see [build-and-run.md](build-and-run.md).
+`--hot-days`, `--replay`, `--accounts-path`, `--pprof-addr`) — see [build-and-run.md](build-and-run.md).
 
 An unknown name prints `clens <name>: not implemented yet` and exits non-zero.
 
@@ -36,11 +36,14 @@ An unknown name prints `clens <name>: not implemented yet` and exits non-zero.
 | `reprice` | `--yes`, `--dry-run` | re-price stored rows in place from the current rate table: `cost_usd` / `api_equivalent_cost_usd` / `cost_source` are recomputed over **every** event row, and no row is inserted or deleted. Rows whose `cost_source` does not name a reconstructible input set are skipped rather than repriced (`repriceInScope`): `unpriced`, and any `approximate:<reason>` except `cache_ttl_unknown`. The repair for the per-class cent rounding GI-11 fixed — and, unlike `ingest --rebuild`, a path to the proxy-only rows that carry an understated cost. `--dry-run` prints the moved/unchanged/skipped split and writes nothing | [internal/cli/reprice.go](../../internal/cli/reprice.go) |
 | `reflag` | `--yes`, `--dry-run` | re-derive `capture_complete` from a `Content-Length` witness: a stored body that is a strict prefix of the client's declared length flips the flag to `incomplete`. Reports flipped / already honest / residual, where a residual row is one the merge laundered with no witness left to prove it — **not repairable**, and reported rather than guessed at. The matching historical repair for RC-B | [internal/cli/reflag.go](../../internal/cli/reflag.go) |
 | `backfill-tool-names` | `--yes`, `--dry-run` | fills `req_tool_names` (GI#13) on rows written before that column existed, so `ruleCacheInvalidatedByTools` does not silently decline on real history. A page-at-a-time read-parse-write loop through `parse.ExtractMeta`, not a single `UPDATE`: a `json_extract`-based SQL backfill would be a second, independent definition of "tool names." `--dry-run` reports the row count only | [internal/cli/backfill.go](../../internal/cli/backfill.go) |
+| `restart` | `--exe PATH`, `--timeout 30s` | GI#16: stop the running `serve`, wait for both ports **and** for the old process's `serve.state.json` to vanish (it is removed only after the consumer drain), relaunch detached from the recorded exe/args (or `--exe`), and print the measured proxy gap. Liveness is decided by `/api/health`. An unhealthy replacement is killed and, when `--exe` swapped the binary, rolled back from the exe/args retained *before* shutdown (the state file is deleted by the graceful exit); non-zero exit either way. Windows/Unix detach in build-tagged `detach_windows.go` / `detach_unix.go` | [internal/cli/restart.go](../../internal/cli/restart.go) |
+| `reload` | — | GI#16: `POST /api/reload` to the running `serve`. Applies live exactly `Accounts`, `RetentionDays`, `HotDays`; every other differing field is reported `restart_required`. All-or-nothing: the new config is loaded and validated first. Re-reads with the boot args, not the state file's | [internal/cli/reload.go](../../internal/cli/reload.go) |
+| `archive` | `status` \| `run` \| `restore` (`--dry-run`, `--yes`, `--since`, `--until`) | GI#16: `status` (hot boundary, archived counts, dir size, held-back / missing / duplicate counts); `run` (the `Archiver`, uses `--hot-days`, `0` = disabled); `restore` (inverse of the archiver's last step: hot columns + marker delete in one transaction, day-file row deleted only after that commits; an undecodable or missing day file leaves the row untouched and exits non-zero). `run`/`restore` need `--yes` | [internal/cli/archive.go](../../internal/cli/archive.go) |
 | `shutdown` | — | `POST /api/shutdown` to a running `clens serve`, triggering the same cancel func Ctrl+C already drives — the graceful path (drain, sink flush, store close) that a hard kill from a second shell skips. Resolves `--dashboard-addr` the same way `serve` does, then dials it as loopback if it is a wildcard bind (`0.0.0.0`/`::`/empty), since this is the common case for an operator config with `AllowRemote = true`. Reports "contacted" once the request succeeds — the process has not necessarily stopped yet, only started its drain (bounded by `serve`'s own 5s grace) | [internal/cli/shutdown.go](../../internal/cli/shutdown.go) |
 
-## The `--yes`-gated writers: five writers, two destructive
+## The `--yes`-gated writers: seven writers, two destructive
 
-Five subcommands refuse to write without `--yes`, and it is worth keeping the groups apart,
+Seven subcommands refuse to write without `--yes`, and it is worth keeping the groups apart,
 because **the shared gate is not a shared property**:
 
 | | Deletes rows? | What it rewrites |
@@ -50,6 +53,8 @@ because **the shared gate is not a shared property**:
 | `reprice` | no | `cost_usd` / `api_equivalent_cost_usd` / `cost_source` |
 | `reflag` | no | `capture_complete` |
 | `backfill-tool-names` | no | `req_tool_names`, on rows where it is currently NULL |
+| `archive run` | no | moves bodies to day files (hot columns NULLed, marker added) |
+| `archive restore` | no | moves bodies back into the hot columns and drops the marker |
 
 `reprice`, `reflag`, and `backfill-tool-names` delete nothing and insert nothing — they fill or
 recompute a column from the row's own stored inputs, which is why a wrong or unwanted run is
@@ -57,7 +62,7 @@ repaired by running it again, not by restoring a backup. The destructive set is 
 `purge` and `rekey`, and the comments in `internal/cli/purge.go` and `internal/cli/rekey.go` say
 "two" deliberately.
 
-All five default to the **opposite of destructive**:
+All seven default to the **opposite of destructive**:
 
 - nothing is written without `--yes`
 - `--dry-run` prints what `--yes` would have written

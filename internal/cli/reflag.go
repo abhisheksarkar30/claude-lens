@@ -56,5 +56,8 @@ func runReflag(args []string, w io.Writer) error {
 	// the store can prove which of them was cut. It is not a failure count.
 	fmt.Fprintf(w, "%s %d row(s) to incomplete; %d already honest, %d residual (laundered, no Content-Length witness -- not repairable)\n",
 		verb, counts.Flipped, counts.AlreadyHonest, counts.Residual)
+	if counts.Archived > 0 {
+		fmt.Fprintf(w, "excluded %d archived row(s) -- run `clens archive restore` first to include them\n", counts.Archived)
+	}
 	return nil
 }

@@ -751,3 +751,155 @@ func TestSubmitLogsADropWithoutTheBody(t *testing.T) {
 		t.Errorf("drop log leaked the request body: %q", logOutput)
 	}
 }
+
+// --- pass-through conformance (br-GI-16-13) ---------------------------------
+//
+// The proxy is byte-transparent: it forwards what it is given and only *copies*
+// bytes into the sink. These cases pin that, so a future change that parses and
+// re-serialises a body, or "redacts before forwarding", fails here. Each
+// assertion compares raw bytes -- never decoded-then-compared, which would pass
+// while a real field drop went uncaught.
+//
+// Two exceptions are sanctioned and NOT asserted against: the hop-by-hop
+// headers RFC 9110 requires httputil.ReverseProxy to drop, and the capture-side
+// copy of the headers (redacted on purpose). Bodies and end-to-end headers are
+// compared, not the whole header set.
+//
+// TestByteIdentityNonStreaming above already pins byte identity for an ordinary
+// body; the cases here add the ones an API feature could break -- fields the
+// proxy has never heard of, unknown SSE fields, and credentials.
+
+const (
+	unknownFieldReq  = `{"model":"m","safeguards":[{"id":"sg_1","mode":"strict"}],"messages":[]}`
+	unknownFieldResp = `{"id":"msg_1","type":"message","safeguard_results":{"sg_1":"pass"},"usage":{"input_tokens":1,"output_tokens":1}}`
+)
+
+// passThrough sends req through a proxy in front of upstream and returns what
+// the client received, plus the captured call.
+func passThrough(t *testing.T, upstream http.HandlerFunc, req *http.Request) ([]byte, *sink.CapturedCall) {
+	t.Helper()
+	up := httptest.NewServer(upstream)
+	t.Cleanup(up.Close)
+	sk := sink.New(16)
+	h, err := New(testConfig(up.URL), sk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := proxyServer(t, h)
+	req.URL.Scheme, req.URL.Host = "http", strings.TrimPrefix(srv.URL, "http://")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	got, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got, captureOne(t, sk)
+}
+
+func TestPassThroughUnknownRequestFieldIsForwardedByteIdentical(t *testing.T) {
+	var got []byte
+	passThrough(t, func(w http.ResponseWriter, r *http.Request) {
+		got, _ = io.ReadAll(r.Body)
+		w.Write([]byte(`{}`))
+	}, mustReq(t, "POST", "/v1/messages", unknownFieldReq))
+	if !bytes.Equal(got, []byte(unknownFieldReq)) {
+		t.Fatalf("upstream received %q, want %q", got, unknownFieldReq)
+	}
+}
+
+func TestPassThroughUnknownResponseFieldReachesTheClientByteIdentical(t *testing.T) {
+	got, call := passThrough(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(unknownFieldResp))
+	}, mustReq(t, "POST", "/v1/messages", `{}`))
+	if !bytes.Equal(got, []byte(unknownFieldResp)) {
+		t.Fatalf("client received %q, want %q", got, unknownFieldResp)
+	}
+	if !bytes.Equal(call.RespBody, []byte(unknownFieldResp)) {
+		t.Fatalf("captured %q, want the same bytes", call.RespBody)
+	}
+}
+
+func TestPassThroughSSEWithUnknownFieldsAndToolUseIDs(t *testing.T) {
+	events := []string{
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}\n\n",
+		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_01ABC\",\"name\":\"Read\"}}\n\n",
+		"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\",\"safeguard_verdict\":{\"id\":\"sg_1\",\"blocked\":false}}}\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	}
+	want := strings.Join(events, "")
+	got, _ := passThrough(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		for _, e := range events {
+			io.WriteString(w, e)
+			fl.Flush()
+		}
+	}, mustReq(t, "POST", "/v1/messages", `{"stream":true}`))
+
+	if string(got) != want {
+		t.Fatalf("stream changed:\n got %q\nwant %q", got, want)
+	}
+	// Framing and order, event by event (case 3); and the tool-use id survives
+	// untouched (case 4).
+	gotEvents := strings.SplitAfter(string(got), "\n\n")
+	gotEvents = gotEvents[:len(gotEvents)-1]
+	if len(gotEvents) != len(events) {
+		t.Fatalf("got %d events, want %d", len(gotEvents), len(events))
+	}
+	for i := range events {
+		if gotEvents[i] != events[i] {
+			t.Errorf("event %d = %q, want %q", i, gotEvents[i], events[i])
+		}
+	}
+	if !strings.Contains(string(got), `"id":"toolu_01ABC"`) {
+		t.Error("the tool-use id was rewritten")
+	}
+}
+
+func TestPassThroughUnknownAndCredentialHeadersReachUpstreamUnchanged(t *testing.T) {
+	const (
+		beta = "prompt-caching-2024-07-31,some-future-beta-2099-01-01"
+		key  = "sk-ant-api03-DUMMYKEYDUMMYKEYDUMMYKEY"
+		auth = "Bearer sk-ant-oat01-DUMMYTOKENDUMMYTOKEN"
+	)
+	req := mustReq(t, "POST", "/v1/messages", `{}`)
+	req.Header.Set("anthropic-beta", beta)
+	req.Header.Set("x-api-key", key)
+	req.Header.Set("authorization", auth)
+
+	var seen http.Header
+	_, call := passThrough(t, func(w http.ResponseWriter, r *http.Request) {
+		seen = r.Header.Clone()
+		w.Write([]byte(`{}`))
+	}, req)
+
+	for name, want := range map[string]string{"Anthropic-Beta": beta, "X-Api-Key": key, "Authorization": auth} {
+		if got := seen.Get(name); got != want {
+			t.Errorf("upstream saw %s = %q, want %q", name, got, want)
+		}
+	}
+	// The other half: redaction is capture-only, so the sink's copy IS redacted
+	// while the forwarded one was not.
+	for _, name := range []string{"X-Api-Key", "Authorization"} {
+		if got := call.ReqHeaders.Get(name); got != redactedValue {
+			t.Errorf("captured %s = %q, want %q", name, got, redactedValue)
+		}
+	}
+	if got := call.ReqHeaders.Get("Anthropic-Beta"); got != beta {
+		t.Errorf("captured anthropic-beta = %q, want it kept as sent", got)
+	}
+}
+
+func mustReq(t *testing.T, method, path, body string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, "http://placeholder"+path, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}

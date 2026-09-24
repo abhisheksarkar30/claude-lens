@@ -27,6 +27,7 @@ fold dedupe to once per flush batch.
 | [008](008-three-tier-identity-key.md) | cross-source identity is a three-tier key (`request-id` header → response body `message.id` → namespaced synthetic) | fall back to a header-only key that cannot converge a proxy row with its JSONL counterpart whenever the header is absent from either side |
 | [009](009-proxy-adopts-the-conversation-id.md) | the proxy adopts `x-claude-code-session-id` as its stored `session_id` | leave `clens sessions` showing gap-window heuristic groups instead of real conversations |
 | [010](010-per-session-dedupe-accepts-warning-subset.md) | the session-scoped analyzer pass and fold run once per distinct session per flush batch, not once per row | re-walk a large session's full row history once per row in a batch again, scaling flush cost with `batch_size × session_row_count` even with the composite index in place |
+| [011](011-bodies-only-archival-with-day-files.md) | only bodies are archived, via a `body_archive` marker table and per-UTC-day files | archive whole rows (breaking aggregates and the merge) or hold the write connection for a background `VACUUM` |
 
-The status of all ten is **Accepted**. None is superseded — 007 supersedes a *GI-1 decision*
+The status of all eleven is **Accepted**. None is superseded — 007 supersedes a *GI-1 decision*
 ("migrations: none in v1"), not another ADR.

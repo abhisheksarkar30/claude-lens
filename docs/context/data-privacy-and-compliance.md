@@ -4,7 +4,7 @@
 
 Not legal advice — this is what the code actually does with sensitive content. It is a real module
 here because the tool's central design decision is **to store full request and response bodies**,
-which makes the database the single most sensitive artifact the tool creates.
+which makes the database, **and since GI#16 the `archive/` directory beside it**, the most sensitive artifacts the tool creates.
 
 Companion to [security-and-permissions.md](security-and-permissions.md), which covers *credential*
 handling. This file covers *content*.
@@ -13,7 +13,7 @@ handling. This file covers *content*.
 
 | Field / Entity | Sensitivity | Where stored | Evidence |
 |---|---|---|---|
-| `events.req_body` | **Highest.** Every prompt, and every file the agent read. | SQLite BLOB, `~/.clens/lens.db` | [internal/store/schema.sql](../../internal/store/schema.sql) |
+| `events.req_body` | **Highest.** Every prompt, and every file the agent read. | SQLite BLOB, `~/.clens/lens.db`; once older than `--hot-days`, moved to `~/.clens/archive/bodies-YYYY-MM-DD.db` (zstd or raw) | [internal/store/schema.sql](../../internal/store/schema.sql) |
 | `events.resp_body` | **Highest.** Every completion, including thinking blocks. | SQLite BLOB | [internal/store/schema.sql](../../internal/store/schema.sql) |
 | `events.req_headers` / `resp_headers` | Medium — **redacted** before the tee; a credential is never in them | SQLite TEXT | [internal/proxy/redact.go](../../internal/proxy/redact.go) |
 | `events.project`, `git_branch` | Low–medium — reveals what you work on | SQLite TEXT | [internal/store/schema.sql](../../internal/store/schema.sql) |
@@ -21,9 +21,9 @@ handling. This file covers *content*.
 | Credentials | **Never stored here at all** | `~/.clens/secrets.toml`, outside the DB | [security-and-permissions.md](security-and-permissions.md) |
 | JSONL transcripts (source B) | The **source** of much of the above; owned by Claude Code, read-only to this tool | `~/.claude/projects/**/*.jsonl` | [internal/jsonlogs](../../internal/jsonlogs/) |
 
-**The threat model is the database file.** Loopback binding, redaction, and the ACL on the
+**The threat model is the database file and the archive directory.** Loopback binding, redaction, and the ACL on the
 credential file are all secondary to the fact that `lens.db` contains the content. Copying it copies
-everything.
+everything, and copying `lens.db` *without* `archive/` silently drops the older bodies, while copying `archive/` alone copies bodies too. Archive files are `0600` in a `0700` directory on Unix; on Windows both modes are no-ops, so protection is no better than for `lens.db`.
 
 Storing bodies is a deliberate trade, not an oversight — the reasoning and the rejected alternative
 are in [decisions/003](decisions/003-full-bodies-stored.md).
@@ -115,7 +115,9 @@ same principle to a cost it cannot compute: see [cost-and-quota.md](cost-and-quo
 
 | Mechanism | Detail |
 |---|---|
-| `--retention-days` | the configured retention horizon |
+| `--retention-days` | the configured retention horizon; purge reaches the archive too (`GCArchive` runs after every purge writer) |
+| `--hot-days` (GI#16) | how long bodies stay in `lens.db` before moving to a day file (default 7, `0` disables); must not exceed the retention horizon. Moves bodies, deletes nothing |
+| `clens archive run` / `restore` | `--yes`-gated; `restore` puts bodies back in the hot columns |
 | `clens purge --older-than <duration>` | delete captured rows by age |
 | `clens purge --unpriced` | delete rows whose cost could not be priced |
 | `--dry-run` | prints exactly what `--yes` would have deleted |
@@ -131,8 +133,8 @@ run that passes `--yes` without `--dry-run` —
 are both read out of `resp_body` / `req_headers`, which the consumer already stores verbatim; nothing
 new is captured, and re-attribution only rewrites a column from a value already on disk.
 
-**Cascade is scoped:** `ON DELETE CASCADE` appears only on `warnings.event_id`. Purging an event
-takes its warnings with it and nothing else — `sessions` is not cascaded, which is why a session
+**Cascade is scoped:** `ON DELETE CASCADE` appears on `warnings.event_id` and `body_archive.event_id`. Purging an event
+takes its warnings and archive marker with it (`GCArchive` then drops its day-file row) and nothing else — `sessions` is not cascaded, which is why a session
 whose events were purged can still exist.
 
 **No soft deletes.** A purge is a delete. There is no `deleted_at` column and no undo.

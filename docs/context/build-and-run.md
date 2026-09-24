@@ -86,6 +86,7 @@ Every subcommand accepts the same flag set; precedence is flags > `CLENS_*` > fi
 | `--allow-remote` | off | the footgun flag: without it, `Validate()` rejects a non-loopback bind |
 | `--session-gap-minutes` | — | session boundary heuristic |
 | `--retention-days` | — | drives `clens purge` |
+| `--hot-days` / `CLENS_HOT_DAYS` | 7 | GI#16: bodies older than this move to `<db dir>/archive/bodies-YYYY-MM-DD.db`; `0` disables; must be <= retention. Live-reloadable |
 | `--replay` | off | the replay endpoint is opt-in |
 | `--accounts-path` | `~/.clens/accounts.toml` | |
 | `--pprof-addr` | unset (disabled) | serves `net/http/pprof` on this address for the process's life — a diagnostic, deliberately absent from `Default()`. **Loopback-locked even under `--allow-remote`**: a profile dumps whatever is in process memory, including prompt and response bodies, so `Validate()` hardcodes `allowRemote=false` for this one field rather than reusing `c.AllowRemote` (`internal/config/config.go`'s `IsLoopbackHost`, shared with the general bind check so a legitimately-loopback address can't pass one and fail the other) |
@@ -173,3 +174,8 @@ separate decision with its own retention question.
 [docs/acceptance.md](../acceptance.md) is the end-to-end run performed once against a real install,
 recorded as it happened — including the half that could not be run on that machine (anything
 needing a live Anthropic credential) and why. It is the closest thing to an E2E suite this repo has.
+
+**Runtime files next to the DB (GI#16):** `serve.state.json` (pid, exe, args, bound addrs; written after the
+listeners are up, removed only after the consumer drain, and `clens restart` keys off it) and `serve.log`
+(the detached child's stdout/stderr under `restart`). The first `serve` boot after upgrading archives every row
+already older than `--hot-days` (~32k rows on the maintainer's store, ~2 minutes); it is not deferred to a later date.

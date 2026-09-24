@@ -74,6 +74,7 @@ func Serve(args []string) error {
 	// open", CLAUDE.md).
 	checkRedaction(ctx, st, log.Printf)
 	purgeOnStartup(ctx, st, cfg.RetentionDays, log.Printf)
+	live := &liveSettings{retentionDays: cfg.RetentionDays, hotDays: cfg.HotDays}
 
 	sk := sink.New(sink.DefaultCapacity)
 	broker := api.NewBroker()
@@ -133,7 +134,11 @@ func Serve(args []string) error {
 	// internal/api never imports secret, config or ingest.
 	dashAPI.SetPricing(priceLoader)
 	dashAPI.SetCredentialWriter(secret.Save)
-	dashAPI.SetAccountWriter(reloadAccounts)
+	// One reloader serves POST /api/reload and the dashboard's accounts save, so
+	// a save applies the same way `clens reload` does.
+	rl := newReloader(args, cfg, live, cons.SetAccounts)
+	dashAPI.SetReload(rl.Reload)
+	dashAPI.SetAccountWriter(func() error { _, err := rl.Reload(ctx); return err })
 	// br-GI-13-09: POST /api/shutdown drives stop, the same NotifyContext
 	// cancel func os.Interrupt drives, so `clens shutdown` triggers the one
 	// shutdown path this function already has rather than a second one.
@@ -188,14 +193,15 @@ func Serve(args []string) error {
 	// only. Get is never called on this path, so a credential's value has no
 	// route from the secrets file to the dashboard.
 	dashAPI.SetAccounts(func(context.Context) (api.Accounts, error) {
+		applied := rl.Accounts() // the live list, not the boot snapshot
 		accts := api.Accounts{
-			List: make([]api.Account, 0, len(cfg.Accounts)),
+			List: make([]api.Account, 0, len(applied)),
 			Credentials: map[string]api.Credential{
 				"sessionKey": credentialState("sessionKey"),
 				"admin":      credentialState("admin"),
 			},
 		}
-		for _, acct := range cfg.Accounts {
+		for _, acct := range applied {
 			accts.List = append(accts.List, api.Account{
 				Name: acct.Name, BillingMode: acct.BillingMode, Plan: acct.Plan,
 			})
@@ -225,6 +231,19 @@ func Serve(args []string) error {
 
 	dashSrv := &http.Server{Addr: cfg.DashboardAddr, Handler: dashAPI}
 
+	// Bind both listeners up front, rather than inside ListenAndServe, so a bind
+	// failure surfaces before anything is written and the state file can record
+	// the real addresses (a `:0` port is only known after the bind).
+	proxyLn, err := net.Listen("tcp", cfg.ProxyAddr)
+	if err != nil {
+		return fmt.Errorf("serve: proxy listen: %w", err)
+	}
+	dashLn, err := net.Listen("tcp", cfg.DashboardAddr)
+	if err != nil {
+		proxyLn.Close()
+		return fmt.Errorf("serve: dashboard listen: %w", err)
+	}
+
 	printBanner(os.Stdout, cfg)
 
 	consumerDone := make(chan struct{})
@@ -235,19 +254,38 @@ func Serve(args []string) error {
 
 	errCh := make(chan error, 2)
 	go func() {
-		if err := proxySrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := proxySrv.Serve(proxyLn); err != nil && err != http.ErrServerClosed {
 			errCh <- fmt.Errorf("proxy server: %w", err)
 		}
 	}()
 	go func() {
-		if err := dashSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := dashSrv.Serve(dashLn); err != nil && err != http.ErrServerClosed {
 			errCh <- fmt.Errorf("dashboard server: %w", err)
 		}
 	}()
 
+	// Both listeners are up. Best-effort: a state file that cannot be written
+	// costs `clens restart` its record, never the proxy.
+	if exe, err := os.Executable(); err == nil {
+		state := serveState{
+			PID: os.Getpid(), Exe: exe, Args: os.Args[1:], StartedAt: time.Now().UTC(),
+			ProxyAddr: proxyLn.Addr().String(), DashboardAddr: dashLn.Addr().String(),
+			LogPath: defaultLogPath(cfg.DBPath),
+		}
+		if err := writeServeState(cfg.DBPath, state); err != nil {
+			log.Printf("serve: write %s: %v", serveStateFile, err)
+		} else {
+			defer removeServeState(cfg.DBPath, state.PID)
+		}
+	}
+
 	// The 24-hour ticker alongside the startup run: a tool opened and closed
 	// around work sessions may never see a 24-hour boundary on its own, but a
 	// long-lived process should not purge only once.
+	// The archiver's boot run starts here, after both listeners are up and after
+	// the boot purge above, so it never delays capture or the boot self-tests.
+	go archiveCycle(ctx, st, live.HotDays, log.Printf)
+
 	purgeTicker := time.NewTicker(24 * time.Hour)
 	defer purgeTicker.Stop()
 	go func() {
@@ -256,7 +294,8 @@ func Serve(args []string) error {
 			case <-ctx.Done():
 				return
 			case <-purgeTicker.C:
-				purgeOnStartup(ctx, st, cfg.RetentionDays, log.Printf)
+				purgeOnStartup(ctx, st, live.RetentionDays(), log.Printf)
+				archiveCycle(ctx, st, live.HotDays, log.Printf)
 			}
 		}
 	}()
@@ -349,7 +388,7 @@ func checkRedaction(ctx context.Context, st *store.Store, logf func(string, ...a
 	// redactor ran. On the summary projection ReqHeaders is not there to read,
 	// and a version that skipped every row would report zero findings — a
 	// security control silently disabled, with no error and no log.
-	events, err := st.ListEventsFull(ctx, store.EventFilter{Limit: redactScanLimit})
+	events, err := st.ListEventsFull(ctx, store.EventFilter{Limit: redactScanLimit, SkipHydrate: true})
 	if err != nil {
 		logf("serve: redaction self-test: %v", err)
 		return
@@ -362,6 +401,22 @@ func checkRedaction(ctx context.Context, st *store.Store, logf func(string, ...a
 			logf("serve: %v", err)
 			return // one is the finding; the rest are the same bug
 		}
+	}
+}
+
+// archiveCycle moves aged bodies into the archive, then collects any day-file
+// rows a purge orphaned. Fail-open: an error is logged, never fatal -- a broken
+// archive must not stop capture. hotDays is read per cycle so a reload applies
+// on the next one; 0 leaves archival disabled.
+func archiveCycle(ctx context.Context, st *store.Store, hotDays func() int, logf func(string, ...any)) {
+	res, err := st.NewArchiver(hotDays).Run(ctx)
+	if err != nil {
+		logf("serve: archive: %v (archived %d row(s) first)", err, res.Archived)
+	} else if res.Archived > 0 {
+		logf("serve: archived the bodies of %d row(s)", res.Archived)
+	}
+	if _, err := st.GCArchive(ctx); err != nil {
+		logf("serve: archive gc: %v", err)
 	}
 }
 
@@ -382,19 +437,6 @@ func purgeOnStartup(ctx context.Context, st *store.Store, days int, logf func(st
 		return
 	}
 	logf("serve: retention purge: deleted %d row(s) older than %s", n, cutoff.Format(time.RFC3339))
-}
-
-// reloadAccounts re-reads the config and accounts files after the dashboard's
-// save route wrote one, so a malformed file is reported at the moment it is
-// saved instead of silently at the next restart.
-//
-// ponytail: a save validates, it does not re-attribute. The running consumer
-// holds the account list it was built with (consumer.New copies it and exposes
-// no setter), so a new account starts contributing only after a restart --
-// which is what the route's response tells the user.
-func reloadAccounts() error {
-	_, err := config.Load(nil)
-	return err
 }
 
 // atOrNil converts ingest's non-pointer timestamps to the API's nullable

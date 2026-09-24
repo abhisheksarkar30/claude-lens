@@ -52,8 +52,9 @@ CREATE TABLE IF NOT EXISTS events (
     method                  TEXT,
     path                    TEXT,
     status                  INTEGER,
-    -- NULL iff the row has no request body (structurally for a JSONL row, or
-    -- because --body-policy dropped it); otherwise the request's tool names
+    -- NULL iff the call had no request body, hot or archived (structurally for a
+    -- JSONL row, or because --body-policy dropped it); an archived row keeps it,
+    -- so it stays non-NULL after req_body is cleared. Otherwise the request's tool names
     -- in body order, JSON-encoded ('[]' when the body declares none). This is
     -- what lets the session-scoped rules compare tool names between turns
     -- without reading req_body -- see internal/store/store.go's
@@ -211,6 +212,20 @@ CREATE TABLE IF NOT EXISTS model_catalog (
     fetched_at       INTEGER NOT NULL,
     source           TEXT NOT NULL
 );
+
+-- br-GI-16-06: which events have had their bodies moved to a day file under
+-- <dir of the DB>/archive. A marker only; `events` itself is untouched, so every
+-- aggregate stays whole-history. day is the UTC 'YYYY-MM-DD' of started_at and
+-- names the file. body_mask (1 req_body, 2 resp_body, 4 transcript_content) is a
+-- lagging, monotone mirror of the day file row's own mask: it may under-claim,
+-- never over-claim, and the day file row is the authority when they differ.
+CREATE TABLE IF NOT EXISTS body_archive (
+    event_id    INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+    day         TEXT    NOT NULL,
+    archived_at INTEGER NOT NULL,
+    body_mask   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_body_archive_day ON body_archive(day);
 
 CREATE TABLE IF NOT EXISTS ingest_state (
     key        TEXT PRIMARY KEY,

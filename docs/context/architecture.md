@@ -60,6 +60,10 @@ A third, optional listener — `net/http/pprof` behind `--pprof-addr` (GI#13) �
 | Transport | [internal/sink](../../internal/sink/) | a bounded buffer between the two — the only thing they share. |
 | Cold path | [internal/consumer](../../internal/consumer/) | its own goroutine: drain, decompress, parse, run analyzer rules, price, write. |
 
+**The pass-through guarantee is a tested invariant (GI#16):** unknown request/response fields, SSE framing
+and tool-use IDs, and unknown/credential headers reach the client and upstream byte-for-byte; the sink copy is
+redacted. Pinned by the `TestPassThrough*` cases in [internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go).
+
 **The import rule that enforces the split:** `internal/proxy` may import only `internal/sink` and
 `internal/config`. Asserted by [internal/proxy/importguard_test.go](../../internal/proxy/importguard_test.go).
 If it ever imports `analyze`, `store`, or `pricing`, the hot path has grown a dependency on the
@@ -225,3 +229,12 @@ impact is tabulated in [integrations-and-external-services.md](integrations-and-
 - [internal/analyze/kinds.go](../../internal/analyze/kinds.go) — the one spelling of every warning kind.
 - [decisions/](decisions/000-index.md) — the architectural forks, and why the rejected side lost.
 - `CLAUDE.md` §Architecture essentials — the invariants in their shortest form.
+
+## Body archiver (GI#16)
+
+A background actor beside the consumer and the collectors: `archiveCycle` in
+[internal/cli/serve.go](../../internal/cli/serve.go) runs `store.Archiver` then `GCArchive`, once after the
+listeners are up and then daily after the purge, fail-open (an error is logged, never fatal). It shares the
+store's **single write connection** with every other writer, so it works in small paced batches rather than
+holding it. `HotDays` is a live setting (`liveSettings`), so `clens reload` moves the boundary without a restart.
+Storage details: [storage-schema.md](storage-schema.md) section "Body archival".

@@ -44,6 +44,9 @@ var commands = map[string]func([]string) error{
 	// br-GI-13-07 / br-GI-13-09, post-convergence additions
 	"backfill-tool-names": cli.BackfillToolNames,
 	"shutdown":            cli.Shutdown,
+	"restart":             cli.Restart,
+	"reload":              cli.Reload,
+	"archive":             cli.Archive,
 }
 
 func main() {

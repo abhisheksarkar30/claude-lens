@@ -93,12 +93,15 @@ func purgeByAge(ctx context.Context, w io.Writer, st *store.Store, olderThan str
 		if err != nil {
 			return fmt.Errorf("purge: %w", err)
 		}
-		bytes, err := st.PurgeableBytes(ctx, cutoff)
+		bytes, skippedDays, err := st.PurgeableBytes(ctx, cutoff)
 		if err != nil {
 			return fmt.Errorf("purge: %w", err)
 		}
 		fmt.Fprintf(w, "would delete %d row(s) started before %s, reclaiming about %s\n",
 			count, cutoff.Format(time.RFC3339), humanBytes(bytes))
+		if skippedDays > 0 {
+			fmt.Fprintf(w, "note: %d archived day file(s) were missing or unreadable and are not counted in that estimate\n", skippedDays)
+		}
 		return nil
 	}
 

@@ -62,16 +62,21 @@
         <!-- The window picker reveals a native input whose type follows the
              granularity (see mountWindowPicker). "any time" is the default and
              filters nothing, which is what this tab did before the picker
-             existed. There is deliberately no `custom` option here: this row
-             has no free-text pair for it to reveal, and a selectable entry that
-             filters nothing is a dead control. -->
+             existed. `custom` reveals a from/to pair of hour-precision
+             datetime-local inputs; the labels (not the inputs) carry the
+             hidden state, toggled at mount, because a `hidden` on an input is
+             permanent. -->
         <label>window <select id="c-window-gran" aria-label="window granularity">
           <option value="">any time</option>
           <option value="hour">hour</option>
           <option value="date">date</option>
           <option value="month">month</option>
+          <option value="custom" selected>custom</option>
         </select></label>
         <input id="c-window-value" hidden aria-label="window value">
+        <label>from <input id="c-from" type="datetime-local"></label>
+        <label>to <input id="c-to" type="datetime-local"></label>
+        <span id="c-range-msg" class="muted"></span>
         <button type="button" id="f-apply">Filter</button>
       </div>
       <div id="calls-table"></div>
@@ -112,6 +117,9 @@
         <option value="month">month</option>
       </select></label>
       <input id="s-window-value" hidden aria-label="window value">
+      <label>from <input id="s-from" type="datetime-local"></label>
+      <label>to <input id="s-to" type="datetime-local"></label>
+      <span id="s-range-msg" class="muted"></span>
       <label>since <input id="s-since" placeholder="24h or RFC3339"></label>
       <label>until <input id="s-until" placeholder="RFC3339"></label>
       <label>by <select id="s-granularity">

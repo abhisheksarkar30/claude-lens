@@ -105,7 +105,13 @@ func runShow(args []string, w io.Writer) error {
 		}
 	}
 
-	if withBody {
+	// An archived row says so, and never falls through to "(not stored)": a
+	// missing archive is a different claim from a body that was never captured.
+	if note := archiveNote(ev); note != "" {
+		fmt.Fprintln(w, "\n"+note)
+	}
+
+	if withBody && ev.BodiesArchived != "missing" {
 		// The request half stays raw: no compressed request body has been
 		// observed, and inventing behaviour for an unobserved case is scope
 		// this story does not need.
@@ -119,6 +125,20 @@ func runShow(args []string, w io.Writer) error {
 		fmt.Fprintln(w, "\nbodies stored; pass --body to print them")
 	}
 	return nil
+}
+
+// archiveNote is the one-line archived-state message for a row whose bodies were
+// (or should have been) loaded from the archive, "" for an ordinary row. The day
+// is the UTC day of started_at, which is what names the archive file.
+func archiveNote(ev *store.Event) string {
+	day := ev.StartedAt.UTC().Format("2006-01-02")
+	switch ev.BodiesArchived {
+	case "restored":
+		return "bodies loaded from the archive (" + day + ")"
+	case "missing":
+		return "archived — archive file for " + day + " not found"
+	}
+	return ""
 }
 
 // tokenLine spells out every token class, because the classes are priced

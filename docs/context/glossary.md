@@ -53,3 +53,7 @@ of truth and this table links to it rather than copying it.
 | **`BodyCapBytes = 0`** | The read cap is **unwired**, which is not a zero-byte cap. The detail view selects its "cap not configured" line off this before consulting the completeness. | [internal/api/api.go](../../internal/api/api.go) |
 | **proxy-mode badge** | The header indicator answering "is this process in Claude Code's path?" from two facts: `settings.json`'s `ANTHROPIC_BASE_URL`, and whether proxy rows have arrived recently. | [internal/api/mode.go](../../internal/api/mode.go) |
 | **GI-1 / bead** | The work-item vocabulary: `GI#<n>` is a GitHub issue; `br-GI-1-NN` is one bead under it. Enforced by the commit-msg hook. | [CLAUDE.md](../../CLAUDE.md) §Conventions |
+| **hot window (`HotDays`)** | GI#16: days a call's bodies stay in `lens.db` before the archiver moves them to a day file. `0` disables. | [internal/config](../../internal/config/) |
+| **archived body** | A body moved to `archive/bodies-YYYY-MM-DD.db`; `events` keeps every aggregate and a `body_archive` marker names it. | [storage-schema.md](storage-schema.md) |
+| **`BodiesArchived`** | `Event` field set by hydration: `""` (ordinary), `"restored"` (loaded from the archive), `"missing"` (marker but no file). | [internal/store](../../internal/store/) |
+| **`serve.state.json`** | Next to the DB: pid, exe, args, addresses of the running `serve`; removed only after the consumer drain. | [internal/cli/restart.go](../../internal/cli/restart.go) |
