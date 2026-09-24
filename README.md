@@ -106,6 +106,9 @@ Two states are first-class and never collapsed to zero:
 | `clens rekey` | the one-off historical id backfill (already run; see its `--dry-run` report) |
 | `clens reprice` | re-price stored rows from the current rate table |
 | `clens reflag` | re-derive `capture_complete` on rows the old merge laundered |
+| `clens restart` | stop and relaunch `serve` with its recorded flags, optionally on a new binary (`--exe`) |
+| `clens reload` | apply `Accounts`, `RetentionDays` and `HotDays` from the config without a restart |
+| `clens archive` | `status`, `run` and `restore` for archived bodies |
 
 Four commands refuse to write without `--yes`, and the shared gate is not a
 shared property: **`clens purge` and `clens rekey` delete rows; `clens reprice`
@@ -168,8 +171,109 @@ Two things to know first:
 Every command takes the config flags — `--proxy-addr`, `--dashboard-addr`,
 `--upstream-url`, `--db-path`, `--body-policy`, `--body-cap-bytes`,
 `--allow-remote`, `--session-gap-minutes`, `--retention-days`, `--replay`,
-`--accounts-path`, `--pprof-addr`. Precedence is flags > `CLENS_*` environment
+`--accounts-path`, `--pprof-addr`, `--hot-days`. Precedence is flags > `CLENS_*` environment
 > the config file at `~/.clens/config.toml` > defaults.
+
+## Operating a running serve
+
+### Restart
+
+```
+clens restart [--exe PATH] [--timeout 30s]
+```
+
+Stops the running `serve`, waits for both ports to free, relaunches it detached
+with the flags it was started with, and prints the measured proxy gap. On Windows a
+running `clens.exe` cannot be overwritten, so build the new binary elsewhere while
+the old one runs and point at it:
+
+```
+go build -o D:\build\clens.exe ./cmd/clens
+clens restart --exe D:\build\clens.exe
+```
+
+`serve` records what `restart` needs in `serve.state.json` beside the database (the
+executable, its arguments, its ports) and appends its output to `serve.log` in the same
+place. Liveness is decided by `/api/health`, never by the file. If the new binary does
+not come up healthy within `--timeout`, `restart` rolls back to the previous one and
+exits non-zero; the message says which binary is serving. Replacing the installed
+`clens` on your `PATH` stays your call — `restart` only relaunches.
+
+**Do not try `restart` against the `serve` your live Claude session is using**: the
+proxy is down for the gap, and a rollback failure leaves nothing serving. Try it on
+a scratch database and ports (`--db-path`, `--proxy-addr 127.0.0.1:0`).
+
+### Reload
+
+```
+clens reload
+```
+
+Asks the running `serve` (over its loopback dashboard address) to re-read its config.
+Exactly three settings apply live: `Accounts`, `RetentionDays` and `HotDays`. Anything
+else that differs — the listen addresses, upstream URL, database path, body policy and
+cap, pprof address — is reported as needing `clens restart`. A file that does not load
+or validate (for example `HotDays` above `RetentionDays`) is a 400 and changes
+nothing: reload is all-or-nothing. The endpoint refuses non-loopback callers.
+
+### Body archival
+
+Bodies are about 99.5% of `lens.db`, so archival moves only them. Every event row and
+every aggregate stays in `lens.db`; a call's request body, response body and transcript
+content older than the hot window move to one file per UTC day,
+`archive/bodies-YYYY-MM-DD.db`, beside the database, compressed. The dashboard, `show`,
+`ls` and `export` read them back transparently and say so
+(`bodies loaded from the archive (2026-09-20)`); if a file has been moved or deleted
+the row says `archived — archive file for … not found`, not that nothing was captured.
+
+- **Window:** `--hot-days N` / `CLENS_HOT_DAYS` / `HotDays` in the config file. Default
+  `7`; `0` disables archival; `HotDays` greater than `RetentionDays` is rejected.
+  `serve` archives at boot (after the listeners are up) and every 24 hours, and a
+  `clens reload` applies a new window on the next cycle. It never blocks capture.
+- **`clens archive status`** — the hot boundary, archived and unarchived row counts, the
+  archive size, rows held back until `clens backfill-tool-names` has run, markers whose
+  file or row is gone, and restored rows still sitting in a day file.
+- **`clens archive run [--dry-run] [--yes]`** — archive now. Nothing is written without
+  `--yes`; `--dry-run` reports the count.
+- **`clens archive restore --since X --until Y [--dry-run] [--yes]`** — move bodies back
+  into `lens.db` (a duration like `720h` or an RFC3339 time). Run it with `serve` stopped.
+  A row whose archive copy is missing or unreadable is reported and left exactly as it
+  was.
+- `--retention-days` deletes archived bodies too: a purge collects the day-file rows
+  it orphans and removes emptied files.
+- A body that arrives after its row was archived (a late transcript merge) stays hot
+  and is not re-archived.
+- **The archive is as sensitive as `lens.db`.** It holds every prompt and file the agent
+  read, in the same directory, with the same protection — and on Windows that is
+  no better than the database's own (the file modes are a no-op there).
+- The first archival on the live store is expected to happen once bodies reach 7 days
+  old, about 2026-09-27.
+
+### Reclaiming the hot file's space (one time)
+
+Archiving deletes rows' bodies from `lens.db` but a SQLite file does not shrink on its
+own, and `serve` never runs `VACUUM` (it would stall capture). After the first archival:
+
+```
+clens shutdown
+clens purge --vacuum --yes
+clens restart
+```
+
+### Before the first run of a new binary against a live store
+
+The schema moves from version 4 to 5 (the `body_archive` marker table). Copy `lens.db`,
+`lens.db-wal` and `lens.db-shm` to a separate path first; a bad migration against the
+only copy is not recoverable.
+
+### The auto-mode notice naming `127.0.0.1:8797`
+
+Claude Code's auto-mode notice can blame the local address for a failed server-side
+check. That is a misattribution: `clens`'s upstream here is DeepSeek's
+Anthropic-compatible endpoint, so Anthropic's server-side checks can never run there.
+Opt out with `CLAUDE_CODE_AUTO_MODE_SERVER=0`, or route to `api.anthropic.com` (which is
+mutually exclusive with DeepSeek models). `clens` itself is byte-transparent to what
+it forwards — a test pins that — so there is nothing to fix on this side.
 
 ## Dashboard
 
