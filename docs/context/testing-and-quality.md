@@ -9,7 +9,7 @@
 | Unit + integration | Go's stdlib `testing` only — no assertion library, no mocking framework | `*_test.go` beside the code | [go.mod](../../go.mod) has no test dependency |
 | End-to-end | none — no suite; one recorded manual run instead | [docs/acceptance.md](../acceptance.md) | the doc states which half could not be run |
 
-**59 test files, 19,978 lines** against 16,665 lines of non-test Go (re-measured at the branch tip
+**72 test files as of GI#16** (line figures below are the GI-15 count: 59 files, 19,978 lines) against 16,665 lines of non-test Go (re-measured at the branch tip
 of `GI-15-deepseek-capture-gap`; GI-15 added no new test file, one new test function in the existing
 `internal/proxy/proxy_test.go`). Beads 01–06 added no new test file — every case
 landed in an existing file: `internal/store/store_test.go`, `internal/consumer/consumer_test.go`,
@@ -65,6 +65,11 @@ Named for the invariant, not the function — that convention is documented in
 | An unobserved zero is not a measurement, and not a disagreement | `TestMergeDoesNotLetABodylessRowZeroObservedUsage` (both orderings, counts *and* no warning) + `TestMergeStillWarnsOnATrueDisagreement` (the warning that must survive) | [internal/store/merge_test.go](../../internal/store/merge_test.go) |
 | **`--body-policy` accepts exactly the values that do something** | `TestBodyPolicyAcceptsExactlyTheValuesThatDoSomething` — asserted in **both** directions. The positive half is the load-bearing one: `truncated` was accepted and read nowhere for the project's whole life, so a negative-only assertion would have been green throughout | [internal/config/config_test.go](../../internal/config/config_test.go) |
 | **A handler panic fails the test that provoked it** | `proxyServer(t, h)` — every proxy test builds its server through this, which points `httptest`'s `ErrorLog` at a buffer and fails the test if the recovered panic text lands there. `net/http` recovers handler panics, so without it a panic on the capture path is a green test plus a silently missing row — which is exactly how the `--body-policy off` nil-deref survived a full suite | [internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go) |
+
+| **Archival never loses a body** | fault injection through a `func(step int) error` hook (`RestoreBodies`) and crash-point tests for the archiver (`errCrash`); asserts the body is recoverable at every step | [internal/store/archive_ops_test.go](../../internal/store/archive_ops_test.go) |
+| **Archive-aware writers** | merge, purge, rekey, reflag treat archived rows correctly | [internal/store/archive_writers_test.go](../../internal/store/archive_writers_test.go) |
+| **Proxy byte pass-through** | `TestPassThrough*` (unknown fields, SSE + tool-use IDs, unknown/credential headers; sink copy redacted) | [internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go) |
+| **Composed integration + live-copy migration** | `TestMigrationOnACopyOfTheLiveStore` runs only when `CLENS_LIVE_COPY_DB` points at a *copy* (never the live DB) | [internal/cli/integration_gi16_test.go](../../internal/cli/integration_gi16_test.go) |
 
 ### The one test that is a design gate
 

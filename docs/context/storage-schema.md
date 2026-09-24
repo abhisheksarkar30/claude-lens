@@ -30,7 +30,7 @@ subsequent boot would fail with `duplicate column name` and no recovery but dele
 A version *ahead* of the binary is refused, not guessed at: `migrate` errors rather than opening a
 database written by a newer `clens`.
 
-**`schemaVersion` is 4** as of GI#13. Migration 1→2 replaces `idx_events_session_id` with a composite
+**`schemaVersion` is 5** as of GI#16 (4 as of GI#13). Migration 1→2 replaces `idx_events_session_id` with a composite
 index on `(session_id, started_at)` and drops the single-column one, since it is now a redundant
 prefix that would otherwise charge every insert for an index nothing reads. The composite exists
 because the session-scoped analyzer pass's own read (`WHERE session_id = ? ORDER BY started_at ASC`,
@@ -39,7 +39,7 @@ materialized the session's rows — BLOBs included — and spilled the sort to a
 flush; see [decisions/010](decisions/010-per-session-dedupe-accepts-warning-subset.md) for the fold
 that accompanies this fix.
 
-Migration 2→3 adds `req_tool_names` (below). Migration 3→4 adds `idx_events_stats`, a covering
+Migration 4→5 (GI#16) adds the `body_archive` marker table and nothing else — `events` is untouched, so there is no table rewrite; on an existing database `schema.sql` (run first) has already created it and the migration step is a versioned no-op. Migration 2→3 adds `req_tool_names` (below). Migration 3→4 adds `idx_events_stats`, a covering
 index for `/api/stats`' aggregate queries — see the indexes list and §The stats covering index
 below. It does **not** drop `idx_events_cost_source`: an earlier version of this migration folded
 that index's one job (`cost_source`) into `idx_events_stats` and dropped it, on the reasoning that
@@ -62,6 +62,7 @@ changing a column: see [architecture.md](architecture.md) and [cost-and-quota.md
 |---|---|---|---|---|
 | `events` | one row per captured call: identity, tokens, cost, the proxy-only request/response columns, and the transcript-only reconstruction columns | `id`, `request_id`, `source`, `first_source`, `session_id`, `total_prompt_tokens`, `cost_usd`, `api_equivalent_cost_usd`, `cost_source`, `req_tool_names`, `req_body`/`resp_body`/`req_headers`/`resp_headers`, `transcript_content`/`transcript_role` (48 columns) | `request_id` **UNIQUE** (this is what makes the merge possible); a composite index on `(session_id, started_at)`, plus `started_at`, `cost_source`, and the covering index `idx_events_stats` (below) | [schema.sql](../../internal/store/schema.sql) |
 | `sessions` | the per-session fold: summed tokens, priced/unpriced counts, warning count | `id` PK, `prefix_hash`, `first_seen`/`last_seen`, every token column, `priced_count`, `unpriced_count`, `model_set`, `warning_count`, both cost columns | no FK — the link to `events` is by `session_id` value only | [schema.sql](../../internal/store/schema.sql) |
+| `body_archive` | GI#16: marks an event whose bodies moved to a per-UTC-day file; a marker only, `events` keeps every aggregate | `event_id` (PK), `day` (UTC `YYYY-MM-DD` of `started_at`, names the file), `archived_at`, `body_mask` (1 `req_body`, 2 `resp_body`, 4 `transcript_content`) | `event_id REFERENCES events(id) ON DELETE CASCADE`; `idx_body_archive_day` | [schema.sql](../../internal/store/schema.sql) |
 | `warnings` | one row per (event, kind) | `event_id`, `kind`, `severity`, `detail`, `path` | `UNIQUE(event_id, kind)`; `REFERENCES events(id) ON DELETE CASCADE` | [schema.sql](../../internal/store/schema.sql) |
 
 **Collector output** — what a source reported:
@@ -90,11 +91,12 @@ of a quietly short chart.
 erDiagram
   sessions ||..o{ events : "session_id (value link, no FK)"
   events ||--o{ warnings : "event_id, ON DELETE CASCADE"
+  events ||--o| body_archive : "event_id, ON DELETE CASCADE"
   prices }o..|| events : "model at started_at (not a FK)"
   ingest_state }o..o{ events : "source -> cursor (not a FK)"
 ```
 
-Only the `events → warnings` edge is enforced by the database. The other three are value
+Only the `events → warnings` and `events → body_archive` edges are enforced by the database. The others are value
 relationships the queries join on; a `session_id` that names no session row is representable and
 would not be caught by SQLite.
 
@@ -166,10 +168,38 @@ comparison never decides *whether* a capture is complete — `capture_complete` 
 marker only draws when it is `false`. The comparison decides *which* body to name, and when it cannot,
 the marker degrades to the honest disjunction rather than asserting a cause it cannot see.
 
+## Body archival (GI#16)
+
+Bodies are ~99.5% of `lens.db`, so only they move. `Archiver` ([archiver.go](../../internal/store/archiver.go))
+copies `req_body` / `resp_body` / `transcript_content` of rows older than `HotDays` into
+`<dir of the DB>/archive/bodies-YYYY-MM-DD.db` (one file per UTC day of `started_at`; dir `0700`, files
+`0600`, both no-ops on Windows) and NULLs the hot columns. A day file's `bodies` table
+([archive.go](../../internal/store/archive.go)) holds, per event, a `body_mask`, a per-blob codec (`zstd`, or
+`raw` when compression would not shrink it), the original lengths and the blobs.
+
+- **The day-file row's mask is the authority; the `body_archive.body_mask` marker lags but never over-claims.**
+  Writes are a monotone upsert (mask ORs, each column keeps its existing value when the write does not carry it).
+- **Archiver order per batch:** read → write day file → verify (read-back of lengths and mask) + commit → one hot
+  transaction that upserts the marker and NULLs exactly the masked columns. A crash between any two steps leaves
+  the body in at least one place. Batches are small (rows and bytes capped) with a pause, so the single write
+  connection is never held long.
+- **Rows awaiting `backfill-tool-names` are held back** (`req_body IS NOT NULL AND req_tool_names IS NULL`).
+- **Read path:** `GetEvent` and `ListEventsFull` hydrate — they fill only the empty masked columns and set
+  `Event.BodiesArchived` (`""` / `"restored"` / `"missing"`); `EventFilter.SkipHydrate` opts out (boot redaction
+  scan). Hydration never errors: a broken archive says `"missing"`. `Event.ArchivedBodyMask` is `json:"-"`.
+- **Merge:** `getEventByRequestIDTx` reads only the marker's mask; a body column counts as present if hot *or*
+  in the mask, so a merge never backfills over an archived body.
+- **GC:** `GCArchive` deletes day-file rows with no marker *and* every hot body column NULL, and removes emptied
+  files. A row with a marker, or with hot bodies still present (an interrupted restore), is never collected.
+- **Writers that read bodies skip archived rows:** `rekey` pass 1 (`RekeyPass1Report.Skipped`) and `reflag`
+  (`ReflagCounts.Archived`) report them and name `clens archive restore` as the remedy.
+- `PurgeableBytes(ctx, cutoff)` now returns `(bytes, skippedDays, err)`, adding the archived `req_len+resp_len`.
+- No `VACUUM` is ever run by `serve`; the hot file does not shrink on its own (see the README runbook).
+
 ## `req_tool_names` (br-GI-13-07)
 
-NULL-or-JSON, not NULL-or-empty: `req_tool_names IS NOT NULL` is the same test as "this row has a
-stored request body at all," matching `req_body`'s own contract — a JSONL-sourced row or a proxy
+NULL-or-JSON, not NULL-or-empty: `req_tool_names IS NOT NULL` is the same test as "this call had a
+request body, hot or archived" (GI#16: archival clears `req_body` but leaves this column, and the merge write-back keeps it non-NULL for an archived body), matching `req_body`'s own contract — a JSONL-sourced row or a proxy
 row captured under `--body-policy off` has it NULL. When not NULL it is a JSON-encoded array of the
 request's tool names in body order (`'[]'` when the body declares none), written once at insert
 time by the same package that parses the body
@@ -252,5 +282,5 @@ and `TestSessionCostSplit` — pins all of it.
 | **Upsert over append** | Collector output is keyed and upserted (`ON CONFLICT … DO UPDATE`), so re-running a collector is idempotent — `TestAdminUpsertIdempotent`, `TestIngestStateUpsert`, `TestWarningUpsertIdempotent`. |
 | **`prices` is append-only** | A rate change inserts a new `(model, effective_from)` row; the row in force at an event's time is the one with the greatest `effective_from ≤ started_at`. |
 | **No soft deletes** | `clens purge` and `clens rekey` delete rows — the two destructive commands. Both default to the opposite of destructive: nothing goes without `--yes`, and `--dry-run` prints what `--yes` would have removed. |
-| **Cascade is scoped** | `ON DELETE CASCADE` appears only on `warnings.event_id`. Purging an event takes its warnings with it; nothing else cascades. |
+| **Cascade is scoped** | `ON DELETE CASCADE` appears on `warnings.event_id` and `body_archive.event_id`. Purging an event takes its warnings and its archive marker with it; the purge writers then run `GCArchive` so the day files hold no orphan rows. Nothing else cascades. |
 | **Concurrency** | Readers proceed during a write batch — `SetMaxOpenConns(1)` serializes writers, not readers. `TestConcurrentReadersDuringWriteBatch`. |

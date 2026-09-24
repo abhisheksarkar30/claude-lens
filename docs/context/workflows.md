@@ -268,3 +268,20 @@ sequenceDiagram
 - **Calibration proposes; the user disposes.** Candidates are offered for confirmation, never
   applied silently.
 - **Read-only:** this flow writes nothing.
+
+## 7. Restart: `clens restart` (GI#16)
+
+1. Read `serve.state.json`; retain exe + args (the graceful exit deletes the file).
+2. `POST /api/shutdown`; wait for both ports to close, **then** for the old state file to vanish or its pid to
+   change. It is removed only after the consumer drain, so this stops a successor starting while the old
+   process is still flushing.
+3. Relaunch detached (`detach_windows.go` / `detach_unix.go`) from the recorded exe/args, or `--exe`; poll
+   `/api/health`; print the measured proxy gap.
+4. Unhealthy replacement: kill it; if `--exe` swapped the binary, relaunch the retained old exe. Non-zero exit.
+
+## 8. Archival pass (GI#16)
+
+`Archiver`, per batch: read rows older than `HotDays` (skipping rows awaiting `backfill-tool-names`), upsert
+the day file, verify + commit, then one hot transaction marks `body_archive` and NULLs the masked columns.
+`clens archive restore` is the inverse: hot columns + marker delete in one transaction, then delete the day-file
+row. A crash at any step leaves the body in at least one place. See [storage-schema.md](storage-schema.md).

@@ -89,6 +89,7 @@ Decoding is display-only: nothing here writes back, and replay sends the stored 
 | `POST` | `/api/accounts` | same-origin | save the accounts file | `503` without `SetAccountWriter` |
 | `POST` | `/api/secrets` | same-origin | store a credential | `503` without `SetCredentialWriter` |
 | `POST` | `/api/ingest` | same-origin | run every collector once | `503` without `SetIngestTrigger` |
+| `POST` | `/api/reload` | same-origin **+ loopback caller** (GI#16) | `clens reload`: re-read config with the boot args and apply live exactly `Accounts`, `RetentionDays`, `HotDays`; the JSON reply lists what was applied and what needs a restart. All-or-nothing | `503` without the reload hook |
 | `POST` | `/api/shutdown` | same-origin **+ loopback caller** (GI#13) | `clens shutdown`'s remote-triggered graceful stop — the same cancel func Ctrl+C already drives | `503` without `SetShutdown`; response is written before the func runs, on its own goroutine |
 
 ### The write guards
@@ -100,11 +101,11 @@ Decoding is display-only: nothing here writes back, and replay sends the stored 
    `Host`, compared as host:port. A cross-origin POST gets `403`.
 2. **Opt-in for the one billable route** — replay sends a real, billable call, so it is off unless
    the server was started with `--replay`.
-3. **Loopback caller, for the one process-stopping route** (GI#13) — `originReject` alone checks
+3. **Loopback caller, for the process-stopping and process-reconfiguring routes** (GI#13, GI#16: `/api/shutdown`, `/api/reload`) — `originReject` alone checks
    only the `Host` header, which is the DNS-rebinding case (a page whose own hostname resolves to
    `127.0.0.1`). A caller that can already reach a dashboard bound to `0.0.0.0` (`--allow-remote`)
    can send `Host: 127.0.0.1` and pass that guard regardless of where the connection actually came
-   from. `/api/shutdown` additionally checks `r.RemoteAddr` itself against a loopback predicate —
+   from. `/api/shutdown` and `/api/reload` additionally check `r.RemoteAddr` themselves against a loopback predicate —
    `--allow-remote` widens neither guard for this route; it is loopback-only unconditionally. See
    [security-and-permissions.md](security-and-permissions.md).
 
@@ -130,3 +131,8 @@ Real observed responses from the acceptance run are recorded in
 [docs/acceptance.md](../acceptance.md) §Local half — including `GET /api/quota` answering `200`
 with a `"(no accounts configured)"`-shaped body rather than `503`, because its read seam *is*
 wired. No sample JSON is reproduced here; the acceptance doc is the record.
+
+**GI#16 wire additions:** the call-detail response and `ls --json` / `export` rows carry an additive
+`BodiesArchived` key (`""` / `"restored"` / `"missing"`, from `Event.BodiesArchived`); `ArchivedBodyMask` is
+`json:"-"` and never on the wire. A missing archive file never becomes an HTTP error: the row is served with
+its bodies empty and `BodiesArchived: "missing"`. There is no archive route; `clens archive status` is the surface.

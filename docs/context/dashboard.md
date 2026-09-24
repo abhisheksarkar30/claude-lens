@@ -20,8 +20,8 @@ a transpile step, or a `<script src="https://…">` is a design change, not a re
 
 | File | Lines | Role |
 |---|---|---|
-| [index.html](../../internal/web/index.html) | 173 | the shell: header totals, the proxy-mode badge, the tab nav, one `<section class="view">` per tab |
-| [app.js](../../internal/web/app.js) | 1142 | every fetch, every table render, the three SVG charts, the body/header renderers, and the one SSE subscription |
+| [index.html](../../internal/web/index.html) | 178 | the shell: header totals, the proxy-mode badge, the tab nav, one `<section class="view">` per tab |
+| [app.js](../../internal/web/app.js) | 1183 | every fetch, every table render, the three SVG charts, the body/header renderers, and the one SSE subscription |
 | [style.css](../../internal/web/style.css) | 240 | |
 
 ## The proxy-mode badge
@@ -106,9 +106,12 @@ for `month`.
 
 The two selects are not the same control, and the difference is load-bearing:
 
-- **Calls offers no `custom`.** It never had a free-text pair, so a `custom` entry there would be a
-  selectable control that filters nothing. Its default is `""` — "any time", which filters nothing
-  and is what the tab did before the picker existed.
+- **Calls offers `custom` (GI#16) as an hour-precision from/to pair**, `c-from` / `c-to`
+  (`datetime-local`). `customWindow(fromVal, toVal)` calls `timeWindow('hour', …)` twice — `since`
+  from the from-hour's start, `until` from the to-hour's end — so there is still exactly one place
+  the `±hh:mm` offset is built. Either bound may be empty (open-ended); a `to` before `from` shows
+  an inline message (`c-range-msg`) and applies no window. The labels, not the inputs, are what the
+  picker hides and reveals. Its default is still `""` — "any time".
 - **Stats offers `custom` and keeps `s-since` / `s-until`**, which remain the only way to ask for
   `24h` or an arbitrary RFC3339 range. `custom` is its default and reveals them.
 
@@ -208,7 +211,7 @@ dropped mount point:
 | `TestAssetsTheBadgeIsInTheHeader` | the proxy-mode badge is inside `<header class="app-header">`, so it is on every tab — putting it on the Sources tab would make it depend on the user already suspecting something |
 | `TestAssetsTheCallDetailReplacesTheList` | the two-mode wiring above: both list wrappers exist, both details are declared `hidden`, each setter is two-sided, each detail renders its own back control, and the `[data-call]` branch of the delegated click handler reveals Calls **without** fetching a list. That last assertion is the reported defect, and it is invisible to every other check in this file — the pre-fix `app.js` passed all of them. Its siblings `TestAssetsTheDetailModeFlipFollowsTheFetch` and `TestAssetsShowResetsBothModesUnconditionally` pin the two orderings a refactor would silently reverse (mode flip after the fetch resolves; both resets unconditional) and that a stale response is dropped |
 | `TestAssetsTimeWindowBuildsTheOffsetByHand` | the window picker's one computation is source-shaped, not behaviour-tested: scoped to the `timeWindow` slice, it asserts the `±hh:mm` suffix is built from `getTimezoneOffset()` **and** that `toISOString()` is not called — the trailing `Z` it emits is accepted as UTC by Go rather than rejected, so the window would silently denote a different day. The negative half is scoped to that slice rather than the whole file, so a future legitimate use elsewhere is not a tripwire |
-| `TestAssetsThePickerMountsBothTabs` | both `callFilter` and `loadStats` route their bounds through `timeWindow(`; Calls' select carries no `value="custom"` while Stats' does; both offer hour/date/month; and Stats keeps its `s-since`/`s-until` pair, without which `24h` and arbitrary RFC3339 ranges would silently cease to exist |
+| `TestAssetsThePickerMountsBothTabs` | both `callFilter` and `loadStats` route their bounds through `timeWindow(`; both selects carry `value="custom"` and Calls mounts `c-from`/`c-to` as `datetime-local` (its default stays an empty-valued option); both offer hour/date/month; and Stats keeps its `s-since`/`s-until` pair, without which `24h` and arbitrary RFC3339 ranges would silently cease to exist |
 
 A tab that renders a permanently blank panel, or a chart that loses its accessible labels, fails
 here rather than in a browser.
