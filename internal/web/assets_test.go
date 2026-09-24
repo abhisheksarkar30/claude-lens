@@ -531,6 +531,21 @@ func TestAssetsTheBodyRendererEscapes(t *testing.T) {
 		}
 	}
 
+	// br-GI-16-10: an archived row names its state, and "missing" is its own
+	// claim -- it must never read as the "not captured" absence.
+	for _, want := range []string{
+		"BodiesArchived",
+		"bodies loaded from the archive",
+		"archived — archive file",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("app.js is missing the archived-state text %q", want)
+		}
+	}
+	if strings.Contains("archived — archive file", "not captured") {
+		t.Error("the missing-archive message must not read as not captured")
+	}
+
 	// The third content column needs the third marker (br-GI-7-09).
 	// transcript_content is bounded by the same cap the bodies are, so without
 	// this a reconstruction cut at the cap renders identically to a whole one --

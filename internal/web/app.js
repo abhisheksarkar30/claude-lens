@@ -188,6 +188,20 @@ function readPathMarker(e) {
   return '';
 }
 
+// archiveNote says where an archived row's bodies came from. `missing` is its own
+// claim -- the row was archived and the archive cannot be read -- and must never
+// read as "not captured", which would tell an operator who moved archive/ that
+// the call had no body. The day is the UTC day of started_at, which names the file.
+function archiveNote(e) {
+  if (!e.BodiesArchived) return '';
+  const d = new Date(e.StartedAt);
+  const day = isNaN(d) ? '' : d.toISOString().slice(0, 10);
+  if (e.BodiesArchived === 'missing') {
+    return '<p class="body-marker">archived — archive file' + (day ? ' for ' + esc(day) : '') + ' not found</p>';
+  }
+  return '<p class="body-marker">bodies loaded from the archive' + (day ? ' (' + esc(day) + ')' : '') + '</p>';
+}
+
 // captureMarker reports a capture the proxy could not finish, in the CLI's own
 // wording. CaptureComplete is false exactly when a body was cut at the cap,
 // so the line names the cap only in the one case where it is knowably the
@@ -464,7 +478,7 @@ async function showCall(id, seq) {
     ? (e.TranscriptContent
       ? bodySection('reconstructed from transcript — not a wire capture', e.TranscriptContent,
         transcriptCapMarker(e))
-      : '<p class="muted">not captured — transcript source</p>')
+      : (e.BodiesArchived === 'missing' ? '' : '<p class="muted">not captured — transcript source</p>'))
     : headerRows('Request headers', e.ReqHeaders) +
       headerRows('Response headers', e.RespHeaders) +
       bodySection('Request body', e.ReqBody, '') +
@@ -478,6 +492,7 @@ async function showCall(id, seq) {
   $('call-detail').innerHTML =
     '<p><button type="button" id="call-back">‹ all calls</button></p>' +
     '<h2>Call ' + esc(e.ID) + '</h2><table class="kv">' + details + '</table>' +
+    archiveNote(e) +
     (capture ? '<p class="body-marker">' + capture + '</p>' : '') +
     sections +
     (warnings ? '<h3>Warnings</h3><ul>' + warnings + '</ul>' : '') +
