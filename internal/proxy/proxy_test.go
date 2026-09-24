@@ -642,3 +642,112 @@ func TestResponseDerivedRequestIDWins(t *testing.T) {
 		t.Errorf("RequestIDHeader = %q, want req_abc123", call.RequestIDHeader)
 	}
 }
+
+// waitForSinkStat polls sk.Stats() until want reports satisfied, or fails the
+// test after 2s. Polling rather than draining: draining a capacity-1 sink to
+// confirm the first call landed would empty the very slot the test needs full
+// for the second call's drop.
+func waitForSinkStat(t *testing.T, sk *sink.Sink, want func(accepted, dropped uint64) bool) (accepted, dropped uint64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		accepted, dropped = sk.Stats()
+		if want(accepted, dropped) {
+			return accepted, dropped
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("sink stats did not reach the wanted state within 2s: accepted=%d dropped=%d", accepted, dropped)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// TestSubmitLogsADropWithoutTheBody is F3.1/F4.1's regression test: a dropped
+// capture must be logged (closing the fail-open gap this bead exists for),
+// and the log line must never carry request/response body or header content
+// -- only the negative-containment assertion below actually enforces that; a
+// lazy log.Printf("dropped: %s", call.ReqBody) convenience leak would pass
+// every positive assertion here and still leak the body. (Not %+v on the
+// whole struct: Go's fmt renders a []byte field under %+v as a slice of
+// decimal integers, never as text, so that particular shape of struct-dump
+// would not trip this string-containment check even though the bytes are
+// technically still present, decimal-encoded, in the output.)
+func TestSubmitLogsADropWithoutTheBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.ReadAll(r.Body)
+		w.Write([]byte("{}"))
+	}))
+	defer upstream.Close()
+
+	sk := sink.New(1)
+	h, err := New(testConfig(upstream.URL), sk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxySrv := proxyServer(t, h)
+	defer proxySrv.Close()
+
+	var mu sync.Mutex
+	var logged bytes.Buffer
+	prevOutput := log.Writer()
+	log.SetOutput(&lockedWriter{mu: &mu, w: &logged})
+	t.Cleanup(func() { log.SetOutput(prevOutput) })
+
+	// First request fills the capacity-1 sink. Wait for the sink to actually
+	// record it before firing the second -- submit() runs from the response
+	// body's Close hook, on the server's own goroutine, so nothing guarantees
+	// it has run yet just because the client has read the response.
+	resp1, err := http.Post(proxySrv.URL+"/v1/messages", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	waitForSinkStat(t, sk, func(accepted, _ uint64) bool { return accepted >= 1 })
+
+	// Not an Authorization-header sentinel: redactHeaders replaces that value
+	// with "[redacted]" before captureState is even constructed (proxy.go's
+	// request handler), so a header-based sentinel would pass this check
+	// unconditionally regardless of what the drop log actually does. Only a
+	// request-body sentinel exercises the leak this test guards against.
+	const sentinel = "sentinel-9f3a7c2e-do-not-leak"
+	resp2, err := http.Post(proxySrv.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"note":"`+sentinel+`"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+
+	_, dropped := waitForSinkStat(t, sk, func(_, dropped uint64) bool { return dropped >= 1 })
+	if dropped != 1 {
+		t.Fatalf("sk.Stats() dropped = %d, want 1", dropped)
+	}
+
+	// The log.Printf call is the statement right after Submit() returns false,
+	// on the same goroutine -- but that goroutine is the server's, not this
+	// test's, so observing sk.Stats()'s dropped counter above does not by
+	// itself guarantee the log write that follows it has landed yet. Poll for
+	// it rather than reading the buffer once.
+	var logOutput string
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		logOutput = logged.String()
+		mu.Unlock()
+		if logOutput != "" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	if logOutput == "" {
+		t.Fatal("drop log is empty, want a line reporting the dropped capture")
+	}
+	if !strings.Contains(logOutput, "/v1/messages") {
+		t.Errorf("drop log = %q, want it to mention the request path", logOutput)
+	}
+	if strings.Contains(logOutput, sentinel) {
+		t.Errorf("drop log leaked the request body: %q", logOutput)
+	}
+}

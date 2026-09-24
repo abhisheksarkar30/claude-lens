@@ -9,8 +9,9 @@
 | Unit + integration | Go's stdlib `testing` only — no assertion library, no mocking framework | `*_test.go` beside the code | [go.mod](../../go.mod) has no test dependency |
 | End-to-end | none — no suite; one recorded manual run instead | [docs/acceptance.md](../acceptance.md) | the doc states which half could not be run |
 
-**59 test files, 19,841 lines** against 16,660 lines of non-test Go (re-measured at the branch tip
-of `GI-13-session-pass-cost`, all nine beads). Beads 01–06 added no new test file — every case
+**59 test files, 19,978 lines** against 16,665 lines of non-test Go (re-measured at the branch tip
+of `GI-15-deepseek-capture-gap`; GI-15 added no new test file, one new test function in the existing
+`internal/proxy/proxy_test.go`). Beads 01–06 added no new test file — every case
 landed in an existing file: `internal/store/store_test.go`, `internal/consumer/consumer_test.go`,
 `internal/jsonlogs/jsonlogs_test.go`, `internal/analyze/rules_test.go`,
 `internal/config/config_test.go`, `internal/cli/doctor_test.go`, `internal/cli/serve_test.go`, and
@@ -42,6 +43,7 @@ Named for the invariant, not the function — that convention is documented in
 | **The hot path never buffers the stream** | `TestNoBufferingSSE` — a fake upstream streaming SSE slowly, asserting the client sees its first event *before* upstream sends its last | [internal/proxy/proxy_test.go:40](../../internal/proxy/proxy_test.go#L40) |
 | Bytes pass through unchanged | `TestByteIdentityNonStreaming` | [internal/proxy/proxy_test.go:95](../../internal/proxy/proxy_test.go#L95) |
 | A broken observer never breaks the session | `TestFailOpenOnUpstreamFailure` | [internal/proxy/proxy_test.go:139](../../internal/proxy/proxy_test.go#L139) |
+| A dropped capture under load is logged, not silently lost | `TestSubmitLogsADropWithoutTheBody` — a capacity-1 sink forces a deterministic drop; asserts `Sink.Stats()` counts it, the log line names the path, and a negative-containment check confirms the line never carries the request body | [internal/proxy/proxy_test.go](../../internal/proxy/proxy_test.go) |
 | Credentials are redacted before the tee | redact tests | [internal/proxy/redact_test.go](../../internal/proxy/redact_test.go) |
 | **The two billing models are never summed** | `TestBillingModeInvariants`, `TestSessionCostSplit` | [internal/store/store_test.go:179](../../internal/store/store_test.go#L179) |
 | **`input_tokens` is the uncached remainder** | `TestDerivedPromptTotal` | [internal/store/store_test.go:151](../../internal/store/store_test.go#L151) |

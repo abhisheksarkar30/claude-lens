@@ -38,9 +38,9 @@ type CapturedCall struct {
 	ReqBody     []byte      // body policy already applied by the caller
 	RespBody    []byte      // nil while streaming; filled by a separate accumulator
 
-	// CaptureComplete is false when either body was truncated by the cap, or
-	// the stream ended without message_stop — the merge-precedence flag
-	// downstream storage reads.
+	// CaptureComplete is false exactly when either body was truncated by the
+	// cap — the merge-precedence flag downstream storage reads. It says
+	// nothing about SSE framing: the hot path never parses the stream.
 	//
 	// Both bodies: a request body over the cap is stored as a prefix exactly
 	// as a response body is, and a flag derived from one of them reports a
