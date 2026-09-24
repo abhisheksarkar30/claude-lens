@@ -98,6 +98,7 @@ func runDoctor(args []string, w io.Writer) error {
 		{"allow_remote", fmt.Sprintf("%t", cfg.AllowRemote)},
 		{"session_gap_minutes", fmt.Sprintf("%d", cfg.SessionGapMinutes)},
 		{"retention_days", fmt.Sprintf("%d", cfg.RetentionDays)},
+		{"hot_days", fmt.Sprintf("%d", cfg.HotDays)},
 		{"replay_enabled", fmt.Sprintf("%t", cfg.ReplayEnabled)},
 		{"accounts_configured", fmt.Sprintf("%d", len(cfg.Accounts))},
 		{"peak_off_peak_dates", effectivePeakDates(cfg.PeakOffPeakDates)},
@@ -204,8 +205,43 @@ func runChecks(cfg *config.Config) []doctorCheck {
 	checks = append(checks, clientConfigCheck())
 	checks = append(checks, dbSchemaCheck(cfg))
 	checks = append(checks, toolNamesBackfillCheck(cfg))
+	checks = append(checks, archiveDirCheck(cfg))
 
 	return checks
+}
+
+// archiveDirCheck WARNs when the body-archive directory (next to the live DB)
+// exists or would be created but cannot be written, so the archiver's failure
+// is seen here rather than at its first nightly run. It creates nothing: it
+// probes the nearest existing ancestor.
+func archiveDirCheck(cfg *config.Config) doctorCheck {
+	const name = "archive_dir"
+	if cfg.HotDays == 0 {
+		return doctorCheck{name, statusPass, "archival disabled (hot_days = 0)"}
+	}
+	dir := filepath.Join(filepath.Dir(cfg.DBPath), "archive")
+	p := dir
+	for {
+		fi, err := os.Stat(p)
+		if err == nil {
+			if !fi.IsDir() {
+				return doctorCheck{name, statusWarn, fmt.Sprintf("%s is not a directory, so %s cannot be created", p, dir)}
+			}
+			break
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			return doctorCheck{name, statusWarn, fmt.Sprintf("no existing ancestor of %s", dir)}
+		}
+		p = parent
+	}
+	f, err := os.CreateTemp(p, ".clens-doctor-*")
+	if err != nil {
+		return doctorCheck{name, statusWarn, fmt.Sprintf("%s is not writable: %v", p, err)}
+	}
+	f.Close()
+	os.Remove(f.Name())
+	return doctorCheck{name, statusPass, dir}
 }
 
 // toolNamesBackfillCheck reports how many rows still await `clens

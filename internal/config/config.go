@@ -48,6 +48,9 @@ type Config struct {
 	AllowRemote       bool
 	SessionGapMinutes int
 	RetentionDays     int
+	// HotDays is how many days a body stays in the live DB before the archiver
+	// moves it to a day file. 0 disables archival (bodies stay hot forever).
+	HotDays       int
 	ReplayEnabled     bool
 	AccountsPath      string
 	Accounts          []Account
@@ -80,6 +83,7 @@ func Default() *Config {
 		AllowRemote:       false,
 		SessionGapMinutes: 30,
 		RetentionDays:     0,
+		HotDays:           7,
 		ReplayEnabled:     false,
 		AccountsPath:      defaultPath("accounts.toml"),
 	}
@@ -120,6 +124,7 @@ var fieldsByEnv = map[string]string{
 	"CLENS_ALLOW_REMOTE":        "AllowRemote",
 	"CLENS_SESSION_GAP_MINUTES": "SessionGapMinutes",
 	"CLENS_RETENTION_DAYS":      "RetentionDays",
+	"CLENS_HOT_DAYS":            "HotDays",
 	"CLENS_REPLAY_ENABLED":      "ReplayEnabled",
 	"CLENS_ACCOUNTS_PATH":       "AccountsPath",
 	"CLENS_PEAK_OFF_PEAK_DATES": "PeakOffPeakDates",
@@ -212,6 +217,8 @@ func applyKV(cfg *Config, kv map[string]string) error {
 			cfg.SessionGapMinutes, err = strconv.Atoi(val)
 		case "RetentionDays":
 			cfg.RetentionDays, err = strconv.Atoi(val)
+		case "HotDays":
+			cfg.HotDays, err = strconv.Atoi(val)
 		case "ReplayEnabled":
 			cfg.ReplayEnabled, err = strconv.ParseBool(val)
 		case "AccountsPath":
@@ -246,6 +253,7 @@ func applyFlags(cfg *Config, args []string) error {
 	fs.BoolVar(&cfg.AllowRemote, "allow-remote", cfg.AllowRemote, "allow non-loopback bind addresses")
 	fs.IntVar(&cfg.SessionGapMinutes, "session-gap-minutes", cfg.SessionGapMinutes, "minutes of inactivity before a new session")
 	fs.IntVar(&cfg.RetentionDays, "retention-days", cfg.RetentionDays, "purge requests older than this many days; 0 means keep forever")
+	fs.IntVar(&cfg.HotDays, "hot-days", cfg.HotDays, "days a body stays in the live DB before it is archived; 0 disables archival")
 	fs.BoolVar(&cfg.ReplayEnabled, "replay", cfg.ReplayEnabled, "enable the replay endpoint")
 	fs.StringVar(&cfg.AccountsPath, "accounts-path", cfg.AccountsPath, "accounts file path")
 	fs.StringVar(&cfg.PprofAddr, "pprof-addr", cfg.PprofAddr, "serve net/http/pprof on this loopback address (diagnostic; empty disables it)")
@@ -367,6 +375,12 @@ func (c *Config) Validate() error {
 	}
 	if c.RetentionDays < 0 {
 		return fmt.Errorf("config: validate: RetentionDays: must not be negative, got %d", c.RetentionDays)
+	}
+	if c.HotDays < 0 {
+		return fmt.Errorf("config: validate: HotDays: must not be negative, got %d", c.HotDays)
+	}
+	if c.HotDays > 0 && c.RetentionDays > 0 && c.HotDays > c.RetentionDays {
+		return fmt.Errorf("config: validate: HotDays exceeds RetentionDays (%d > %d): nothing would ever be archived before it is deleted", c.HotDays, c.RetentionDays)
 	}
 	// A typo'd date silently stays in peak, which over-charges, so it is
 	// rejected here rather than absorbed.

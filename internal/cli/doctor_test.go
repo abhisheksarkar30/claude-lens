@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/secret"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
@@ -222,5 +223,42 @@ func TestDoctorPrintsNoneForExplicitlyEmptyKeys(t *testing.T) {
 	}
 	if got := doctorRow(t, out, "api_model_prefixes"); got != "none" {
 		t.Errorf("api_model_prefixes = %q, want %q", got, "none")
+	}
+}
+
+func TestDoctorPrintsHotDays(t *testing.T) {
+	withHome(t)
+	var buf bytes.Buffer
+	if err := runDoctor(nil, &buf); err != nil {
+		t.Fatalf("runDoctor: %v\n%s", err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "hot_days") {
+		t.Errorf("doctor does not print hot_days:\n%s", buf.String())
+	}
+}
+
+func TestArchiveDirCheck(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{HotDays: 7, DBPath: filepath.Join(dir, "lens.db")}
+	if c := archiveDirCheck(cfg); c.Status != statusPass {
+		t.Errorf("writable parent: %+v, want PASS", c)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "archive")); err == nil {
+		t.Error("the check created the archive directory; it must only probe")
+	}
+
+	// A path under a regular file cannot exist or be created, on any OS.
+	file := filepath.Join(dir, "afile")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.DBPath = filepath.Join(file, "lens.db")
+	if c := archiveDirCheck(cfg); c.Status != statusWarn {
+		t.Errorf("unwritable archive dir: %+v, want WARN", c)
+	}
+
+	cfg.HotDays = 0
+	if c := archiveDirCheck(cfg); c.Status != statusPass {
+		t.Errorf("archival off: %+v, want PASS (nothing to warn about)", c)
 	}
 }

@@ -392,3 +392,67 @@ func TestValidateRejectsMalformedDatesAndPrefixes(t *testing.T) {
 		t.Errorf("Validate rejected the `none` shape: %v", err)
 	}
 }
+
+func TestHotDaysDefaultAndPrecedence(t *testing.T) {
+	dir := withHome(t)
+	if cfg, err := Load(nil); err != nil || cfg.HotDays != 7 {
+		t.Fatalf("default HotDays = %d, err %v, want 7", cfg.HotDays, err)
+	}
+
+	clensDir := filepath.Join(dir, ".clens")
+	if err := os.MkdirAll(clensDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clensDir, "config.toml"), []byte("HotDays = 3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, _ := Load(nil); cfg.HotDays != 3 {
+		t.Errorf("HotDays from file = %d, want 3", cfg.HotDays)
+	}
+	t.Setenv("CLENS_HOT_DAYS", "5")
+	if cfg, _ := Load(nil); cfg.HotDays != 5 {
+		t.Errorf("env should beat file: HotDays = %d, want 5", cfg.HotDays)
+	}
+	if cfg, _ := Load([]string{"--hot-days", "9"}); cfg.HotDays != 9 {
+		t.Errorf("flag should beat env: HotDays = %d, want 9", cfg.HotDays)
+	}
+}
+
+func TestHotDaysNonIntegerIsAClearError(t *testing.T) {
+	withHome(t)
+	t.Setenv("CLENS_HOT_DAYS", "soon")
+	if _, err := Load(nil); err == nil {
+		t.Error("a non-integer CLENS_HOT_DAYS must be an error")
+	}
+	t.Setenv("CLENS_HOT_DAYS", "")
+	if _, err := Load([]string{"--hot-days", "soon"}); err == nil {
+		t.Error("a non-integer --hot-days must be an error")
+	}
+}
+
+func TestValidateHotDays(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		hot, retained int
+		wantErr       string
+	}{
+		{"negative", -1, 0, "HotDays"},
+		{"exceeds retention", 30, 7, "exceeds RetentionDays"},
+		{"equal to retention", 7, 7, ""},
+		{"retention forever", 30, 0, ""},
+		{"archival off", 0, 7, ""},
+		{"archival off and retention forever", 0, 0, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Default()
+			cfg.HotDays, cfg.RetentionDays = tc.hot, tc.retained
+			err := cfg.Validate()
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Errorf("Validate: %v, want ok", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Errorf("Validate = %v, want it to mention %q", err, tc.wantErr)
+			}
+		})
+	}
+}
