@@ -379,8 +379,8 @@ const callState = { offset: 0, limit: 50 };
 // offset is built -- so the range is inclusive of the hour picked at each end
 // and agrees with the Stats tab. One side empty leaves that side open; an
 // inverted range applies no window and says so.
-function customWindow(fromVal, toVal) {
-  const msg = $('c-range-msg');
+function customWindow(fromVal, toVal, msgId = 'c-range-msg') {
+  const msg = $(msgId);
   const from = timeWindow('hour', fromVal);
   const to = timeWindow('hour', toVal);
   msg.textContent = '';
@@ -624,10 +624,13 @@ async function loadWarnings() {
 
 async function loadStats() {
   const q = new URLSearchParams();
-  const win = timeWindow($('s-window-gran').value, $('s-window-value').value);
+  // The from/to pickers win when either is filled; else the picker/free-text path.
+  const win = ($('s-window-gran').value === 'custom' && ($('s-from').value || $('s-to').value))
+    ? customWindow($('s-from').value, $('s-to').value, 's-range-msg')
+    : timeWindow($('s-window-gran').value, $('s-window-value').value);
   if (win) {
-    q.set('since', win.since);
-    q.set('until', win.until);
+    if (win.since) q.set('since', win.since);
+    if (win.until) q.set('until', win.until);
   } else {
     // `custom` (and an hour/date/month selection with nothing picked yet): the
     // retained free-text pair, exactly as this row behaved before the picker.
@@ -1086,7 +1089,9 @@ mountWindowPicker($('c-window-gran'), $('c-window-value'),
 $('c-from').addEventListener('change', callsReload);
 $('c-to').addEventListener('change', callsReload);
 mountWindowPicker($('s-window-gran'), $('s-window-value'),
-  [$('s-since').closest('label'), $('s-until').closest('label')], loadStats);
+  [$('s-from').closest('label'), $('s-to').closest('label'), $('s-since').closest('label'), $('s-until').closest('label')], loadStats);
+$('s-from').addEventListener('change', loadStats);
+$('s-to').addEventListener('change', loadStats);
 $('s-apply').addEventListener('click', loadStats);
 $('q-apply').addEventListener('click', loadQuota);
 

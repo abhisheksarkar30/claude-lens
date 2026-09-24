@@ -112,7 +112,7 @@ The two selects are not the same control, and the difference is load-bearing:
   the `±hh:mm` offset is built. Either bound may be empty (open-ended); a `to` before `from` shows
   an inline message (`c-range-msg`) and applies no window. The labels, not the inputs, are what the
   picker hides and reveals. Its default is `custom` with both bounds empty (no window), so the pair is visible on load; `any time` remains selectable.
-- **Stats offers `custom` and keeps `s-since` / `s-until`**, which remain the only way to ask for
+- **Stats offers `custom` with the same hour-precision `s-from` / `s-to` pair (GI#16, via `customWindow(…, 's-range-msg')`, taking precedence when filled) and keeps `s-since` / `s-until`**, which remain the only way to ask for
   `24h` or an arbitrary RFC3339 range. `custom` is its default and reveals them.
 
 `timeWindow(gran, value)` is the single place a window becomes a `{since, until}` pair, and it
