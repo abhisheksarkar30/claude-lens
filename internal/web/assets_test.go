@@ -723,11 +723,13 @@ func TestAssetsThePickerMountsBothTabs(t *testing.T) {
 	// no-window path. The control would be advertising a granularity it is not
 	// applying. `custom` is safe on both because it reveals a from/to pair, so
 	// it is never the dead option; it is still not the default on Calls.
-	if strings.Contains(callsOpts, "selected") {
-		t.Error("the Calls picker marks an option `selected`: its default must be the neutral \"any time\" (the first, empty-valued option), or the select displays a granularity that is not being applied")
+	// GI#16: Calls now defaults to `custom` too, so the from/to pair is visible
+	// without a click; both empty is the same no-window path as "any time".
+	if !strings.Contains(callsOpts, `value="custom" selected`) {
+		t.Error("the Calls picker's `custom` is not the default, so the from/to range is hidden on load")
 	}
 	if !strings.Contains(callsOpts, `value=""`) {
-		t.Error("the Calls picker has no empty-valued option, so its default cannot be \"any time\"")
+		t.Error("the Calls picker has no empty-valued `any time` option")
 	}
 	if !strings.Contains(statsOpts, `value="custom" selected`) {
 		t.Error("the Stats picker's `custom` is not the default, so the retained free-text pair is not the one being used")

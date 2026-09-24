@@ -111,7 +111,7 @@ The two selects are not the same control, and the difference is load-bearing:
   from the from-hour's start, `until` from the to-hour's end — so there is still exactly one place
   the `±hh:mm` offset is built. Either bound may be empty (open-ended); a `to` before `from` shows
   an inline message (`c-range-msg`) and applies no window. The labels, not the inputs, are what the
-  picker hides and reveals. Its default is still `""` — "any time".
+  picker hides and reveals. Its default is `custom` with both bounds empty (no window), so the pair is visible on load; `any time` remains selectable.
 - **Stats offers `custom` and keeps `s-since` / `s-until`**, which remain the only way to ask for
   `24h` or an arbitrary RFC3339 range. `custom` is its default and reveals them.
 
@@ -211,7 +211,7 @@ dropped mount point:
 | `TestAssetsTheBadgeIsInTheHeader` | the proxy-mode badge is inside `<header class="app-header">`, so it is on every tab — putting it on the Sources tab would make it depend on the user already suspecting something |
 | `TestAssetsTheCallDetailReplacesTheList` | the two-mode wiring above: both list wrappers exist, both details are declared `hidden`, each setter is two-sided, each detail renders its own back control, and the `[data-call]` branch of the delegated click handler reveals Calls **without** fetching a list. That last assertion is the reported defect, and it is invisible to every other check in this file — the pre-fix `app.js` passed all of them. Its siblings `TestAssetsTheDetailModeFlipFollowsTheFetch` and `TestAssetsShowResetsBothModesUnconditionally` pin the two orderings a refactor would silently reverse (mode flip after the fetch resolves; both resets unconditional) and that a stale response is dropped |
 | `TestAssetsTimeWindowBuildsTheOffsetByHand` | the window picker's one computation is source-shaped, not behaviour-tested: scoped to the `timeWindow` slice, it asserts the `±hh:mm` suffix is built from `getTimezoneOffset()` **and** that `toISOString()` is not called — the trailing `Z` it emits is accepted as UTC by Go rather than rejected, so the window would silently denote a different day. The negative half is scoped to that slice rather than the whole file, so a future legitimate use elsewhere is not a tripwire |
-| `TestAssetsThePickerMountsBothTabs` | both `callFilter` and `loadStats` route their bounds through `timeWindow(`; both selects carry `value="custom"` and Calls mounts `c-from`/`c-to` as `datetime-local` (its default stays an empty-valued option); both offer hour/date/month; and Stats keeps its `s-since`/`s-until` pair, without which `24h` and arbitrary RFC3339 ranges would silently cease to exist |
+| `TestAssetsThePickerMountsBothTabs` | both `callFilter` and `loadStats` route their bounds through `timeWindow(`; both selects carry `value="custom"` and Calls mounts `c-from`/`c-to` as `datetime-local` (Calls now defaults to `custom` as well; `any time` remains an empty-valued option); both offer hour/date/month; and Stats keeps its `s-since`/`s-until` pair, without which `24h` and arbitrary RFC3339 ranges would silently cease to exist |
 
 A tab that renders a permanently blank panel, or a chart that loses its accessible labels, fails
 here rather than in a browser.
