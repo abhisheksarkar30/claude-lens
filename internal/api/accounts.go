@@ -84,9 +84,6 @@ func (a *api) listAccounts(w http.ResponseWriter, r *http.Request) {
 // accounts`'s job; this is the dashboard's re-read button, and saying so is
 // better than a body the handler silently discards.
 //
-// ponytail: the running consumer keeps the account list it booted with, so a
-// newly added account contributes only after a restart -- which is why the
-// response says so rather than implying the reload took effect everywhere.
 func (a *api) saveAccounts(w http.ResponseWriter, r *http.Request) {
 	if reason := originReject(r, "accounts"); reason != "" {
 		writeError(w, http.StatusForbidden, reason)
@@ -104,6 +101,6 @@ func (a *api) saveAccounts(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	accts.Note = "the accounts file was re-read and is valid; a newly added account contributes only after a restart"
+	accts.Note = "the accounts file was re-read and applied; calls from now on are attributed with it"
 	writeJSON(w, http.StatusOK, accts)
 }

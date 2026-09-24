@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -52,6 +53,7 @@ type Store interface {
 type Consumer struct {
 	sk       *sink.Sink
 	st       Store
+	accMu    sync.RWMutex // guards accounts: SetAccounts runs while the loop resolves
 	accounts []config.Account
 
 	resolver     SessionResolver
@@ -88,6 +90,21 @@ func New(sk *sink.Sink, st Store, accounts []config.Account) *Consumer {
 		flushInterval: defaultFlushInterval,
 		shutdownGrace: defaultShutdownGrace,
 	}
+}
+
+// SetAccounts swaps the account list used to attribute later calls, so an
+// edited accounts file takes effect without a restart. Safe to call while Run
+// is resolving; a call already in flight keeps the list it started with.
+func (c *Consumer) SetAccounts(accounts []config.Account) {
+	c.accMu.Lock()
+	c.accounts = accounts
+	c.accMu.Unlock()
+}
+
+func (c *Consumer) resolveAccountNow(authKind string) (name, billingMode string) {
+	c.accMu.RLock()
+	defer c.accMu.RUnlock()
+	return resolveAccount(c.accounts, authKind)
 }
 
 func (c *Consumer) SetSessionResolver(r SessionResolver)     { c.resolver = r }
@@ -332,7 +349,7 @@ func (c *Consumer) processCall(call *sink.CapturedCall) *pendingEvent {
 		ev.SessionID = c.resolver.Resolve(meta, call.StartedAt)
 	}
 
-	account, billingMode := resolveAccount(c.accounts, call.AuthKind)
+	account, billingMode := c.resolveAccountNow(call.AuthKind)
 	ev.Account = account
 	ev.BillingMode = billingMode
 

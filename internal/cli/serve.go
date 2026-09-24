@@ -74,6 +74,7 @@ func Serve(args []string) error {
 	// open", CLAUDE.md).
 	checkRedaction(ctx, st, log.Printf)
 	purgeOnStartup(ctx, st, cfg.RetentionDays, log.Printf)
+	live := &liveSettings{retentionDays: cfg.RetentionDays}
 
 	sk := sink.New(sink.DefaultCapacity)
 	broker := api.NewBroker()
@@ -133,7 +134,11 @@ func Serve(args []string) error {
 	// internal/api never imports secret, config or ingest.
 	dashAPI.SetPricing(priceLoader)
 	dashAPI.SetCredentialWriter(secret.Save)
-	dashAPI.SetAccountWriter(reloadAccounts)
+	// One reloader serves POST /api/reload and the dashboard's accounts save, so
+	// a save applies the same way `clens reload` does.
+	rl := newReloader(args, cfg, live, cons.SetAccounts)
+	dashAPI.SetReload(rl.Reload)
+	dashAPI.SetAccountWriter(func() error { _, err := rl.Reload(ctx); return err })
 	// br-GI-13-09: POST /api/shutdown drives stop, the same NotifyContext
 	// cancel func os.Interrupt drives, so `clens shutdown` triggers the one
 	// shutdown path this function already has rather than a second one.
@@ -188,14 +193,15 @@ func Serve(args []string) error {
 	// only. Get is never called on this path, so a credential's value has no
 	// route from the secrets file to the dashboard.
 	dashAPI.SetAccounts(func(context.Context) (api.Accounts, error) {
+		applied := rl.Accounts() // the live list, not the boot snapshot
 		accts := api.Accounts{
-			List: make([]api.Account, 0, len(cfg.Accounts)),
+			List: make([]api.Account, 0, len(applied)),
 			Credentials: map[string]api.Credential{
 				"sessionKey": credentialState("sessionKey"),
 				"admin":      credentialState("admin"),
 			},
 		}
-		for _, acct := range cfg.Accounts {
+		for _, acct := range applied {
 			accts.List = append(accts.List, api.Account{
 				Name: acct.Name, BillingMode: acct.BillingMode, Plan: acct.Plan,
 			})
@@ -284,7 +290,7 @@ func Serve(args []string) error {
 			case <-ctx.Done():
 				return
 			case <-purgeTicker.C:
-				purgeOnStartup(ctx, st, cfg.RetentionDays, log.Printf)
+				purgeOnStartup(ctx, st, live.RetentionDays(), log.Printf)
 			}
 		}
 	}()
@@ -410,19 +416,6 @@ func purgeOnStartup(ctx context.Context, st *store.Store, days int, logf func(st
 		return
 	}
 	logf("serve: retention purge: deleted %d row(s) older than %s", n, cutoff.Format(time.RFC3339))
-}
-
-// reloadAccounts re-reads the config and accounts files after the dashboard's
-// save route wrote one, so a malformed file is reported at the moment it is
-// saved instead of silently at the next restart.
-//
-// ponytail: a save validates, it does not re-attribute. The running consumer
-// holds the account list it was built with (consumer.New copies it and exposes
-// no setter), so a new account starts contributing only after a restart --
-// which is what the route's response tells the user.
-func reloadAccounts() error {
-	_, err := config.Load(nil)
-	return err
 }
 
 // atOrNil converts ingest's non-pointer timestamps to the API's nullable

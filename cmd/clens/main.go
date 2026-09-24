@@ -45,6 +45,7 @@ var commands = map[string]func([]string) error{
 	"backfill-tool-names": cli.BackfillToolNames,
 	"shutdown":            cli.Shutdown,
 	"restart":             cli.Restart,
+	"reload":              cli.Reload,
 }
 
 func main() {
