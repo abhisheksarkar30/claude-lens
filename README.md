@@ -176,6 +176,17 @@ Every command takes the config flags — `--proxy-addr`, `--dashboard-addr`,
 
 ## Operating a running serve
 
+### Body cap
+
+Each captured body (request and response separately) is cut at `--body-cap-bytes` /
+`CLENS_BODY_CAP_BYTES` / `BodyCapBytes` (default 2 MiB). A cut body marks the call
+`capture_complete = 0` and raises `stream_incomplete`; token counts and cost are unaffected.
+Long tool-use streams run about 90-130 bytes per output token, so a 20k-token turn reaches
+2 MiB. If you see these, raise the cap in `~/.clens/config.toml` (for example
+`BodyCapBytes = 8388608`) and `clens restart` — it is not live-reloadable. Rows already cut stay
+cut; the flag records that truthfully. The buffer grows only as a body arrives, so a larger cap
+costs nothing on ordinary traffic.
+
 ### Restart
 
 ```
@@ -295,10 +306,10 @@ base URL not set in settings.json` when the variable only exists in your shell
 | Tab | Shows |
 |---|---|
 | Overview | totals, and the most recent calls |
-| Calls | the call log with filters; the **id** cell link replaces the list with that call's full request and response — including both sides' **headers** and their **bodies**, each in a collapsed box with its byte count. A capture the proxy could not finish says so, and a transcript-sourced row has no wire bodies at all, so it says *"not captured — transcript source"* rather than drawing empty boxes |
+| Calls | the call log with filters, including a **from / to** date-time range (hour precision, either end optional); the **id** cell link replaces the list with that call's full request and response — including both sides' **headers** and their **bodies**, each in a collapsed box with its byte count. A capture the proxy could not finish says so, and a transcript-sourced row has no wire bodies at all, so it says *"not captured — transcript source"* rather than drawing empty boxes |
 | Sessions | one row per run, with both cost models labelled side by side |
 | Warnings | findings by kind, and one row per occurrence |
-| Stats | totals over a window, charted by day, week, or month |
+| Stats | totals over a window (a **from / to** date-time range, or `since`/`until` text such as `24h`), charted by day, week, or month |
 | Sources | every collector's last success, last error, and rows written |
 | Quota | per-account burn against each window, and candidate limits |
 | Reconcile | computed vs billed cost, side by side per day and model |
