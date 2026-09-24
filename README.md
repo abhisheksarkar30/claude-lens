@@ -246,8 +246,11 @@ the row says `archived — archive file for … not found`, not that nothing was
 - **The archive is as sensitive as `lens.db`.** It holds every prompt and file the agent
   read, in the same directory, with the same protection — and on Windows that is
   no better than the database's own (the file modes are a no-op there).
-- The first archival on the live store is expected to happen once bodies reach 7 days
-  old, about 2026-09-27.
+- The first `serve` boot with archival on archives everything already older than the
+  window, in the background and without blocking capture. Measured on a copy of a real
+  store (3.3 GB, 56,857 events): 31,891 rows in about two minutes, into about 21 MiB of
+  day files, because the older rows are mostly transcript-only. Check progress with
+  `clens archive status`.
 
 ### Reclaiming the hot file's space (one time)
 
