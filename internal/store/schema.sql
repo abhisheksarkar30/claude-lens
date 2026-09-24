@@ -212,6 +212,20 @@ CREATE TABLE IF NOT EXISTS model_catalog (
     source           TEXT NOT NULL
 );
 
+-- br-GI-16-06: which events have had their bodies moved to a day file under
+-- <dir of the DB>/archive. A marker only; `events` itself is untouched, so every
+-- aggregate stays whole-history. day is the UTC 'YYYY-MM-DD' of started_at and
+-- names the file. body_mask (1 req_body, 2 resp_body, 4 transcript_content) is a
+-- lagging, monotone mirror of the day file row's own mask: it may under-claim,
+-- never over-claim, and the day file row is the authority when they differ.
+CREATE TABLE IF NOT EXISTS body_archive (
+    event_id    INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+    day         TEXT    NOT NULL,
+    archived_at INTEGER NOT NULL,
+    body_mask   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_body_archive_day ON body_archive(day);
+
 CREATE TABLE IF NOT EXISTS ingest_state (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL DEFAULT '',

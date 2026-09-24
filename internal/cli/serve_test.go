@@ -301,3 +301,27 @@ func TestProxyModeObservedWindow(t *testing.T) {
 		t.Errorf("a row %v old reads as receiving (window %v)", time.Since(at), proxyRecentWindow)
 	}
 }
+
+// checkRedaction runs on the boot path and reads up to redactScanLimit full
+// rows. It must never decompress an archive to do it: the redaction check reads
+// headers, and headers are never archived. A source-shape guard, because the
+// property is "this call site sets the flag", which no row-level test can see
+// without seeding an archived day.
+func TestCheckRedactionSkipsArchiveHydration(t *testing.T) {
+	src, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := strings.ReplaceAll(string(src), "\r\n", "\n")
+	i := strings.Index(s, "func checkRedaction(")
+	if i < 0 {
+		t.Fatal("serve.go has no checkRedaction")
+	}
+	body := s[i:]
+	if j := strings.Index(body, "\n}\n"); j >= 0 {
+		body = body[:j]
+	}
+	if !strings.Contains(body, "SkipHydrate: true") {
+		t.Error("checkRedaction reads full rows without SkipHydrate: true, so boot would decompress archived bodies")
+	}
+}

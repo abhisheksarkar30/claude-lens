@@ -50,6 +50,12 @@ var RedactCheck = proxy.RedactCheck
 // connection.
 type Store struct {
 	db *sql.DB
+
+	// archiveDir is <dir of the DB>/archive, where day files of archived
+	// bodies live. Set once here; GCArchive and PurgeableBytes read it rather
+	// than re-deriving the path.
+	archiveDir string
+	arch       *archiveCache
 }
 
 // Open creates (or opens) the SQLite file at dbPath, enables WAL and
@@ -120,12 +126,13 @@ func Open(dbPath string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	dir := filepath.Join(filepath.Dir(dbPath), "archive")
+	return &Store{db: db, archiveDir: dir, arch: newArchiveCache(dir)}, nil
 }
 
 // schemaVersion is the current PRAGMA user_version. It must equal
 // len(migrations): migrations[n] upgrades version n to n+1.
-const schemaVersion = 4
+const schemaVersion = 5
 
 // SchemaVersion reports the schema version this binary knows, so a diagnostic
 // can print it beside a database's stored one. Exported rather than duplicated
@@ -199,6 +206,17 @@ var migrations = []string{
 		cache_read_tokens, thinking_tokens, total_prompt_tokens, model_resolved,
 		billing_mode, cost_source, cost_usd, api_equivalent_cost_usd, started_at
 	);`,
+	// 4 -> 5: body archival (br-GI-16-06). A marker table only -- `events` is
+	// left byte-for-byte untouched, so there is no table rewrite. The same DDL
+	// is in schema.sql, which Open runs before this, so on an existing database
+	// this is already a no-op; it is here so the version has a step of its own.
+	`CREATE TABLE IF NOT EXISTS body_archive (
+	    event_id    INTEGER PRIMARY KEY REFERENCES events(id) ON DELETE CASCADE,
+	    day         TEXT    NOT NULL,
+	    archived_at INTEGER NOT NULL,
+	    body_mask   INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS idx_body_archive_day ON body_archive(day);`,
 }
 
 // eventsTableAbsent reports whether this database has no events table yet,
@@ -248,6 +266,7 @@ func migrate(db *sql.DB) error {
 
 // Close closes the underlying connection.
 func (s *Store) Close() error {
+	s.arch.closeAll()
 	return s.db.Close()
 }
 
@@ -360,7 +379,12 @@ func (s *Store) InsertEvents(ctx context.Context, evs []*Event) error {
 // GetEvent reads back a single event row by id.
 func (s *Store) GetEvent(ctx context.Context, id int64) (*Event, error) {
 	row := s.db.QueryRowContext(ctx, eventSelectColumns+" FROM events WHERE id = ?", id)
-	return scanEvent(row)
+	ev, err := scanEvent(row)
+	if err != nil {
+		return nil, err
+	}
+	s.hydrate(ctx, []*Event{ev})
+	return ev, nil
 }
 
 // SessionEventsForRules returns sessionID's rows oldest-first, at the rules
@@ -477,7 +501,16 @@ func (s *Store) ListEventsFull(ctx context.Context, filter EventFilter) ([]*Even
 		}
 		out = append(out, ev)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Close before hydrating: the store has one connection, and the cursor
+	// would still hold it while hydrate reads body_archive.
+	rows.Close()
+	if !filter.SkipHydrate {
+		s.hydrate(ctx, out)
+	}
+	return out, nil
 }
 
 // LatestProxyStartedAt returns the newest source='proxy' row's started_at, or

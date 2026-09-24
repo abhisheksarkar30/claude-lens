@@ -383,7 +383,7 @@ func checkRedaction(ctx context.Context, st *store.Store, logf func(string, ...a
 	// redactor ran. On the summary projection ReqHeaders is not there to read,
 	// and a version that skipped every row would report zero findings — a
 	// security control silently disabled, with no error and no log.
-	events, err := st.ListEventsFull(ctx, store.EventFilter{Limit: redactScanLimit})
+	events, err := st.ListEventsFull(ctx, store.EventFilter{Limit: redactScanLimit, SkipHydrate: true})
 	if err != nil {
 		logf("serve: redaction self-test: %v", err)
 		return

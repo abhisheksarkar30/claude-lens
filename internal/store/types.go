@@ -123,6 +123,17 @@ type Event struct {
 	// A transcript carries no headers at all -- not redacted, absent.
 	TranscriptContent []byte
 	TranscriptRole    string
+
+	// BodiesArchived is read-only and never written by InsertEvent: "" for a
+	// row whose bodies are hot (or never archived), "restored" when at least
+	// one body was loaded back from the archive -- a partially restored row is
+	// never "" -- and "missing" when the row is marked archived but its day
+	// file, its row in that file, or its bytes cannot be read.
+	BodiesArchived string
+
+	// ArchivedBodyMask is an internal load-path flag (which bodies came from
+	// the archive) for the merge path, not wire data.
+	ArchivedBodyMask uint8 `json:"-"`
 }
 
 // Warning is one analyzer finding attached to an event. (event_id, kind) is
@@ -184,6 +195,12 @@ type EventFilter struct {
 	// A pointer rather than an int64 because 0 is not a valid event id and
 	// "unset" has to be distinguishable from it.
 	ReplayOf *int64
+
+	// SkipHydrate makes ListEventsFull leave archived bodies unloaded. A filter
+	// flag rather than a sibling method so ListEventsFull's signature and the
+	// api.Store interface stay as they are; the boot-time redaction scan sets
+	// it so starting up never decompresses an archive.
+	SkipHydrate bool
 }
 
 // StatsSummary is the aggregate shape shared by StatsSummary, StatsByModel,
