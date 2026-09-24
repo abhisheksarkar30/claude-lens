@@ -225,6 +225,19 @@ func Serve(args []string) error {
 
 	dashSrv := &http.Server{Addr: cfg.DashboardAddr, Handler: dashAPI}
 
+	// Bind both listeners up front, rather than inside ListenAndServe, so a bind
+	// failure surfaces before anything is written and the state file can record
+	// the real addresses (a `:0` port is only known after the bind).
+	proxyLn, err := net.Listen("tcp", cfg.ProxyAddr)
+	if err != nil {
+		return fmt.Errorf("serve: proxy listen: %w", err)
+	}
+	dashLn, err := net.Listen("tcp", cfg.DashboardAddr)
+	if err != nil {
+		proxyLn.Close()
+		return fmt.Errorf("serve: dashboard listen: %w", err)
+	}
+
 	printBanner(os.Stdout, cfg)
 
 	consumerDone := make(chan struct{})
@@ -235,15 +248,30 @@ func Serve(args []string) error {
 
 	errCh := make(chan error, 2)
 	go func() {
-		if err := proxySrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := proxySrv.Serve(proxyLn); err != nil && err != http.ErrServerClosed {
 			errCh <- fmt.Errorf("proxy server: %w", err)
 		}
 	}()
 	go func() {
-		if err := dashSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := dashSrv.Serve(dashLn); err != nil && err != http.ErrServerClosed {
 			errCh <- fmt.Errorf("dashboard server: %w", err)
 		}
 	}()
+
+	// Both listeners are up. Best-effort: a state file that cannot be written
+	// costs `clens restart` its record, never the proxy.
+	if exe, err := os.Executable(); err == nil {
+		state := serveState{
+			PID: os.Getpid(), Exe: exe, Args: os.Args[1:], StartedAt: time.Now().UTC(),
+			ProxyAddr: proxyLn.Addr().String(), DashboardAddr: dashLn.Addr().String(),
+			LogPath: defaultLogPath(cfg.DBPath),
+		}
+		if err := writeServeState(cfg.DBPath, state); err != nil {
+			log.Printf("serve: write %s: %v", serveStateFile, err)
+		} else {
+			defer removeServeState(cfg.DBPath, state.PID)
+		}
+	}
 
 	// The 24-hour ticker alongside the startup run: a tool opened and closed
 	// around work sessions may never see a 24-hour boundary on its own, but a

@@ -19,9 +19,9 @@ import (
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
-// Serve itself cannot be driven from a test -- it binds two real listeners and
-// blocks on a signal context -- so these cover the three boot steps it calls,
-// each of which is split out for exactly this reason.
+// Serve is driven whole only in serve_state_test.go (ephemeral ports, stopped
+// via /api/shutdown); these cover the boot steps it calls, each of which is
+// split out so it can be tested without binding listeners.
 
 // TestCheckRedactionReportsALeakAndContinues is both halves of the fail-open
 // rule: the leak is reported, and boot is not refused over it.
