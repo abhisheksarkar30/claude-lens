@@ -71,8 +71,10 @@ advisory.
 - **PR** — title is the same `GI#<n> <type>: <summary>` as the branch's headline commit. Body is
   `## Summary`, `## Verification`, `## Beads`, then `Closes #<n>`. A story branch PRs directly into
   `main`.
-- **Commits end with** `Co-Authored-By: Claude Code <noreply@anthropic.com>`; PR bodies end with
-  `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+- **AI attribution comes from the session, not from this file.** Append whatever commit trailer and
+  PR footer the *active session's own instructions* specify — the harness states them, and they
+  change over time. Never hardcode a tool name, model or email here, and never copy one in from
+  another repo. If the session states none, add none and say so rather than inventing one.
 
 ### Enforcement
 
@@ -82,15 +84,15 @@ the body, and every non-merge commit prefixed with an issue the body closes. `ma
 force-reverts any commit that reaches `main` outside that flow. Neither runs tests — tests are not a
 CI gate.
 
-**This is the one place the conventions deliberately differ from `deepseek-lens`.** Its guards
-hard-gate PRs into `main` on the head branch being exactly `develop`, and verify each landed commit
-arrived via a merged `develop → main` PR. This repo has no `develop` — v1 lands on `main` via a
-`GI-<n>-…` branch (the plan's Decision log records this as a deliberate deviation). Keeping those
-two predicates verbatim would reject this repo's own pull requests, starting with the first one, so
-both were adapted rather than copied. Everything else — the `GI#<n>` title gate, the closing
-keyword, the per-commit prefix check, the pre-commit secret scan — is unchanged. If a second story
-ever needs an integration branch, introduce `develop` and restore the two-guard flow; until then
-there is nothing for it to integrate.
+**No repo in this family carries a `develop` branch.** `deepseek-lens` used to hard-gate PRs into
+`main` on the head branch being exactly `develop`, and verify each landed commit arrived via a
+merged `develop → main` PR; it has since dropped both (commit `1102a01`, GI#27), and this repo never
+had them. Every repo now lands a `GI-<n>-<slug>` branch on `main` directly, and both guards are
+written for that single hop: the PR head must match `^GI-[0-9]+-[a-z0-9-]+$`, a landed commit must
+trace to a merged `GI-…` PR, and the branch's issue number must be one the PR body closes. That last
+check exists because one hop to `main` no longer proves provenance the way `develop` did, so the
+branch is bound to the same issues the commits already are. Everything else — the `GI#<n>` title
+gate, the closing keyword, the per-commit prefix check, the pre-commit secret scan — is unchanged.
 
 ### Layout
 
