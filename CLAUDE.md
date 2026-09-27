@@ -71,10 +71,12 @@ advisory.
 - **PR** — title is the same `GI#<n> <type>: <summary>` as the branch's headline commit. Body is
   `## Summary`, `## Verification`, `## Beads`, then `Closes #<n>`. A story branch PRs directly into
   `main`.
-- **AI attribution comes from the session, not from this file.** Append whatever commit trailer and
-  PR footer the *active session's own instructions* specify — the harness states them, and they
-  change over time. Never hardcode a tool name, model or email here, and never copy one in from
-  another repo. If the session states none, add none and say so rather than inventing one.
+- **AI attribution — the format is fixed here, the identity comes from the session.** Every commit
+  ends with a `Co-Authored-By: <name> <email>` trailer and every PR body with a
+  `🤖 Generated with [<tool>](<url>)` footer. What goes *inside* them is whatever the **active
+  session's own instructions** specify — read it from the session every time. Never hardcode a
+  name, model or email in this file, and never copy one in from another repo; if the session states
+  none, omit the trailer and say so rather than inventing one.
 
 ### Enforcement
 
