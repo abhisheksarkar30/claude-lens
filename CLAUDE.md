@@ -72,11 +72,13 @@ advisory.
   `## Summary`, `## Verification`, `## Beads`, then `Closes #<n>`. A story branch PRs directly into
   `main`.
 - **AI attribution — the format is fixed here, the identity comes from the session.** Every commit
-  ends with a `Co-Authored-By: <name> <email>` trailer and every PR body with a
-  `🤖 Generated with [<tool>](<url>)` footer. What goes *inside* them is whatever the **active
-  session's own instructions** specify — read it from the session every time. Never hardcode a
-  name, model or email in this file, and never copy one in from another repo; if the session states
-  none, omit the trailer and say so rather than inventing one.
+  ends with a `Co-Authored-By: <agentic tool> (<model>) <noreply@vendor>` trailer naming both the
+  tool that produced the change and the model behind it; every PR body ends with a
+  `🤖 Generated with [<agentic tool>](<tool url>) using <model>` footer. The *values* — the tool
+  name (Claude Code / Cursor / GitHub Copilot / Cline / …) and the model name — are whatever the
+  **active session's own instructions** specify; read them from the session every time. Never
+  hardcode either in this file, and never copy one in from another repo; if the session names
+  neither, omit the trailer and say so.
 
 ### Enforcement
 

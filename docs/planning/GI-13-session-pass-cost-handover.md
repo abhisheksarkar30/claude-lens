@@ -78,9 +78,10 @@ You will need these. They are used precisely, not loosely.
   `feat` / `fix` / `docs` / `chore` / `plan` / `beads` / `review`. For a commit that isn't scoped to a
   single bead (e.g. the plan itself), the trailer is `(GI#<n>)` instead.
 - **AI attribution — fixed format, session-supplied identity**: every commit ends with a
-  `Co-Authored-By: <name> <email>` trailer and every PR body with a
-  `🤖 Generated with [<tool>](<url>)` footer. The contents come from the *active session's own
-  instructions*, never from a constant here or in `CLAUDE.md`.
+  `Co-Authored-By: <agentic tool> (<model>) <noreply@vendor>` trailer and every PR body with a
+  `🤖 Generated with [<agentic tool>](<tool url>) using <model>` footer, naming both the tool and
+  the model. The values come from the *active session's own instructions*, never from a constant
+  here or in `CLAUDE.md`.
 - **PRs** target `main` directly. There is no `develop` branch and there intentionally isn't one.
 - **Hooks** (armed by `git config core.hooksPath .githooks`, one step per clone):
   `.githooks/commit-msg` rejects any commit not starting with `GI#<n>`; `.githooks/pre-commit` runs a
