@@ -77,8 +77,11 @@ You will need these. They are used precisely, not loosely.
 - **Commit subject**: `GI#<n> <type>: <lowercase summary> (br-GI-<n>-<NN>)`, where `<type>` is one of
   `feat` / `fix` / `docs` / `chore` / `plan` / `beads` / `review`. For a commit that isn't scoped to a
   single bead (e.g. the plan itself), the trailer is `(GI#<n>)` instead.
-- **Commits end with** `Co-Authored-By: Claude Code <noreply@anthropic.com>`. PR bodies end with
-  `🤖 Generated with [Claude Code](https://claude.com/claude-code)`.
+- **AI attribution — fixed format, session-supplied identity**: every commit ends with a
+  `Co-Authored-By: <agentic tool> (<model>) <noreply@vendor>` trailer and every PR body with a
+  `🤖 Generated with [<agentic tool>](<tool url>) using <model>` footer, naming both the tool and
+  the model. The values come from the *active session's own instructions*, never from a constant
+  here or in `CLAUDE.md`.
 - **PRs** target `main` directly. There is no `develop` branch and there intentionally isn't one.
 - **Hooks** (armed by `git config core.hooksPath .githooks`, one step per clone):
   `.githooks/commit-msg` rejects any commit not starting with `GI#<n>`; `.githooks/pre-commit` runs a

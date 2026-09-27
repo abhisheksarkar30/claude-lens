@@ -32,8 +32,10 @@ did — so the branch is bound to the same set of issues the commits are already
   rediscover from a red CI run.
 - `main` is the repo's **default branch**, which is what makes `Closes #N` in a PR body actually
   auto-close the issue — GitHub only honours it against the default branch.
-- If a second story ever needs an integration branch, introduce `develop` and restore the two-guard
-  flow. Until then there is nothing for it to integrate.
+- `deepseek-lens` has since dropped `develop` too (commit `1102a01`, GI#27), so this is no longer a
+  deviation between the two repos — no repo in the family carries an integration branch, and a
+  future story that wanted one would have to reopen this decision rather than assume the old
+  two-guard flow is still there to restore.
 - Everything else is unchanged from `deepseek-lens`: the `GI#<n>` title gate, the closing keyword,
   the per-commit prefix check, and the pre-commit secret scan.
 
