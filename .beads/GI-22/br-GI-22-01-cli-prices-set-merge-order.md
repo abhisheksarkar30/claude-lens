@@ -4,7 +4,7 @@
 
 - **Bead ID**: br-GI-22-01
 - **Priority**: P0 (critical)
-- **Status**: pending
+- **Status**: done
 - **Original Estimate**: 1h
 - **Dependencies**: None
 - **Blocks**: None
@@ -65,3 +65,9 @@ Manual negative control, once, before calling the bead done: temporarily restore
 - `internal/cli/prices_test.go` (create)
 
 ## Review Notes
+
+Built the `overrides[model]`-first lookup in `applyPriceEdits` and the four tests in `internal/cli/prices_test.go`. The function comment now says a later `--set` merges onto the rate this invocation already wrote, then onto the effective snapshot.
+
+`go test ./internal/cli/ -count=1 -run TestPricesSet` — 6 passed (the existing-model test counts its two subtests).
+
+Negative control, not committed: the lookup was put back to `effective[model]` only. `TestPricesSetMultipleFieldsNewModelInOneInvocation` failed with `input_rate`, `output_rate`, `cache_read_rate`, and `cache_write_5m_rate` nil and the from-scratch message printed 5 times; `cache_write_1h_rate` (the last `--set`) was the only field present. `TestPricesSetMultipleFieldsExistingModelInOneInvocation` failed on both subtests: the shipped subtest kept `input_rate` at the snapshot `2.00` (`1/500000`), and the prior-override subtest kept `cache_read_rate` at the seeded `0.40` (`1/2500000`). The lookup was restored before this commit.

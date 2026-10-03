@@ -81,11 +81,13 @@ func runPrices(args []string, w io.Writer) error {
 }
 
 // applyPriceEdits writes sets and unsets to path. Each --set merges onto the
-// model's *effective* rate, so `--set claude-sonnet-5:output_rate=18` changes
+// rate this invocation has already written for that model, then onto the
+// model's effective rate, so `--set claude-sonnet-5:output_rate=18` changes
 // one field and leaves input, cache and the rest exactly as they were --
 // writing only the named field would leave every other class nil, and a nil
 // rate computes a zero cost, which is the one outcome this repo never
-// invents (invariant 5).
+// invents (invariant 5). Reading the frozen effective snapshot on every
+// iteration would keep only the last --set.
 func applyPriceEdits(path string, sets, unsets []string, w io.Writer) error {
 	overrides, err := pricing.LoadOverrides(path)
 	if err != nil {
@@ -98,10 +100,14 @@ func applyPriceEdits(path string, sets, unsets []string, w io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("prices: %w", err)
 		}
-		r, ok := effective[model]
+		r, ok := overrides[model]
+		if !ok {
+			r, ok = effective[model]
+		}
 		if !ok {
 			// A model with no shipped rate can still be given one, but say so:
-			// the user is defining a rate, not adjusting one.
+			// the user is defining a rate, not adjusting one. Later --set flags
+			// in this same call find the rate in overrides and do not repeat it.
 			fmt.Fprintf(w, "prices: %s has no shipped rate; defining it from scratch\n", model)
 			r = pricing.Rate{Model: model}
 		}
