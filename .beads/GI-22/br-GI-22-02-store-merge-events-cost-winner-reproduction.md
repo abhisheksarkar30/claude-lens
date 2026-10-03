@@ -4,7 +4,7 @@
 
 - **Bead ID**: br-GI-22-02
 - **Priority**: P0 (critical)
-- **Status**: pending
+- **Status**: done
 - **Original Estimate**: 1h
 - **Dependencies**: None
 - **Blocks**: br-GI-22-03
@@ -63,3 +63,9 @@ An earlier live-database investigation already produced a false lead. A `merge.g
 - `.beads/GI-22/evidence-02.txt` (create — the recorded test and SQL result)
 
 ## Review Notes
+
+Added `TestMergeEventsPrefersPricedOverUnpriced` only. `internal/store/merge.go` is unchanged.
+
+`go test ./internal/store/ -count=1 -run TestMergeEventsPrefersPricedOverUnpriced` passed. The fixture set both `CaptureComplete` flags to true and both sides had non-zero input and output tokens. The returned `CostSource` was `user`.
+
+`config.Default().DBPath` resolved to `C:\Users\abhis\.clens\lens.db` (`HOME` unset, so `os.UserHomeDir`). That file is not present, so the SQL check is `db: absent` and no override-key comparison was possible. Recorded in `.beads/GI-22/evidence-02.txt`. Gate line: `bead-03: not-applicable`.
