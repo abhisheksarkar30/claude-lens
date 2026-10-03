@@ -2216,6 +2216,12 @@ func (c repriceCandidate) routed() (sql.NullFloat64, bool) {
 // and the rows --yes changes then come from the same loop, so the preview and
 // the repair cannot drift apart.
 //
+// model, when non-empty, restricts the pass to rows whose model_resolved
+// equals that string and is the one path that newly prices
+// cost_source='unpriced' rows. An empty model is today's full-table pass,
+// which still skips unpriced rows. Other not-in-scope labels stay skipped
+// either way.
+//
 // table is the caller's effective pricing table behind the PriceComputer
 // mirror. The store never builds one and never imports internal/pricing.
 //
@@ -2226,7 +2232,7 @@ func (c repriceCandidate) routed() (sql.NullFloat64, bool) {
 // error, and no test would report it as a failure rather than a timeout. That
 // reconcileSessionTx is unexported, and so unreachable from internal/cli, is
 // why this loop lives in internal/store at all.
-func (s *Store) RepriceCosts(ctx context.Context, table PriceComputer, dryRun bool) (RepriceCounts, error) {
+func (s *Store) RepriceCosts(ctx context.Context, table PriceComputer, model string, dryRun bool) (RepriceCounts, error) {
 	var counts RepriceCounts
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -2239,14 +2245,19 @@ func (s *Store) RepriceCosts(ctx context.Context, table PriceComputer, dryRun bo
 	// the cursor before the first UPDATE: one BeginTx is the contract, and a
 	// snapshot read outside it could price a row version this transaction never
 	// writes back.
-	rows, err := tx.QueryContext(ctx, `
+	query := `
 		SELECT id, session_id, billing_mode, model_resolved, cost_source,
 		       speed, service_tier, started_at,
 		       input_tokens, output_tokens,
 		       cache_write_5m_tokens, cache_write_1h_tokens, cache_read_tokens,
 		       cost_usd, api_equivalent_cost_usd
-		FROM events
-	`)
+		FROM events`
+	var queryArgs []any
+	if model != "" {
+		query += ` WHERE model_resolved = ?`
+		queryArgs = append(queryArgs, model)
+	}
+	rows, err := tx.QueryContext(ctx, query, queryArgs...)
 	if err != nil {
 		return counts, fmt.Errorf("store: RepriceCosts: select: %w", err)
 	}
@@ -2278,7 +2289,10 @@ func (s *Store) RepriceCosts(ctx context.Context, table PriceComputer, dryRun bo
 	// InsertEvents' distinct-session loop.
 	sessions := map[string]bool{}
 	for _, c := range candidates {
-		if !repriceInScope(c.costSource) {
+		// The model pass newly prices unpriced rows of the named model only.
+		// Every other not-in-scope label, and every unpriced row of an
+		// unqualified pass, stays skipped.
+		if (model == "" || c.costSource != "unpriced") && !repriceInScope(c.costSource) {
 			counts.Skipped++
 			continue
 		}

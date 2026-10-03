@@ -3,10 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"math/big"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
@@ -170,4 +173,124 @@ func TestRepriceUsesTheConfiguredOffPeakCalendar(t *testing.T) {
 	if got.CostUSD == nil || *got.CostUSD != 0.15 {
 		t.Errorf("CostUSD = %v, want 0.15 off peak (the shipped calendar)", got.CostUSD)
 	}
+}
+
+// TestRepriceModelFlagBackfillsOnlyNamedModel: --model is a narrowed pass.
+// One flag value cannot name both the shipped subscription row and the
+// from-scratch row, so each named model is its own runReprice. The four rows
+// share one database; the second pass must not move what the first wrote.
+func TestRepriceModelFlagBackfillsOnlyNamedModel(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+	ctx := context.Background()
+
+	const (
+		namedShipped  = "claude-sonnet-5"
+		namedScratch  = "claude-haiku-4-5-20251001"
+		otherPriced   = "claude-opus-5"
+		otherUnpriced = "claude-haiku-4-5"
+		session       = "s_reprice_model"
+	)
+	if err := st.UpsertSession(ctx, session, "", time.Now()); err != nil {
+		t.Fatalf("UpsertSession: %v", err)
+	}
+
+	kept := 1.25
+	otherID := seedEvent(t, st, &store.Event{EventSummary: store.EventSummary{
+		RequestID:     "req-other-priced",
+		ModelResolved: otherPriced,
+		SessionID:     session,
+		InputTokens:   100,
+		OutputTokens:  100,
+		CostUSD:       &kept,
+		CostSource:    "shipped",
+		BillingMode:   "api",
+	}})
+	unpricedOtherID := seedEvent(t, st, &store.Event{EventSummary: store.EventSummary{
+		RequestID:     "req-other-unpriced",
+		ModelResolved: otherUnpriced,
+		SessionID:     session,
+		InputTokens:   100,
+		OutputTokens:  100,
+		CostSource:    "unpriced",
+		BillingMode:   "api",
+	}})
+	subID := seedEvent(t, st, &store.Event{EventSummary: store.EventSummary{
+		RequestID:       "req-named-subscription",
+		ModelResolved:   namedShipped,
+		SessionID:       session,
+		InputTokens:     1_000_000,
+		OutputTokens:    0,
+		CacheReadTokens: 0,
+		CostSource:      "unpriced",
+		BillingMode:     "subscription",
+	}})
+	scratchID := seedEvent(t, st, &store.Event{EventSummary: store.EventSummary{
+		RequestID:       "req-named-scratch",
+		ModelResolved:   namedScratch,
+		SessionID:       session,
+		InputTokens:     100,
+		OutputTokens:    50,
+		CacheReadTokens: 10,
+		CostSource:      "unpriced",
+		BillingMode:     "api",
+	}})
+
+	overridePath := filepath.Join(home, ".clens", "prices.toml")
+	perTok := func(usd int64) *big.Rat { return big.NewRat(usd, 1_000_000) }
+	if err := pricing.SaveOverrides(overridePath, pricing.Table{
+		namedScratch: {
+			Model:      namedScratch,
+			InputRate:  perTok(1),
+			OutputRate: perTok(5),
+		},
+	}); err != nil {
+		t.Fatalf("SaveOverrides: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := runReprice([]string{"--yes", "--model", namedShipped}, &buf); err != nil {
+		t.Fatalf("runReprice --model %s: %v\n%s", namedShipped, err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "`--model "+namedShipped+"` is backfilling previously-unpriced rows for this model only") {
+		t.Fatalf("output missing the limited-pass sentence:\n%s", buf.String())
+	}
+
+	other := mustEvent(t, st, otherID)
+	if other.CostSource != "shipped" || other.CostUSD == nil || *other.CostUSD != kept {
+		t.Errorf("other in-scope row = source %q cost %v, want shipped %v", other.CostSource, other.CostUSD, kept)
+	}
+	unpricedOther := mustEvent(t, st, unpricedOtherID)
+	if unpricedOther.CostSource != "unpriced" || unpricedOther.CostUSD != nil || unpricedOther.ApiEquivalentCostUSD != nil {
+		t.Errorf("other unpriced row = source %q cost %v api %v, want unpriced and both nil", unpricedOther.CostSource, unpricedOther.CostUSD, unpricedOther.ApiEquivalentCostUSD)
+	}
+	sub := mustEvent(t, st, subID)
+	if sub.ApiEquivalentCostUSD == nil || sub.CostUSD != nil || sub.CostSource == "unpriced" {
+		t.Errorf("subscription row = source %q cost %v api %v, want a figure in api_equivalent_cost_usd and cost_usd nil", sub.CostSource, sub.CostUSD, sub.ApiEquivalentCostUSD)
+	}
+
+	buf.Reset()
+	if err := runReprice([]string{"--yes", "--model", namedScratch}, &buf); err != nil {
+		t.Fatalf("runReprice --model %s: %v\n%s", namedScratch, err, buf.String())
+	}
+	if !strings.Contains(buf.String(), "`--model "+namedScratch+"` is backfilling previously-unpriced rows for this model only") {
+		t.Fatalf("output missing the limited-pass sentence:\n%s", buf.String())
+	}
+	scratch := mustEvent(t, st, scratchID)
+	if scratch.CostSource != "unpriced" || scratch.CostUSD != nil || scratch.ApiEquivalentCostUSD != nil {
+		t.Errorf("from-scratch row = source %q cost %v api %v, want unpriced and both nil", scratch.CostSource, scratch.CostUSD, scratch.ApiEquivalentCostUSD)
+	}
+	subAfter := mustEvent(t, st, subID)
+	if subAfter.CostUSD != nil || subAfter.ApiEquivalentCostUSD == nil || *subAfter.ApiEquivalentCostUSD != *sub.ApiEquivalentCostUSD {
+		t.Errorf("second pass moved the subscription row: cost %v api %v", subAfter.CostUSD, subAfter.ApiEquivalentCostUSD)
+	}
+}
+
+func mustEvent(t *testing.T, st *store.Store, id int64) *store.Event {
+	t.Helper()
+	got, err := st.GetEvent(context.Background(), id)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	return got
 }

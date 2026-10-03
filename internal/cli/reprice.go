@@ -24,6 +24,10 @@ func Reprice(args []string) error {
 func runReprice(args []string, w io.Writer) error {
 	dryRun, args := hasFlag(args, "--dry-run")
 	yes, args := hasFlag(args, "--yes")
+	// Strip --model before the refuse return and before openStore. config.Load
+	// has no model flag, so leaving it on args errors the command before any
+	// reprice runs.
+	model, args := takeFlag(args, "--model")
 	if !dryRun && !yes {
 		return errors.New("reprice: refusing to rewrite costs without --yes (add --dry-run to see what would change)")
 	}
@@ -37,6 +41,9 @@ func runReprice(args []string, w io.Writer) error {
 	if !dryRun {
 		warnIfServeLive(w, cfg.DashboardAddr)
 	}
+	if model != "" {
+		fmt.Fprintf(w, "`--model %s` is backfilling previously-unpriced rows for this model only\n", model)
+	}
 
 	// The effective, Loader-backed table. Not pricing.Compute, which is
 	// ShippedTable().Compute and would ignore a user override; and not the
@@ -45,7 +52,7 @@ func runReprice(args []string, w io.Writer) error {
 	// off-peak dates -- a state distinct from the `none` spelling that
 	// excludes nothing. newPriceLoader is the one loader shape every pricer in
 	// this process builds, so reprice cannot disagree with serve about them.
-	counts, err := st.RepriceCosts(context.Background(), newPriceLoader(cfg).Table(), dryRun)
+	counts, err := st.RepriceCosts(context.Background(), newPriceLoader(cfg).Table(), model, dryRun)
 	if err != nil {
 		return fmt.Errorf("reprice: %w", err)
 	}

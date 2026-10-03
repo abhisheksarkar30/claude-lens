@@ -812,3 +812,28 @@ func TestPeakAtContract(t *testing.T) {
 		t.Error("(*Loader).PeakAt on a flat-priced model = true, want false")
 	}
 }
+
+// TestComputeNilUsedClassReturnsUnpriced: a from-scratch override can name a
+// model and still leave a class nil. A used nil rate is unpriced, not a panic
+// and not a partial sum. An unused nil rate does not blank the other classes.
+func TestComputeNilUsedClassReturnsUnpriced(t *testing.T) {
+	const model = "from-scratch-nil-cache-read"
+	table := Table{
+		model: {
+			Model:         model,
+			InputRate:     big.NewRat(2, 1_000_000),
+			OutputRate:    big.NewRat(10, 1_000_000),
+			CacheReadRate: nil,
+		},
+	}
+
+	usd, source := table.Compute(model, parse.Usage{CacheReadTokens: 10}, "", "", time.Now())
+	if usd != nil || source != "unpriced" {
+		t.Fatalf("Compute with a used nil cache-read rate = (%v, %q), want (nil, unpriced)", usd, source)
+	}
+
+	usd, source = table.Compute(model, parse.Usage{InputTokens: 100}, "", "", time.Now())
+	if usd == nil || source == "unpriced" {
+		t.Fatalf("Compute with a nil rate on an unused class = (%v, %q), want a price", usd, source)
+	}
+}

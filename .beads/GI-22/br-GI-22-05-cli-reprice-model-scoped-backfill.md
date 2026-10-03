@@ -4,7 +4,7 @@
 
 - **Bead ID**: br-GI-22-05
 - **Priority**: P2 (medium — lowest priority in the set; the bead to drop first, §8. The nil-rate guard does not raise that priority)
-- **Status**: pending
+- **Status**: done
 - **Original Estimate**: 2h
 - **Dependencies**: br-GI-22-04
 - **Blocks**: None
@@ -89,3 +89,11 @@ Do not edit `docs/context/`. §11's doc corrections are not this bead's. Do not 
 - `internal/pricing/pricing_test.go` (modify — add `TestComputeNilUsedClassReturnsUnpriced`)
 
 ## Review Notes
+
+`--model` is taken off `args` with `takeFlag` before the refuse-without-`--yes` return and before `openStore`. An empty model keeps `RepriceCosts`' full-table pass, including the `repriceInScope` skip of `unpriced`. A non-empty model adds `WHERE model_resolved = ?` and bypasses that skip only for `cost_source == "unpriced"`. The live-serve probe from br-GI-22-04 stays behind `!dryRun`. When the flag is set, the writer includes `` `--model <name>` is backfilling previously-unpriced rows for this model only ``.
+
+`Table.Compute` returns `(nil, "unpriced")` when a class has tokens and a nil rate, before the multiply. Zero-token classes still skip a nil rate. `consumer.go` and `table.go` were not edited.
+
+`TestRepriceModelFlagBackfillsOnlyNamedModel` issues two `runReprice` calls. One `--model` value cannot be both shipped `claude-sonnet-5` and from-scratch `claude-haiku-4-5-20251001`. Both rows share one database; the second pass does not move the subscription figure the first pass wrote.
+
+`go test ./internal/pricing/ ./internal/store/ ./internal/cli/ -count=1 -run 'TestComputeNilUsedClassReturnsUnpriced|TestRepriceModelFlagBackfillsOnlyNamedModel|TestReprice|TestStoreDoesNotImportPricing'` — 17 passed. Before the guard, `TestComputeNilUsedClassReturnsUnpriced` panicked on a nil `*big.Rat` multiply. `go test ./internal/pricing/ ./internal/store/ -count=1` — 169 passed.
