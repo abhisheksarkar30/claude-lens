@@ -4,7 +4,7 @@
 
 - **Bead ID**: br-GI-22-03
 - **Priority**: P1 (high — ships only when br-GI-22-02 records a valid `'unpriced'` result; otherwise this bead is not applicable)
-- **Status**: pending
+- **Status**: done
 - **Original Estimate**: 90m
 - **Dependencies**: br-GI-22-02
 - **Blocks**: None
@@ -48,3 +48,5 @@ Manual negative control, once, only when the edit landed: revert the new winner 
 - `internal/store/merge.go` (modify — only when the gate line is `bead-03: start`; the additional winner correction described above, placed after `merge.go:280-290` and before the copies at `merge.go:292`)
 
 ## Review Notes
+
+Not applicable. `.beads/GI-22/evidence-02.txt` gate line: `bead-03: not-applicable`. The reproduction returned `CostSource` `user` with `incoming.CaptureComplete` already true, and the operator database was absent. `internal/store/merge.go` was not edited. The pre-declared fix commit was not made.
