@@ -2,9 +2,14 @@ package store
 
 import (
 	"context"
+	"math/big"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/abhisheksarkar30/claude-lens/internal/parse"
+	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 )
 
 // Test 11a (B-owned metadata columns survive the merge): the columns a
@@ -1387,5 +1392,64 @@ func TestMergeCaptureCompleteFollowsTheBodies(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestMergeEventsPrefersPricedOverUnpriced pins the cost-column copy to the
+// completeness winner. Both captures are complete and both have observed
+// usage, so the incoming priced row must win. An 'unpriced' result here, with
+// incoming.CaptureComplete already true, is the signal that the completeness
+// pick is keeping an unpriced cost.
+func TestMergeEventsPrefersPricedOverUnpriced(t *testing.T) {
+	const model = "claude-haiku-4-5-20251001"
+	const inputTokens = 100
+	const outputTokens = 50
+
+	table := pricing.Table{
+		model: {
+			Model:            model,
+			InputRate:        big.NewRat(1, 1_000_000),
+			OutputRate:       big.NewRat(5, 1_000_000),
+			CacheWrite5mRate: big.NewRat(0, 1),
+			CacheWrite1hRate: big.NewRat(0, 1),
+			CacheReadRate:    big.NewRat(1, 10_000_000),
+			Source:           "user",
+		},
+	}
+	usd, source := table.Compute(model, parse.Usage{
+		InputTokens:  inputTokens,
+		OutputTokens: outputTokens,
+	}, "", "", time.Unix(1700000000, 0))
+	if usd == nil || source != "user" {
+		t.Fatalf("Compute = (%v, %q), want a user price", usd, source)
+	}
+
+	existing := &Event{EventSummary: EventSummary{
+		ModelResolved:        model,
+		CaptureComplete:      true,
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		CostSource:           "unpriced",
+		CostUSD:              nil,
+		ApiEquivalentCostUSD: nil,
+		BillingMode:          "api",
+	}}
+	incoming := &Event{EventSummary: EventSummary{
+		ModelResolved:        model,
+		CaptureComplete:      true,
+		InputTokens:          inputTokens,
+		OutputTokens:         outputTokens,
+		CostSource:           source,
+		CostUSD:              usd,
+		ApiEquivalentCostUSD: nil,
+		BillingMode:          "api",
+	}}
+	if !incoming.CaptureComplete {
+		t.Fatal("fixture incoming.CaptureComplete is false; that is a broken fixture, not a confirmed root cause")
+	}
+
+	got, _ := mergeEvents(existing, incoming)
+	if got.CostSource != "user" {
+		t.Fatalf("CostSource = %q, want user (incoming.CaptureComplete=%v)", got.CostSource, incoming.CaptureComplete)
 	}
 }

@@ -61,7 +61,12 @@ carries a `Source` of `shipped` (cited to a doc line in the comment) or `provisi
 unverified). A user override is written to a separate file and carries `user`.
 
 `Compute(model, usage, speed, serviceTier, at)` returns `(nil, "unpriced")` for a model with no
-rate — never a numeric zero a caller could store as `$0.00`. The full vocabulary of `cost_source`
+rate, and for a model that is in the table when a class with a non-zero token count has a nil
+`*big.Rat` — a from-scratch override that leaves a used class unset. A nil rate on a class with
+zero tokens is skipped and the other classes still price. Never a numeric zero a caller could
+store as `$0.00`. Plain `reprice` still skips stored `cost_source='unpriced'` rows.
+`reprice --model <name>` is the opt-in that overrides that exclusion for the named model only;
+it does not reprice any other model ([cli-and-tooling.md](cli-and-tooling.md)). The full vocabulary of `cost_source`
 is `shipped | provisional | user | approximate:<reason> | unpriced`; `approximate:` marks a rate
 applied where only a flat cache count was available (e.g. `approximate:cache_ttl_unknown`), so the
 caveat survives into the stored row instead of being rounded away.
@@ -73,7 +78,7 @@ force for an event is the one with the greatest `effective_from ≤ started_at`.
 
 Every rate is an exact `*big.Rat` **dollars per token**, never a float. A class costs
 `tokens × rate`; `batch` halves it and the peak multiplier scales it; `Compute` **sums the classes
-exactly and rounds nowhere** ([pricing.go:116-138](../../internal/pricing/pricing.go#L116-L138)).
+exactly and rounds nowhere** ([pricing.go:116-144](../../internal/pricing/pricing.go#L116-L144)).
 The rounding happens at the edges and only there: the stored `REAL` column is a `float64` and is
 therefore approximate by construction, and each display path formats the value it prints
 (`$%.4f` in [internal/cli/format.go](../../internal/cli/format.go), `toFixed(2)` in the dashboard).

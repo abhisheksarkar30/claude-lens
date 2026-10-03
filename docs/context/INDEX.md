@@ -368,3 +368,15 @@ logged" half of rule 1 had no test actually asserting a log line before this sto
 client was unaffected — so `TestSubmitLogsADropWithoutTheBody` is now cited as the first evidence
 of that specific half) and `testing-and-quality.md` (one new row for the same test, matching the
 table's one-invariant-per-row granularity).
+
+**2026-10-03 — REFRESH, scoped to `GI-22-prices-set-clobber-and-rebuild-backfill-gaps`** (beads
+`br-GI-22-01` … `-05`; plan `docs/planning/GI-22-prices-set-clobber-and-rebuild-backfill-gaps.md`
+v8, converged). **No module was added or retired.** `br-GI-22-03` did not change `mergeEvents`:
+the reproduction returned `CostSource` `user`. The operator database was absent, so the six stuck
+rows' `source` was not re-checked.
+
+**Three module files changed:** `cli-and-tooling.md` (`prices` repeated `--set`, `ingest --rebuild`
+reaches only a JSONL counterpart, `reprice --model`, and the live-serve `WARN` on the write
+commands), `workflows.md` (flows 2 and 4 name `reprice --model` as the unpriced backfill), and
+`cost-and-quota.md` (a used nil rate is `unpriced`, and `--model` is the opt-in exception to the
+unpriced-row skip).

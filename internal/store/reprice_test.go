@@ -61,7 +61,7 @@ func TestRepriceCostsPricesTheExactValue(t *testing.T) {
 		t.Fatalf("InsertEvent: %v", err)
 	}
 
-	counts, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), false)
+	counts, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), "", false)
 	if err != nil {
 		t.Fatalf("RepriceCosts: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestRepriceCostsPricesTheExactValue(t *testing.T) {
 	}
 
 	// Idempotent: recomputing an already-correct row moves nothing.
-	again, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), false)
+	again, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), "", false)
 	if err != nil {
 		t.Fatalf("RepriceCosts (second run): %v", err)
 	}
@@ -107,7 +107,7 @@ func TestRepriceCostsIncludesUserRows(t *testing.T) {
 		t.Fatalf("InsertEvent: %v", err)
 	}
 
-	counts, err := st.RepriceCosts(ctx, repriceTable("test-model", "user"), false)
+	counts, err := st.RepriceCosts(ctx, repriceTable("test-model", "user"), "", false)
 	if err != nil {
 		t.Fatalf("RepriceCosts: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestRepriceCostsIncludesUserRows(t *testing.T) {
 	row := override["test-model"]
 	row.InputRate, row.OutputRate = usdPerMTok(50), usdPerMTok(50)
 	override["test-model"] = row
-	if _, err := st.RepriceCosts(ctx, override, false); err != nil {
+	if _, err := st.RepriceCosts(ctx, override, "", false); err != nil {
 		t.Fatalf("RepriceCosts (overridden rate): %v", err)
 	}
 	got, err = st.GetEvent(ctx, id)
@@ -170,7 +170,7 @@ func TestRepriceCostsPreservesTheTTLUnknownLabel(t *testing.T) {
 	row.CacheWrite5mRate = usdPerMTok(10)
 	table["test-model"] = row
 
-	counts, err := st.RepriceCosts(ctx, table, false)
+	counts, err := st.RepriceCosts(ctx, table, "", false)
 	if err != nil {
 		t.Fatalf("RepriceCosts: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestRepriceCostsUsesTheConfiguredOffPeakCalendar(t *testing.T) {
 	// nil dates: unset, so the shipped holiday list applies and the fixture
 	// instant is off peak. deepseek-flash bills $0.15/MTok off peak.
 	shipped := pricing.NewLoader(overrides, nil)
-	if _, err := st.RepriceCosts(ctx, shipped, false); err != nil {
+	if _, err := st.RepriceCosts(ctx, shipped, "", false); err != nil {
 		t.Fatalf("RepriceCosts (shipped calendar): %v", err)
 	}
 	got, err := st.GetEvent(ctx, id)
@@ -236,7 +236,7 @@ func TestRepriceCostsUsesTheConfiguredOffPeakCalendar(t *testing.T) {
 	// A non-nil list that does not contain the fixture date: the same instant
 	// is now peak, at 2x.
 	configured := pricing.NewLoader(overrides, []string{"2026-01-01"})
-	counts, err := st.RepriceCosts(ctx, configured, false)
+	counts, err := st.RepriceCosts(ctx, configured, "", false)
 	if err != nil {
 		t.Fatalf("RepriceCosts (configured calendar): %v", err)
 	}
@@ -267,7 +267,7 @@ func TestRepriceCostsSkipsUnresolvableRows(t *testing.T) {
 		t.Fatalf("InsertEvent: %v", err)
 	}
 
-	counts, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), false)
+	counts, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), "", false)
 	if err != nil {
 		t.Fatalf("RepriceCosts: %v", err)
 	}
@@ -295,7 +295,7 @@ func TestRepriceCostsSkipsUnresolvableRows(t *testing.T) {
 	if _, _, err := st.InsertEvent(ctx, unpriced); err != nil {
 		t.Fatalf("InsertEvent (unpriced): %v", err)
 	}
-	counts, err = st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), false)
+	counts, err = st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), "", false)
 	if err != nil {
 		t.Fatalf("RepriceCosts (unpriced present): %v", err)
 	}
@@ -323,7 +323,7 @@ func TestRepriceCostsRoutesSubscriptionToApiEquivalent(t *testing.T) {
 		t.Fatalf("InsertEvent: %v", err)
 	}
 
-	if _, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), false); err != nil {
+	if _, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), "", false); err != nil {
 		t.Fatalf("RepriceCosts: %v", err)
 	}
 
@@ -377,7 +377,7 @@ func TestRepriceCostsReducesTheOwningSessionTotal(t *testing.T) {
 		t.Fatalf("pre-reprice session total = %v, want 0.5", before.TotalCostUSD)
 	}
 
-	if _, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), false); err != nil {
+	if _, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), "", false); err != nil {
 		t.Fatalf("RepriceCosts: %v", err)
 	}
 
@@ -410,7 +410,7 @@ func TestRepriceCostsDryRunWritesNothing(t *testing.T) {
 		t.Fatalf("ReconcileSession: %v", err)
 	}
 
-	counts, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), true)
+	counts, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), "", true)
 	if err != nil {
 		t.Fatalf("RepriceCosts (dry run): %v", err)
 	}
@@ -458,7 +458,7 @@ func TestRepriceCostsErrorsOnAClosedStore(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	if _, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), false); err == nil {
+	if _, err := st.RepriceCosts(ctx, repriceTable("test-model", "shipped"), "", false); err == nil {
 		t.Fatal("RepriceCosts on a closed store returned no error")
 	}
 

@@ -46,6 +46,9 @@ func runIngest(args []string, w io.Writer) error {
 	root := jsonlRoot()
 
 	if rebuild {
+		// --rebuild always writes. A live serve on this database contends
+		// with the capture path; say so, then continue.
+		warnIfServeLive(w, cfg.DashboardAddr)
 		if err := resetJSONLCursors(ctx, st, root); err != nil {
 			return fmt.Errorf("ingest: rebuild: %w", err)
 		}

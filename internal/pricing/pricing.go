@@ -127,6 +127,12 @@ func (t Table) Compute(model string, usage parse.Usage, speed, serviceTier strin
 		if class.tokens == 0 {
 			continue
 		}
+		// A from-scratch override can name a model and still leave a class
+		// nil. Multiplying by that rate panics. A used nil class is the same
+		// answer as an absent model: unpriced, not a partial sum.
+		if class.rate == nil {
+			return nil, "unpriced"
+		}
 		cost := new(big.Rat).Mul(big.NewRat(int64(class.tokens), 1), class.rate)
 		if batch {
 			cost.Mul(cost, big.NewRat(1, 2))

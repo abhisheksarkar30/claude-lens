@@ -1,0 +1,11 @@
+go test ./internal/store/ -count=1 -run TestMergeEventsPrefersPricedOverUnpriced
+result: pass (Go test: 1 passed in 1 packages)
+CostSource observed: user
+incoming.CaptureComplete: true
+
+database: C:\Users\abhis\.clens\lens.db
+db: absent
+
+override-key comparison: not run; no events rows to compare with pricing.DefaultPath()
+
+bead-03: not-applicable
