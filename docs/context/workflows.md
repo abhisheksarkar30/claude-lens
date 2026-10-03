@@ -150,7 +150,9 @@ sequenceDiagram
   re-pricing path**, which is what it used to be called here. A re-ingest produces a *JSONL* row,
   priced with `speed=""` / `serviceTier=""`, and this merge never replaces the proxy's bodies; the
   rows whose stored cost is wrong are proxy rows, and reaching those is `clens reprice`'s job
-  ([cli-and-tooling.md](cli-and-tooling.md)).
+  ([cli-and-tooling.md](cli-and-tooling.md)). Plain `reprice` still skips `cost_source='unpriced'`.
+  `reprice --model <name>` is the opt-in that newly prices previously-unpriced rows of that model
+  only, including a pure proxy-sourced row `ingest` never reads.
 - **The session a merged row belongs to is the conversation id, not a heuristic group (D7).** The
   proxy now adopts `x-claude-code-session-id` as its stored `session_id` — the id the request already
   carries — instead of the gap-window `s_…` grouping it used before GI#9. A proxy row and its JSONL
@@ -204,6 +206,9 @@ offset is meaningless and only a from-zero pass is correct.
 
 **Transaction boundary:** per event, via the same merge path as flow 2. A rebuild therefore
 *merges* rather than duplicates, which is what makes `source_mismatch` reachable on a re-run.
+`--rebuild` only reaches a row that has or acquires a JSONL counterpart. A pure proxy-sourced
+call never enters `mergeEvents`. Pricing that row is `reprice --model <name>`
+([cli-and-tooling.md](cli-and-tooling.md)); plain `reprice` still skips `cost_source='unpriced'`.
 
 ## 5. Replay — the one route that spends money
 
