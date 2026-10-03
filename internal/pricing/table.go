@@ -153,17 +153,19 @@ func rateExact(model, input, output, cacheRead, cacheWrite5m, cacheWrite1h, sour
 // §Shipped price table for the citation behind every row.
 func ShippedTable() Table {
 	t := Table{
-		"claude-fable-5-1":  rate("claude-fable-5-1", "10.00", "50.00", "0.25", "shipped"),   // shared/models.md:73
-		"claude-fable-5":    rate("claude-fable-5", "10.00", "50.00", "1.00", "shipped"),     // shared/models.md:74
-		"claude-mythos-5":   rate("claude-mythos-5", "10.00", "50.00", "1.00", "shipped"),    // shared/models.md:74
-		"claude-mythos-5-1": rate("claude-mythos-5-1", "10.00", "50.00", "0.25", "shipped"),  // shared/models.md:75, cited via Fable 5.1
-		"claude-opus-5":     rate("claude-opus-5", "5.00", "25.00", "0.50", "shipped"),       // shared/models.md:76
-		"claude-opus-4-8":   rate("claude-opus-4-8", "5.00", "25.00", "0.50", "shipped"),     // shared/models.md:76
-		"claude-opus-4-7":   rate("claude-opus-4-7", "5.00", "25.00", "0.50", "provisional"), // no rate in bundle; verify against Pricing URL
-		"claude-opus-4-6":   rate("claude-opus-4-6", "5.00", "25.00", "0.50", "provisional"),
-		"claude-sonnet-5":   rate("claude-sonnet-5", "2.00", "10.00", "0.20", "shipped"),   // shared/model-migration.md:1291
-		"claude-sonnet-4-6": rate("claude-sonnet-4-6", "3.00", "15.00", "0.30", "shipped"), // shared/model-migration.md:1291
-		"claude-haiku-4-5":  rate("claude-haiku-4-5", "1.00", "5.00", "0.10", "provisional"),
+		"claude-fable-5-1":          rate("claude-fable-5-1", "10.00", "50.00", "0.25", "shipped"),   // shared/models.md:73
+		"claude-fable-5":            rate("claude-fable-5", "10.00", "50.00", "1.00", "shipped"),     // shared/models.md:74
+		"claude-mythos-5":           rate("claude-mythos-5", "10.00", "50.00", "1.00", "shipped"),    // shared/models.md:74
+		"claude-mythos-5-1":         rate("claude-mythos-5-1", "10.00", "50.00", "0.25", "shipped"),  // shared/models.md:75, cited via Fable 5.1
+		"claude-opus-5":             rate("claude-opus-5", "5.00", "25.00", "0.50", "shipped"),       // shared/models.md:76
+		"claude-opus-5-5":           rate("claude-opus-5-5", "4.00", "20.00", "0.20", "shipped"),     // platform.claude.com/docs/en/about-claude/pricing (retrieved 2026-10-03); cache read is 0.05× ($0.20), so 5m/1h writes are $5/$8
+		"claude-opus-4-8":           rate("claude-opus-4-8", "5.00", "25.00", "0.50", "shipped"),     // shared/models.md:76
+		"claude-opus-4-7":           rate("claude-opus-4-7", "5.00", "25.00", "0.50", "provisional"), // no rate in bundle; verify against Pricing URL
+		"claude-opus-4-6":           rate("claude-opus-4-6", "5.00", "25.00", "0.50", "provisional"),
+		"claude-sonnet-5":           rate("claude-sonnet-5", "2.00", "10.00", "0.20", "shipped"),          // shared/model-migration.md:1291
+		"claude-sonnet-4-6":         rate("claude-sonnet-4-6", "3.00", "15.00", "0.30", "shipped"),        // shared/model-migration.md:1291
+		"claude-haiku-4-5":          rate("claude-haiku-4-5", "1.00", "5.00", "0.10", "shipped"),          // platform.claude.com/docs/en/about-claude/pricing (retrieved 2026-10-03)
+		"claude-haiku-4-5-20251001": rate("claude-haiku-4-5-20251001", "1.00", "5.00", "0.10", "shipped"), // dated API id of claude-haiku-4-5; same page, same rates
 
 		// DeepSeek, billed pay-as-you-go. The rates below are the *off-peak*
 		// ones; peak is 2x, applied by the Peak window attached after this
@@ -185,13 +187,18 @@ func ShippedTable() Table {
 		t[model] = r
 	}
 
-	// Fast-mode rates: shipped for Opus 5 / Opus 4.8 only ($10/$50 per MTok).
+	// Fast-mode rates: Opus 5 / Opus 4.8 are $10/$50 per MTok. Opus 5.5 fast
+	// mode is $8/$40 (anthropic.com/claude-opus-5-5, retrieved 2026-10-03).
 	for _, model := range []string{"claude-opus-5", "claude-opus-4-8"} {
 		r := t[model]
 		r.FastInputRate = perMTok("10.00")
 		r.FastOutputRate = perMTok("50.00")
 		t[model] = r
 	}
+	opus55 := t["claude-opus-5-5"]
+	opus55.FastInputRate = perMTok("8.00")
+	opus55.FastOutputRate = perMTok("40.00")
+	t["claude-opus-5-5"] = opus55
 
 	return t
 }

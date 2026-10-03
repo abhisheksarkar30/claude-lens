@@ -272,16 +272,52 @@ func TestTTLUnknownReturnsApproximate(t *testing.T) {
 
 func TestProvisionalRowCarriesVerificationNote(t *testing.T) {
 	table := ShippedTable()
-	for _, model := range []string{"claude-opus-4-7", "claude-opus-4-6", "claude-haiku-4-5"} {
+	for _, model := range []string{"claude-opus-4-7", "claude-opus-4-6"} {
 		r := table[model]
 		if r.Source != "provisional" {
 			t.Errorf("%s: Source = %q, want provisional", model, r.Source)
 		}
 	}
-	for _, model := range []string{"claude-sonnet-5", "claude-opus-5", "claude-mythos-5-1"} {
+	for _, model := range []string{"claude-sonnet-5", "claude-opus-5", "claude-opus-5-5", "claude-haiku-4-5", "claude-haiku-4-5-20251001", "claude-mythos-5-1"} {
 		r := table[model]
 		if r.Source != "shipped" {
 			t.Errorf("%s: Source = %q, want shipped", model, r.Source)
+		}
+	}
+}
+
+// TestAnnouncedOpus55AndHaiku45AreShipped pins the rates retrieved from
+// platform.claude.com/docs/en/about-claude/pricing on 2026-10-03. Opus 5.5
+// cache read is $0.20/MTok (0.05×), not the usual 0.10×, and its fast mode
+// is $8/$40. Both Haiku 4.5 ids share $1/$5/$0.10.
+func TestAnnouncedOpus55AndHaiku45AreShipped(t *testing.T) {
+	table := ShippedTable()
+	opus := table["claude-opus-5-5"]
+	for _, c := range []struct{ name, got, want string }{
+		{"input", perTokenToMTok(opus.InputRate), "4.000000"},
+		{"output", perTokenToMTok(opus.OutputRate), "20.000000"},
+		{"cache_read", perTokenToMTok(opus.CacheReadRate), "0.200000"},
+		{"cache_write_5m", perTokenToMTok(opus.CacheWrite5mRate), "5.000000"},
+		{"cache_write_1h", perTokenToMTok(opus.CacheWrite1hRate), "8.000000"},
+		{"fast_input", perTokenToMTok(opus.FastInputRate), "8.000000"},
+		{"fast_output", perTokenToMTok(opus.FastOutputRate), "40.000000"},
+	} {
+		if c.got != c.want {
+			t.Errorf("claude-opus-5-5 %s = %s, want %s", c.name, c.got, c.want)
+		}
+	}
+	for _, model := range []string{"claude-haiku-4-5", "claude-haiku-4-5-20251001"} {
+		r := table[model]
+		for _, c := range []struct{ name, got, want string }{
+			{"input", perTokenToMTok(r.InputRate), "1.000000"},
+			{"output", perTokenToMTok(r.OutputRate), "5.000000"},
+			{"cache_read", perTokenToMTok(r.CacheReadRate), "0.100000"},
+			{"cache_write_5m", perTokenToMTok(r.CacheWrite5mRate), "1.250000"},
+			{"cache_write_1h", perTokenToMTok(r.CacheWrite1hRate), "2.000000"},
+		} {
+			if c.got != c.want {
+				t.Errorf("%s %s = %s, want %s", model, c.name, c.got, c.want)
+			}
 		}
 	}
 }
@@ -554,8 +590,8 @@ func TestPeakDoesNotLeakOntoFlatModels(t *testing.T) {
 // multiply would double every Claude row, so both directions are asserted.
 func TestShippedTableShape(t *testing.T) {
 	table := ShippedTable()
-	if len(table) != 14 {
-		t.Errorf("ShippedTable() has %d rows, want 14 (11 Claude + 3 DeepSeek)", len(table))
+	if len(table) != 16 {
+		t.Errorf("ShippedTable() has %d rows, want 16 (13 Claude + 3 DeepSeek)", len(table))
 	}
 
 	for _, model := range []string{"deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"} {

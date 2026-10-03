@@ -185,8 +185,10 @@ func TestRepriceModelFlagBackfillsOnlyNamedModel(t *testing.T) {
 	ctx := context.Background()
 
 	const (
-		namedShipped  = "claude-sonnet-5"
-		namedScratch  = "claude-haiku-4-5-20251001"
+		namedShipped = "claude-sonnet-5"
+		// Absent from ShippedTable on purpose: the dated Haiku 4.5 id is a
+		// shipped key, so a partial override of it would inherit cache read.
+		namedScratch  = "from-scratch-nil-cache-read"
 		otherPriced   = "claude-opus-5"
 		otherUnpriced = "claude-haiku-4-5"
 		session       = "s_reprice_model"
