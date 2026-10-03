@@ -47,12 +47,16 @@ func runPurge(args []string, w io.Writer) error {
 		return errors.New("purge: refusing to delete without --yes (add --dry-run to see what would go)")
 	}
 
-	_, st, err := openStore(args)
+	cfg, st, err := openStore(args)
 	if err != nil {
 		return fmt.Errorf("purge: %w", err)
 	}
 	defer st.Close()
 	ctx := context.Background()
+
+	if !dryRun {
+		warnIfServeLive(w, cfg.DashboardAddr)
+	}
 
 	switch {
 	case olderThan != "":

@@ -4,7 +4,7 @@
 
 - **Bead ID**: br-GI-22-04
 - **Priority**: P1 (high — a live `ingest --rebuild` already produced sustained `SQLITE_BUSY` on serve's capture path)
-- **Status**: pending
+- **Status**: done
 - **Original Estimate**: 90m
 - **Dependencies**: None
 - **Blocks**: br-GI-22-05
@@ -79,3 +79,11 @@ Manual negative control, once: point the with-listener WARN assertion at a run t
 - `internal/cli/purge.go` (modify — `_, st` to `cfg, st`, then the same `!dryRun` probe)
 
 ## Review Notes
+
+Added `probeServeHealth` and `warnIfServeLive` in `internal/cli/livecheck.go`. The probe dials `dialableDashboardAddr` and treats HTTP 200 from `GET /api/health` as live, with the caller's 2s timeout. `warnIfServeLive` prints one `WARN` line (the doctor `statusWarn` token) naming `/api/health` contention and `SQLITE_BUSY`, then returns. `ingest --rebuild` calls it before `resetJSONLCursors`. `reprice`, `reflag`, and `purge` call it only when `!dryRun`, after `openStore`. `reflag` and `purge` now keep `cfg` from `openStore`. `RepriceCosts` arguments are unchanged.
+
+`go test ./internal/cli/ -count=1 -run 'TestIngestRebuildWarnsWhenServeIsLive|TestIngestRebuildProceedsWhenServeIsDown|TestIngestWithoutRebuildDoesNotWarnWhenServeIsLive|TestRepriceYesWarnsWhenServeIsLive|TestReflagYesWarnsWhenServeIsLive|TestPurgeYesWarnsWhenServeIsLive|TestRepriceDryRunDoesNotWarnWhenServeIsLive|TestReflagDryRunDoesNotWarnWhenServeIsLive|TestPurgeDryRunDoesNotWarnWhenServeIsLive'` passed. Before the probe existed, the four `--yes` / `--rebuild` tests failed on a missing `WARN`, and the wildcard ingest recorded Host `""`.
+
+Negative control: `TestIngestRebuildProceedsWhenServeIsDown` runs `--rebuild` against a released loopback port and asserts the writer has no `WARN` while the `jsonl:` summary is still printed. That assertion passed.
+
+`go test ./internal/cli/ -count=1 -run 'TestRestart|TestShutdown|TestDoctor'` passed (20 tests) on a retry. An earlier run under load failed `TestRestartRunningReusesRecordedExeAndArgs` and, separately, `TestRestartUnhealthyNewExeRollsBackFromRetainedArgs`, both on the pre-existing drain wait (`restart.go` was not edited). `restart.go` and `doctor.go` are untouched.

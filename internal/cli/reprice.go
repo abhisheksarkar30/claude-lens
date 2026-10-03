@@ -34,6 +34,10 @@ func runReprice(args []string, w io.Writer) error {
 	}
 	defer st.Close()
 
+	if !dryRun {
+		warnIfServeLive(w, cfg.DashboardAddr)
+	}
+
 	// The effective, Loader-backed table. Not pricing.Compute, which is
 	// ShippedTable().Compute and would ignore a user override; and not the
 	// nil-dates form, which means "unset -> the shipped calendar" and would

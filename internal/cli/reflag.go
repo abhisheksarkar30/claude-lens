@@ -32,11 +32,15 @@ func runReflag(args []string, w io.Writer) error {
 		return errors.New("reflag: refusing to rewrite capture_complete without --yes (add --dry-run to see what would change)")
 	}
 
-	_, st, err := openStore(args)
+	cfg, st, err := openStore(args)
 	if err != nil {
 		return fmt.Errorf("reflag: %w", err)
 	}
 	defer st.Close()
+
+	if !dryRun {
+		warnIfServeLive(w, cfg.DashboardAddr)
+	}
 
 	counts, err := st.ReflagIncompleteCaptures(context.Background(), dryRun)
 	if err != nil {
