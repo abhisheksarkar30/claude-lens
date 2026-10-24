@@ -1,8 +1,10 @@
 package jsonlogs
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -842,5 +844,34 @@ func TestTailerFoldsTheFirstInsertedRow(t *testing.T) {
 	}
 	if rec.evs[0].RequestID != "req-first" {
 		t.Errorf("folded row RequestID = %q, want req-first (the first inserted line, not the last)", rec.evs[0].RequestID)
+	}
+}
+
+// A transcript the walk listed but Claude Code removed before the open is an
+// expected race: skipped without a log line. Any other open failure still logs.
+func TestTailFileSkipsVanishedFileQuietly(t *testing.T) {
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	root := t.TempDir()
+	tailer := New(root, newTestStore(t))
+	for _, p := range []string{
+		filepath.Join(root, "gone.jsonl"),
+		filepath.Join(root, "no-such-dir", "gone.jsonl"),
+	} {
+		if stats := tailer.tailFile(context.Background(), walkedFile{Path: p}); stats != (Stats{}) {
+			t.Errorf("stats for vanished %s = %+v, want zero", p, stats)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Errorf("vanished files logged: %q", buf.String())
+	}
+
+	// Any other open failure (here an invalid name) is a real fault and stays loud.
+	tailer.tailFile(context.Background(), walkedFile{Path: filepath.Join(root, "bad\x00name.jsonl")})
+	if !bytes.Contains(buf.Bytes(), []byte("jsonlogs: open")) {
+		t.Errorf("a non-ENOENT open error no longer logs: %q", buf.String())
 	}
 }

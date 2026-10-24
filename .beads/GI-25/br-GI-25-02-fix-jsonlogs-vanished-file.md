@@ -59,3 +59,5 @@ A file genuinely vanishing between the walk and the open is not an operator-acti
 - `internal/jsonlogs/jsonlogs_test.go` (modify — add `TestTailFileSkipsVanishedFileQuietly`)
 
 ## Review Notes
+
+Implemented. `go test ./internal/jsonlogs/` green. Negative control (disabling the `ErrNotExist` branch) failed the new test. The test also pins that a non-ENOENT open error (an invalid name; a directory opens fine on Windows) still logs.

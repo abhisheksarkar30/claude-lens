@@ -11,6 +11,7 @@ package jsonlogs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -287,6 +288,12 @@ func (t *Tailer) tailFile(ctx context.Context, f walkedFile) Stats {
 
 	fh, err := os.Open(f.Path)
 	if err != nil {
+		// Claude Code removes transcripts on its own schedule, so a file the
+		// walk listed can be gone by now. That is expected, not an I/O fault,
+		// and logging it like one buries the real open errors.
+		if errors.Is(err, fs.ErrNotExist) {
+			return stats
+		}
 		log.Printf("jsonlogs: open %s: %v", f.Path, err)
 		return stats
 	}
