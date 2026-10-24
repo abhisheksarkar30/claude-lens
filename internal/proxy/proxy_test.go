@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -902,4 +903,130 @@ func mustReq(t *testing.T, method, path, body string) *http.Request {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	return req
+}
+
+// abortingUpstream answers with a chunked 200, writes one chunk, then drops
+// the connection without the terminating chunk: the upstream dying mid-stream.
+func abortingUpstream(contentType string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		fmt.Fprintf(buf, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n", contentType)
+		buf.Flush()
+	}
+}
+
+// captureLog redirects the std logger for the test and returns a reader of
+// what was logged.
+func captureLog(t *testing.T) func() string {
+	t.Helper()
+	var mu sync.Mutex
+	var logged bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&lockedWriter{mu: &mu, w: &logged})
+	t.Cleanup(func() { log.SetOutput(prev) })
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return logged.String()
+	}
+}
+
+// TestMidStreamUpstreamAbortIsMarkedIncomplete: an upstream that drops the
+// response mid-body must not be recorded as a complete capture.
+func TestMidStreamUpstreamAbortIsMarkedIncomplete(t *testing.T) {
+	cases := []struct {
+		name, policy, contentType string
+		wantCaptured              string
+	}{
+		{"stream", "full", "text/event-stream", "captured=5"},
+		{"json", "full", "application/json", "captured=5"},
+		{"policy off", "off", "text/event-stream", "captured=0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(abortingUpstream(tc.contentType))
+			defer upstream.Close()
+
+			cfg := testConfig(upstream.URL)
+			cfg.BodyPolicy = tc.policy
+			sk := sink.New(8)
+			h, err := New(cfg, sk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proxySrv := proxyServer(t, h)
+			defer proxySrv.Close()
+			logs := captureLog(t)
+
+			resp, err := http.Post(proxySrv.URL+"/v1/messages", "application/json", strings.NewReader("{}"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			io.ReadAll(resp.Body) // the client sees the abort too; its error is not under test
+			resp.Body.Close()
+
+			call := captureOne(t, sk)
+			if call.CaptureComplete {
+				t.Error("CaptureComplete = true for a response the upstream aborted")
+			}
+			if call.Err == nil {
+				t.Error("Err = nil, want the upstream read error")
+			}
+			out := logs()
+			if !strings.Contains(out, "proxy: upstream stream aborted") || !strings.Contains(out, tc.wantCaptured) {
+				t.Errorf("log lacks the labelled abort line with %s:\n%s", tc.wantCaptured, out)
+			}
+			if strings.Contains(out, "ReverseProxy read error") {
+				t.Errorf("the stdlib's unlabelled duplicate line was not suppressed:\n%s", out)
+			}
+		})
+	}
+}
+
+// TestCancelledClientIsNotAnAbort: a client that stops reading received what
+// the session produced, so the capture stays complete and carries no error.
+func TestCancelledClientIsNotAnAbort(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("data: one\n\n"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer upstream.Close()
+	defer close(release)
+
+	sk := sink.New(8)
+	h, err := New(testConfig(upstream.URL), sk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxySrv := proxyServer(t, h)
+	defer proxySrv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, proxySrv.URL+"/v1/messages", strings.NewReader("{}"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bufio.NewReader(resp.Body).ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	resp.Body.Close()
+
+	call := captureOne(t, sk)
+	if !call.CaptureComplete || call.Err != nil {
+		t.Errorf("CaptureComplete=%v Err=%v, want true and nil for a client cancel", call.CaptureComplete, call.Err)
+	}
 }

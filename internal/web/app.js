@@ -203,9 +203,9 @@ function archiveNote(e) {
 }
 
 // captureMarker reports a capture the proxy could not finish, in the CLI's own
-// wording. CaptureComplete is false exactly when a body was cut at the cap,
-// so the line names the cap only in the one case where it is knowably the
-// cause, and says so plainly when the
+// wording. CaptureComplete is defined on sink.CapturedCall (a body cut at the
+// cap, or an upstream abort), so the line names the cap only in the one case
+// where it is knowably the cause, and says so plainly when the
 // row does not record which of the two it was. Claiming the cap unconditionally
 // would be a second, quieter defect in the thing that exists to report the
 // first.

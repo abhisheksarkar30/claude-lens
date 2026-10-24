@@ -1041,3 +1041,46 @@ func TestHashFallbackTwoAttemptsProduceDistinctIDs(t *testing.T) {
 		t.Fatalf("two attempts with identical bodies produced the same RequestID %q, want distinct", first)
 	}
 }
+
+// An aborted stream carries both warnings: upstream_error for the cause and
+// stream_incomplete for the shape. An aborted JSON body carries only the
+// first, because the rule requires a stream.
+func TestConsumerAbortedCallWarnings(t *testing.T) {
+	cases := []struct {
+		name       string
+		stream     bool
+		wantStream bool
+	}{{"stream", true, true}, {"json", false, false}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			sk := sink.New(sink.DefaultCapacity)
+			c := New(sk, st, nil)
+			c.SetAnalyzers(analyze.Engine{})
+			ctx, cancel := context.WithCancel(context.Background())
+			go c.Run(ctx)
+			defer cancel()
+
+			call := basicCall("req-abort-" + tc.name)
+			call.CaptureComplete = false
+			call.Err = errors.New("unexpected EOF")
+			if tc.stream {
+				call.RespHeaders = http.Header{"Content-Type": {"text/event-stream"}}
+				call.RespBody = sseBody("claude-sonnet-5", 20, 8)
+			}
+			sk.Submit(call)
+
+			ev := waitForEvents(t, st, 1)[0]
+			warnings, err := st.EventWarnings(context.Background(), ev.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !hasWarningKind(warnings, "upstream_error") {
+				t.Errorf("no upstream_error: %v", warnings)
+			}
+			if got := hasWarningKind(warnings, string(analyze.KindStreamIncomplete)); got != tc.wantStream {
+				t.Errorf("stream_incomplete = %v, want %v: %v", got, tc.wantStream, warnings)
+			}
+		})
+	}
+}

@@ -71,10 +71,10 @@ type EventSummary struct {
 	ReplayOf    string
 	ReplayEdits string
 
-	// CaptureComplete is false exactly when either body was truncated at the
-	// read cap — the merge-precedence flag. Which of the two bodies was cut
-	// is not recorded on the row; the detail view names it by comparing each
-	// stored body's length against the read cap it was configured with.
+	// CaptureComplete: see sink.CapturedCall.CaptureComplete. It is the
+	// merge-precedence flag. Which cause or which body was cut is not recorded
+	// on the row; the detail view names a capped body by comparing each stored
+	// body's length against the read cap it was configured with.
 	CaptureComplete bool
 
 	// Proxy-only, empty for a source="jsonl" row.

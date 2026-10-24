@@ -90,3 +90,5 @@ Without this, a stream the upstream (the DeepSeek edge the proxy forwards to, pe
 - `internal/jsonlogs/jsonlogs.go` (modify — `buildEvent` comment near lines 474-475 reduced to a pointer)
 
 ## Review Notes
+
+Implemented. `go test ./internal/proxy/ ./internal/consumer/ ./internal/analyze/ ./internal/web/ ./internal/store/` green. Negative control (never setting `readErr`) failed `TestMidStreamUpstreamAbortIsMarkedIncomplete` as the bead required. The abort fixture hijacks the connection and drops it after one chunk; the client-cancel case stayed complete with no error. `app.js:247` and the jsonlogs `buildEvent` comment were left as is: both are still true.
