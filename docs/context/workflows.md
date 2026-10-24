@@ -54,7 +54,7 @@ sequenceDiagram
   cut at the read cap be stored as a prefix on a row still reporting a whole capture (br-GI-7-08,
   found by the GI#7 manual run rather than by a test — every fixture in that story truncated a
   response). A migration that changes this flag changes what `analyze`'s `stream_incomplete` rule
-  fires on and which row the merge prefers; see flow 2.
+  fires on and which row the merge prefers; see flow 2. Since GI#25 an upstream read error also clears it (see the abort bullet below).
 - **`--body-policy off` skips the tee, not the row.** Under `off` no `boundedBuffer` is allocated and
   no `io.TeeReader` is installed; the response is wrapped in a bare pass-through whose only job is to
   fire the submit when the call ends, so a row is written with both body columns NULL and
@@ -62,6 +62,25 @@ sequenceDiagram
   br-GI-7-09 the handler returned the bare `ReverseProxy` under `off` and no row was written at all,
   which is the opposite of what `clens serve`'s banner promises. The hot path is unchanged either
   way, and `TestNoBufferingSSE` is a table over both policies to keep it that way.
+
+- **The upstream is chosen per request (GI#25).** The handler reads `Targets.Active()` once and stores
+  it on the request's `captureState`; `Rewrite` resolves the upstream URL from that stamp, so the
+  upstream that answers and the `Provider` written on the row cannot disagree when a switch races a
+  request. A request in flight finishes on the provider it started with.
+  `TestTargetsSwitchIsLiveAndTagged` (with `-race`) pins it. A replay goes through the same handler,
+  so it uses the provider active at replay time, not the original row's.
+- **An upstream that drops the stream mid-response clears `CaptureComplete` (GI#25).**
+  `teeCloser.Read` remembers the first read error that is neither EOF nor `context.Canceled`; both
+  `onClose` closures (the capturing one and the `--body-policy off` one) then submit
+  `captureComplete=false` with that error as the call's `Err` and log `proxy: upstream stream aborted …`.
+  The consumer turns the error into `upstream_error`, and for a stream `stream_incomplete` fires too.
+  A client that stops the stream is not an abort. The stdlib's own `read error during body copy` line
+  is discarded because this one carries the call's identity.
+- **A transient store error is retried, not dropped (GI#25).** The consumer wraps each flush write in
+  `withRetry` (250 ms, 1 s, 4 s) for `SQLITE_IOERR` (including `disk I/O error (266)`), `SQLITE_NOMEM`
+  and the `cannot allocate N bytes of memory` message; `SQLITE_BUSY` is not retried. On exhaustion the
+  rest of that flush's inserts are skipped and counted as failed, once per flush. The counts are
+  `store_transient_retries` / `store_transient_gave_up` on `GET /api/health`.
 
 ## 2. Cross-source merge — the one `UPDATE` on `events`
 
@@ -283,6 +302,10 @@ sequenceDiagram
 3. Relaunch detached (`detach_windows.go` / `detach_unix.go`) from the recorded exe/args, or `--exe`; poll
    `/api/health`; print the measured proxy gap.
 4. Unhealthy replacement: kill it; if `--exe` swapped the binary, relaunch the retained old exe. Non-zero exit.
+
+A provider switch is **not** a restart: `POST /api/provider` takes effect on the next request and the choice is
+saved beside the database, so `clens restart` keeps it. A saved `local` with no `LocalUpstreamURL` falls
+back to `cloud` on boot.
 
 ## 8. Archival pass (GI#16)
 

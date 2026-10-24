@@ -34,11 +34,11 @@ Three non-stdlib modules and no more: `modernc.org/sqlite` (pure Go, no cgo),
 | [workflows.md](workflows.md) | to understand a flow end to end before changing it | conditional — trigger: flows spanning more than one package |
 | [security-and-permissions.md](security-and-permissions.md) | **before touching credentials, redaction, listeners, or an import edge** | conditional — trigger: `internal/secret`, the redactor, the Origin guard |
 | [data-privacy-and-compliance.md](data-privacy-and-compliance.md) | before changing what is captured, or how long it is kept | conditional — trigger: the body policy, the cap, retention, `clens purge` |
-| [testing-and-quality.md](testing-and-quality.md) | before writing a test, or wondering what CI gates on | conditional — trigger: 72 test files |
+| [testing-and-quality.md](testing-and-quality.md) | before writing a test, or wondering what CI gates on | conditional — trigger: 78 test files |
 | [infra-and-deploy.md](infra-and-deploy.md) | before touching a workflow, a hook, or branch policy | conditional — trigger: `.github/workflows/` |
 | [integrations-and-external-services.md](integrations-and-external-services.md) | before changing a collector or adding a dependency | conditional — trigger: four external endpoints, three Go modules |
 | [dashboard.md](dashboard.md) | before changing anything in `internal/web` | conditional — a non-catalogue module: 1183 lines of hand-written JS under a hard no-build-step rule |
-| [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — eleven genuine forks, each with a rejected alternative a change could reintroduce |
+| [decisions/](decisions/000-index.md) | before "simplifying" something that looks over-built | conditional — twelve genuine forks, each with a rejected alternative a change could reintroduce |
 
 ## Grounding rules for agents
 
@@ -380,3 +380,30 @@ reaches only a JSONL counterpart, `reprice --model`, and the live-serve `WARN` o
 commands), `workflows.md` (flows 2 and 4 name `reprice --model` as the unpriced backfill), and
 `cost-and-quota.md` (a used nil rate is `unpriced`, and `--model` is the opt-in exception to the
 unpriced-row skip).
+
+**2026-10-24 — REFRESH, scoped to `GI-25-local-llm-toggle-and-store-hardening`** (beads `br-GI-25-01` …
+`-06`; plan `docs/planning/GI-25-local-llm-toggle-and-store-hardening.md` v9, converged). **No module was
+added or retired; `decisions/` gained one ADR**, [012](decisions/012-provider-stamped-on-the-request.md),
+so the count above moved eleven → twelve. The story added a third billing mode (`local`, a projection
+priced as `deepseek-flash`, kept out of every real-cost sum and out of quota burn), a live cloud/local
+provider switch (`proxy.Targets`, `GET`/`POST /api/provider`, a header toggle), an upstream-abort path
+into `CaptureComplete`, and a bounded retry for transient store errors.
+
+**Fifteen module files changed, one created.** `cost-and-quota.md` (the new "local provider" section, the
+local row in the plan table, rule 1 reworded from "two" to "billing models"), `storage-schema.md` (the
+`billing_mode` vocabulary, the billing-split table, and the `capture_complete` definition, which no longer
+says "the two buffers' truncation bits alone"), `workflows.md` (flow 1 gains the per-request provider stamp,
+the abort path and the store retry; flow 7 notes a switch is not a restart), `api-surface.md` and
+`security-and-permissions.md` (the loopback-guarded routes are now three, and why `/api/provider` is
+loopback-only), `architecture.md` ("Two upstreams, one switch"), `build-and-run.md` and `cli-and-tooling.md`
+(`--local-upstream-url`, `LocalModelPrefixes`, the new `Validate` rules), `conventions.md` (the health
+counters), `dashboard.md` (the toggle and the local columns; asset line counts re-measured: 190 / 1249 / 258),
+`glossary.md`, `data-privacy-and-compliance.md` (two spots now point at
+`sink.CapturedCall.CaptureComplete` instead of restating it), `integrations-and-external-services.md` (the
+local server row), `testing-and-quality.md`, and `decisions/000-index.md`. The created file is the ADR.
+
+**Not changed.** The line-number citations in `storage-schema.md` (such as `store.go:686`) and the line totals in
+`testing-and-quality.md` pre-date this story and were not re-checked. A replay is routed by the provider active at
+replay time, not the original row's (written into `workflows.md` flow 1 and `api-surface.md`). The jsonlogs
+quiet skip of a vanished file and the `store_transient_gave_up` over-count when a shutdown cancels a backoff
+need no doc claim.

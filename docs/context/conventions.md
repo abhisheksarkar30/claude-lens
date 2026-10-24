@@ -89,7 +89,8 @@ return value on `Compute` so that widening it cannot force an update on every fa
 - Collector failures are recorded against the owning source row in `ingest_state`, surfaced by
   `GET /api/sources` — a failed collector is visible, not a quietly short chart.
 - Counters that would otherwise be invisible are exposed on `GET /api/health` — e.g.
-  `replayRejected`, which counts replays turned away by the opt-in or Origin guard, because a
+  `replayRejected`, which counts replays turned away by the opt-in or Origin guard (and, GI#25,
+  `store_transient_retries` / `store_transient_gave_up`, the bounded store-retry counts), because a
   rejected probe against the one billable route would otherwise leave no server-side trace.
 
 ## Testing conventions

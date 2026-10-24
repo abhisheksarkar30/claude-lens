@@ -2,7 +2,7 @@
 
 # Decision records
 
-Ten architectural forks where the code took one path and a real alternative was rejected. Each is
+Twelve architectural forks where the code took one path and a real alternative was rejected. Each is
 recorded because **the losing side is the one a future change is most likely to reintroduce** —
 these are not history for its own sake.
 
@@ -13,7 +13,8 @@ rejected side of that original decision — "no migrations" — is the one a rea
 quoted in the older docs. **008 and 009 come from the GI-9 plan** (`docs/planning/GI-9-merge-jsonl-and-proxy-rows.md`,
 D1 and D7): the identity key and the session id the cross-source merge relies on. **010 comes from
 the GI-13 plan** (`docs/planning/GI-13-session-pass-cost.md`, D1): the per-session analyzer pass and
-fold dedupe to once per flush batch.
+fold dedupe to once per flush batch. **012 comes from the GI-25 plan** (`docs/planning/GI-25-local-llm-toggle-and-store-hardening.md`,
+§10): how a call is known to be local.
 
 | ADR | Decision | Reintroducing the rejected side would… |
 |---|---|---|
@@ -28,6 +29,7 @@ fold dedupe to once per flush batch.
 | [009](009-proxy-adopts-the-conversation-id.md) | the proxy adopts `x-claude-code-session-id` as its stored `session_id` | leave `clens sessions` showing gap-window heuristic groups instead of real conversations |
 | [010](010-per-session-dedupe-accepts-warning-subset.md) | the session-scoped analyzer pass and fold run once per distinct session per flush batch, not once per row | re-walk a large session's full row history once per row in a batch again, scaling flush cost with `batch_size × session_row_count` even with the composite index in place |
 | [011](011-bodies-only-archival-with-day-files.md) | only bodies are archived, via a `body_archive` marker table and per-UTC-day files | archive whole rows (breaking aggregates and the merge) or hold the write connection for a background `VACUUM` |
+| [012](012-provider-stamped-on-the-request.md) | the proxy stamps the active provider on each request; the billing mode is not inferred from the model name | make the local/cloud split a guess, since a local and a cloud model can share a name — and misfile a projection in a real-cost column |
 
-The status of all eleven is **Accepted**. None is superseded — 007 supersedes a *GI-1 decision*
+The status of all twelve is **Accepted**. None is superseded — 007 supersedes a *GI-1 decision*
 ("migrations: none in v1"), not another ADR.

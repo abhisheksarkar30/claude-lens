@@ -9,7 +9,7 @@ transparent pass-through — and is documented first because it is the one that 
 
 | Method | Path | Auth | Summary | Evidence |
 |---|---|---|---|---|
-| any | any path | passed through untouched | **Transparent reverse proxy.** The method, path, headers, and body reach `--upstream-url` unchanged, and the response returns unchanged. The listener does not parse, does not require a credential, and does not fail closed. | [internal/proxy/proxy.go](../../internal/proxy/proxy.go) |
+| any | any path | passed through untouched | **Transparent reverse proxy.** The method, path, headers, and body reach the active upstream (`--upstream-url`, or `--local-upstream-url` when the provider toggle is set to `local`, GI#25) unchanged, and the response returns unchanged. The listener does not parse, does not require a credential, and does not fail closed. | [internal/proxy/proxy.go](../../internal/proxy/proxy.go) |
 
 The only paths with behaviour of their own are the ones the capture logic inspects to decide
 whether it is looking at a `/v1/messages` call. Everything else is a byte-for-byte pass-through —
@@ -45,7 +45,8 @@ handler runs.
 | `GET` | `/api/models` | the catalogue, plus every model traffic used | — | [internal/api/api.go:188](../../internal/api/api.go#L206) |
 | `GET` | `/api/reconcile` | computed (A/B) vs billed (D), per day and model | — | [internal/api/api.go:189](../../internal/api/api.go#L207) |
 | `GET` | `/api/prices` | the effective rate table | — | [internal/api/api.go:180](../../internal/api/api.go#L198) |
-| `GET` | `/api/health` | health, plus the counters that would otherwise be invisible | — | [internal/api/api.go:179](../../internal/api/api.go#L197) |
+| `GET` | `/api/health` | health, plus the counters that would otherwise be invisible (including `store_transient_retries` / `store_transient_gave_up`, GI#25) | — | [internal/api/api.go:179](../../internal/api/api.go#L197) |
+| `GET` | `/api/provider` | the active provider (`cloud` or `local`), the two upstream **hosts** (never the URLs), and whether a local upstream is configured (GI#25) | — | [internal/api/provider.go](../../internal/api/provider.go) |
 | `GET` | `/api/stream` | **SSE.** Live push of new events and warnings. | — | [internal/api/api.go:178](../../internal/api/api.go#L196) |
 | `GET` | `/` and below | the embedded dashboard assets | — | [internal/api/api.go:194](../../internal/api/api.go#L213) |
 
@@ -84,13 +85,14 @@ Decoding is display-only: nothing here writes back, and replay sends the stored 
 
 | Method | Path | Auth | Summary | Unwired seam |
 |---|---|---|---|---|
-| `POST` | `/api/requests/{id}/replay` | same-origin + `--replay` | re-issue a captured call | **disabled by default** — 403 unless `clens serve --replay` |
+| `POST` | `/api/requests/{id}/replay` | same-origin + `--replay` | re-issue a captured call through the live proxy handler, so it goes to whichever provider is active at replay time, not the original row's | **disabled by default** — 403 unless `clens serve --replay` |
 | `POST` | `/api/prices` | same-origin | write a user rate override | `503` without `SetPricing` |
 | `POST` | `/api/accounts` | same-origin | save the accounts file | `503` without `SetAccountWriter` |
 | `POST` | `/api/secrets` | same-origin | store a credential | `503` without `SetCredentialWriter` |
 | `POST` | `/api/ingest` | same-origin | run every collector once | `503` without `SetIngestTrigger` |
 | `POST` | `/api/reload` | same-origin **+ loopback caller** (GI#16) | `clens reload`: re-read config with the boot args and apply live exactly `Accounts`, `RetentionDays`, `HotDays`; the JSON reply lists what was applied and what needs a restart. All-or-nothing | `503` without the reload hook |
 | `POST` | `/api/shutdown` | same-origin **+ loopback caller** (GI#13) | `clens shutdown`'s remote-triggered graceful stop — the same cancel func Ctrl+C already drives | `503` without `SetShutdown`; response is written before the func runs, on its own goroutine |
+| `POST` | `/api/provider` | same-origin **+ loopback caller** (GI#25) | switch new requests to `{"active": "cloud"}` or `{"active": "local"}`; saved beside the database, effective on the next request with no restart | `503` without `SetProvider`; `400` for an unknown value or `local` with no local upstream configured |
 
 ### The write guards
 
@@ -101,11 +103,11 @@ Decoding is display-only: nothing here writes back, and replay sends the stored 
    `Host`, compared as host:port. A cross-origin POST gets `403`.
 2. **Opt-in for the one billable route** — replay sends a real, billable call, so it is off unless
    the server was started with `--replay`.
-3. **Loopback caller, for the process-stopping and process-reconfiguring routes** (GI#13, GI#16: `/api/shutdown`, `/api/reload`) — `originReject` alone checks
+3. **Loopback caller, for the process-stopping and process-reconfiguring routes** (GI#13, GI#16, GI#25: `/api/shutdown`, `/api/reload`, `/api/provider`) — `originReject` alone checks
    only the `Host` header, which is the DNS-rebinding case (a page whose own hostname resolves to
    `127.0.0.1`). A caller that can already reach a dashboard bound to `0.0.0.0` (`--allow-remote`)
    can send `Host: 127.0.0.1` and pass that guard regardless of where the connection actually came
-   from. `/api/shutdown` and `/api/reload` additionally check `r.RemoteAddr` themselves against a loopback predicate —
+   from. `/api/shutdown`, `/api/reload` and `/api/provider` additionally check `r.RemoteAddr` themselves against a loopback predicate —
    `--allow-remote` widens neither guard for this route; it is loopback-only unconditionally. See
    [security-and-permissions.md](security-and-permissions.md).
 

@@ -108,24 +108,28 @@ These are `TEXT` columns, not SQL enums — the valid vocabulary lives in Go and
 |---|---|---|
 | `events.source` | `proxy` \| `jsonl` \| `snapshot` \| `admin` | the four writer packages |
 | `events.auth_kind` | `oauth` \| `api_key` \| `admin` \| `cloud` \| `unknown` | [cost-and-quota.md](cost-and-quota.md) |
-| `events.billing_mode` | `subscription` \| `api` | `TestBillingModeInvariants` |
+| `events.billing_mode` | `subscription` \| `api` \| `local` (GI#25) | `TestBillingModeInvariants` |
 | `events.cost_source` | `shipped` \| `provisional` \| `user` \| `approximate:<reason>` \| `unpriced` | `TestBillingModeInvariants` |
 | `warnings.kind` | the 23 kinds in [internal/analyze/kinds.go](../../internal/analyze/kinds.go) | `internal/analyze/readme_test.go` |
 | `warnings.severity` | `info` \| `warn` \| `error` | [internal/analyze/kinds.go](../../internal/analyze/kinds.go) |
 | `quota_snapshots.status` | the endpoint's own reported status, stored verbatim | [internal/snapshot](../../internal/snapshot/) |
 | `ingest_state.status` | per-collector outcome; `error` carries the message | [internal/ingest](../../internal/ingest/) |
 
-`events.capture_complete` is a flag rather than an enum: it says whether the capture is whole. It is
-computed from **the two buffers' `truncated` bits alone** —
-`!respBuf.truncated && !st.reqBody.truncated` ([proxy.go:107](../../internal/proxy/proxy.go#L107)) —
-and **both bodies count**: a request body cut at the cap clears it just as a response body does
-(br-GI-7-08). Two consequences follow, and both are easy to get wrong from the outside:
+`events.capture_complete` is a flag rather than an enum: it says whether the capture is whole. The
+canonical definition is on `sink.CapturedCall.CaptureComplete` ([sink.go](../../internal/sink/sink.go)).
+In short it is **false** when either teed body hit the read cap, or when the upstream response body
+ended with a read error other than a client cancel (GI#25: `teeCloser.aborted()` in
+[proxy.go](../../internal/proxy/proxy.go), which also hands the error to the consumer so
+`upstream_error` is raised). **Both bodies count**: a request body cut at the cap clears it just as a
+response body does (br-GI-7-08). A client that cancels mid-stream does not clear it. Two consequences
+follow, and both are easy to get wrong from the outside:
 
 - **It does not encode "the stream ended without a `message_stop` event."** The flag is about teed
-  bytes, not about the SSE framing. `internal/analyze`'s `stream_incomplete` rule fires on
-  `!CaptureComplete && IsStream` ([rules.go:183](../../internal/analyze/rules.go#L183)) and says
-  "truncated, or the stream ended early" because a stored row cannot distinguish the two — that
-  wording is the rule's, not the flag's.
+  bytes and the read outcome, not the SSE framing: a clean EOF with no `message_stop` leaves it true.
+  `internal/analyze`'s `stream_incomplete` rule fires on `!CaptureComplete && IsStream`
+  ([rules.go](../../internal/analyze/rules.go)) and says "truncated at the read cap, or the upstream
+  stream was aborted" because a stored row cannot distinguish the two — that wording is the rule's,
+  not the flag's.
 - **The row does not record which body was cut.** A reader that needs to name one compares each
   stored body's length against the configured cap, which the dashboard does and `clens show` does
   not — and that comparison is only as good as the cap not having changed, see the limitation below.
@@ -245,15 +249,18 @@ prompt size is wrong.
 
 ## The billing split, in columns
 
-Two billing models that must never be summed, carried by *which column the figure lives in*:
+Billing figures that must never be summed, carried by *which column the figure lives in* (GI#25 added a
+third, `local`, a projection beside the two real ones):
 
 | `billing_mode` | `cost_usd` | `api_equivalent_cost_usd` |
 |---|---|---|
 | `api` | the computed cost | NULL |
 | `subscription` | NULL | the hypothetical API-equivalent value |
+| `local` | NULL | the projected value at the `deepseek-flash` rate — see [cost-and-quota.md](cost-and-quota.md#the-local-provider-gi25) |
 
 No `SUM(cost_usd)` — with or without a JOIN — can merge them, because they are never in the same
-column. `sessions` mirrors the split with `total_cost_usd` and `total_api_equivalent_cost_usd`. See
+column. `sessions` mirrors the split with `total_cost_usd` and `total_api_equivalent_cost_usd` (a session has no local total, and its api-equivalent sum counts
+`subscription` rows only). See
 [decisions/001](decisions/001-billing-split-by-column.md).
 
 **A cross-source merge is what can desync the pair, so the merge moves both together.** The winning
@@ -261,11 +268,13 @@ capture supplies the cost columns *and* the `billing_mode` that labels them; whe
 no mode at all — possible, since `billing_mode` is `TEXT NOT NULL DEFAULT ''` and an unclassified
 credential yields `''` — the label is derived from the column the winner priced rather than taken
 from the losing side
-([internal/store/merge.go](../../internal/store/merge.go), `TestMergeDerivesBillingModeFromWinningCostColumn`).
+([internal/store/merge.go](../../internal/store/merge.go), `TestMergeDerivesBillingModeFromWinningCostColumn`). A `local` row adds its own rule, in
+[cost-and-quota.md](cost-and-quota.md#the-local-provider-gi25).
 Note the aggregates key on the value: `SUM(CASE WHEN billing_mode = 'api' THEN cost_usd END)` and
 its `'subscription'` mirror, so a row whose mode is `''` matches neither and is absent from **both**
 totals ([internal/store/store.go:686](../../internal/store/store.go#L686) and its two siblings at
-`:1372` and `:1437`).
+`:1372` and `:1437`). The aggregates carry a third `CASE WHEN billing_mode = 'local'` mirror feeding
+`TotalLocalProjectedCostUSD`.
 
 `cost_source` labels how the figure was arrived at: `shipped` (from the bundled table),
 `provisional` (bundled but unverified), `user` (an override), `approximate:<reason>` (a rate
