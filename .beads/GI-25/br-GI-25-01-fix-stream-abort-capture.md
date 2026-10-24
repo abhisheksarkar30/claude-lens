@@ -57,7 +57,7 @@ The response body wrapped in `teeCloser` at each site is the same `*teeCloser` v
 - `internal/web/app.js:247-248` ("that flag is about the two *teed* bodies" — `transcriptCapMarker` doc) — this line is about a *different* flag's scope (it already correctly says CaptureComplete does NOT drive `transcriptCapMarker`); update only the parenthetical if it restates the old cap-only definition, otherwise leave the "deliberately NOT driven by" statement itself unchanged — it remains true.
 - `internal/jsonlogs/jsonlogs.go:474-475` ("teed bodies" wording in the `buildEvent` comment) — reduce to a pointer; this comment also remains structurally correct (a jsonl row owns no teed bodies) but should name the canonical definition rather than restate it.
 - `internal/analyze/kinds.go:74` (`KindStreamIncomplete`'s user-facing description, currently `"The capture is incomplete: a body was truncated at the read cap."`) — rewrite to the disjunction the rule now covers: `"The capture is incomplete: truncated at the read cap, or the upstream stream was aborted before the response was complete."`
-- `internal/store/storage-schema.md`, `workflows.md`, `dashboard.md`, `glossary.md`, `INDEX.md`, `data-privacy-and-compliance.md` context-doc staleness is tracked separately (plan §11); do not edit `docs/context/` from this bead.
+- `docs/context/` staleness (`storage-schema.md`, `workflows.md`, `dashboard.md`, `glossary.md`, `INDEX.md`, `data-privacy-and-compliance.md`) is tracked separately (plan §11); do not edit `docs/context/` from this bead.
 
 **Hot-path rule.** No parsing, no blocking, no new import: `teeCloser.Read` only compares `err` against `io.EOF` and `context.Canceled` (both already-imported stdlib values once `context` and `errors` are imported; `errors` is a new import to `proxy.go`, `context` is already imported). `internal/proxy` continues to depend only on `sink` and `config`.
 
@@ -73,7 +73,7 @@ Without this, a stream the upstream (the DeepSeek edge the proxy forwards to, pe
 
 ## Test Specifications
 
-- `internal/proxy/proxy_test.go`: `TestMidStreamUpstreamAbortIsMarkedIncomplete` — fake upstream sends headers, part of the body, then closes the connection mid-stream; asserts `CaptureComplete=false`, the labelled log line (`proxy: upstream stream aborted ...`), and the exact warning set via a wired consumer/analyzer test double or by asserting the `sink.CapturedCall.Err` field is non-nil and feeding it through the existing `TestUpstreamErrorWarning`-style consumer check if one exists — assert at minimum `CapturedCall.CaptureComplete == false` and `CapturedCall.Err != nil` at the proxy layer, since `internal/proxy` cannot import `store` to assert warnings directly (CLAUDE.md: proxy depends only on sink and config). Three sub-cases in the same test: (a) a streamed body abort, (b) a non-stream (JSON) body abort, (c) `--body-policy off` (the pass-through closure), asserting `captured=0` on the off-policy sub-case's log line.
+- `internal/proxy/proxy_test.go`: `TestMidStreamUpstreamAbortIsMarkedIncomplete` — fake upstream sends headers and part of the body, then closes the connection mid-stream. At the proxy layer (which cannot import `store`, so it cannot assert warnings) assert on the submitted `sink.CapturedCall`: `CaptureComplete == false` and `Err != nil`; and assert the captured log contains `proxy: upstream stream aborted`. Three sub-cases: (a) a streamed (SSE) body abort, (b) a non-stream (JSON) body abort, (c) `--body-policy off` (the pass-through closure), whose log line must show `captured=0`. The two-warning outcome (`upstream_error` + `stream_incomplete` for a stream, `upstream_error` alone for JSON) is covered on the consumer side: add one consumer test feeding a `CapturedCall{Err: errors.New("x"), CaptureComplete: false}` with a stream usage and assert both kinds.
 - `internal/proxy/proxy_test.go`: `TestCancelledClientIsNotAnAbort` — the fake upstream read returns `context.Canceled` (simulated via closing the client's request context mid-copy); asserts `CaptureComplete=true` and `CapturedCall.Err == nil`.
 - **Negative control**: revert the `teeCloser.readErr`/`aborted()` change (or revert the `onClose` check) and re-run `TestMidStreamUpstreamAbortIsMarkedIncomplete` — it must fail with `CaptureComplete == true`.
 
@@ -81,6 +81,7 @@ Without this, a stream the upstream (the DeepSeek edge the proxy forwards to, pe
 
 - `internal/proxy/proxy.go` (modify — `teeCloser.readErr`/`aborted()`, both `onClose` closures check it, `rp.ErrorLog` discard logger, new `errors` import)
 - `internal/proxy/proxy_test.go` (modify — add the two new tests and their sub-cases)
+- `internal/consumer/consumer_test.go` (modify — the one test asserting both warning kinds for an aborted stream; no consumer code change)
 - `internal/sink/sink.go` (modify — `CapturedCall.CaptureComplete` doc comment, canonical definition)
 - `internal/store/types.go` (modify — `Event.CaptureComplete` doc comment, line 74, reduced to a pointer)
 - `internal/analyze/rules.go` (modify — `ruleStreamIncomplete` doc comment, lines 174-175, reduced to a pointer)

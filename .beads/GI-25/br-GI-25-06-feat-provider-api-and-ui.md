@@ -79,21 +79,27 @@ The loopback-guarded route count in `docs/context/api-surface.md`/`security-and-
 
 **`internal/cli/serve.go` wiring** (completing the line br-GI-25-05 deferred): after `dashAPI := api.New(...)` (`serve.go:130`), alongside the other `dashAPI.SetXxx(...)` calls (`serve.go:135-145`):
 ```go
+hostOf := func(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
 dashAPI.SetProvider(api.ProviderSeam{
 	Get: func() (string, string, string, bool) {
-		active := targets.Active()
-		return active, cfg.UpstreamURL /* host-only, resolved */, cfg.LocalUpstreamURL, cfg.LocalUpstreamURL != ""
+		return targets.Active(), hostOf(cfg.UpstreamURL), hostOf(cfg.LocalUpstreamURL), cfg.LocalUpstreamURL != ""
 	},
 	Set: targets.Set,
 })
 ```
-(resolve `cloud_url_host`/`local_url_host` to bare hosts via `url.Parse(...).Host` rather than passing the raw config strings — the pseudocode above elides that step; do it in `serve.go`, which already imports `net/url` indirectly through `config`/`proxy`, or add the import directly.)
+`cloud_url_host`/`local_url_host` are bare hosts (`url.Parse(...).Host`), never the raw config strings. Add the `net/url` import to `serve.go` if it is not already there. If `cfg` is reloadable (`liveFields`), read the current value inside the closure rather than capturing a stale copy.
 
 ### Dashboard UI — `internal/web/index.html` and `internal/web/app.js`
 
 - **Header toggle.** A segmented control `cloud | local` beside `#proxy-mode` (`index.html:25`) — e.g. `<div class="provider-toggle" id="provider-toggle"><button data-provider="cloud">cloud</button><button data-provider="local">local</button></div>`. A muted/disabled state on the `local` button when `local_configured` is `false` (CSS class toggle, `internal/web/style.css`). Vanilla JS, no build step (ADR 006) — follow the existing `loadProxyMode`/`$('proxy-mode')` pattern (`app.js:1134-1156`) exactly: a `loadProvider()` function that `GET /api/provider`s and renders the active state into `#provider-toggle` (e.g. an `active` class on the matching button), and a click handler on each button that `POST /api/provider`s `{"active": "cloud"|"local"}` via the existing `api()` helper (`app.js:53-69`, the same one `src-collect`'s click handler at `app.js:1103-1117` uses), then re-runs `loadProvider()` (and `loadTotals()`, since the active provider can change which rows future calls contribute to). A `403` from a non-loopback dashboard session (the listener can bind `0.0.0.0`, R1) should render as a status-line error via the existing `setStatus(err.message, true)` pattern (`app.js:1112`), not a silent no-op.
 - **Billing filter.** `#f-billing` (`index.html:57-61`) gains a third `<option value="local">local</option>` beside the existing `api`/`subscription` options — no JS change needed beyond this, since the filter already round-trips its raw value into `EventFilter.BillingMode` (`internal/store/types.go:186`), which already accepts any string including `"local"` with no code change required there.
-- **Local cost display.** One `fmtCost(e)` helper (new, consolidating what today are per-site inline `fmtUSD` calls) used at the three **row-level** sites `app.js:429,570,966` and all nine **summary** sites `app.js:552,581,652,659,663,956,1128` (plus the header total at `app.js:1127-1128`, which gains a third tile): render `local (proj) $x` when `e.BillingMode == "local"` (row-level) or when a summary object carries a non-null/non-zero `TotalLocalProjectedCostUSD` (summary-level), beside the existing `api`/`sub` figures — never replacing them, since a non-local row still has real `api`/`sub` figures to show. The summary sites all read `TotalApiEquivalentCostUSD` today (per plan §3.4's citation of each) and gain a parallel `TotalLocalProjectedCostUSD` read once `internal/store`'s `StatsSummary` carries that field (added in br-GI-25-04 §5) — `index.html:17-18`'s header totals span gains a third `<span>local <strong id="total-cost-local">$0.00</strong></span>`, populated in `loadTotals()` (`app.js:1121-1132`) from `s.TotalLocalProjectedCostUSD` the same way the existing two spans are populated.
+- **Local cost display.** One `fmtCost(e)` helper (new, consolidating what today are per-site inline `fmtUSD` calls) used at the **row-level** sites `app.js:429,570,966` and the **summary** sites `app.js:552,581,652,659,663,956,1128` (plus the header total at `app.js:1127-1128`, which gains a third tile). Line numbers are from before this ticket; re-find them with `grep -n 'fmtUSD' internal/web/app.js` and convert every hit, so none is missed: render `local (proj) $x` when `e.BillingMode == "local"` (row-level) or when a summary object carries a non-null/non-zero `TotalLocalProjectedCostUSD` (summary-level), beside the existing `api`/`sub` figures — never replacing them, since a non-local row still has real `api`/`sub` figures to show. The summary sites all read `TotalApiEquivalentCostUSD` today (per plan §3.4's citation of each) and gain a parallel `TotalLocalProjectedCostUSD` read once `internal/store`'s `StatsSummary` carries that field (added in br-GI-25-04 §5) — `index.html:17-18`'s header totals span gains a third `<span>local <strong id="total-cost-local">$0.00</strong></span>`, populated in `loadTotals()` (`app.js:1121-1132`) from `s.TotalLocalProjectedCostUSD` the same way the existing two spans are populated.
 
 ### By-hand verification against the real LM Studio server
 

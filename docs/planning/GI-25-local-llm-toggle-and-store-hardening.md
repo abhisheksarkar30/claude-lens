@@ -81,9 +81,10 @@ side effect. Hot-path rule: no parsing, no blocking, no new import (proxy still 
 New `internal/store/retry.go`: `IsTransient(err) bool` matches SQLite primary codes IOERR (10) and
 NOMEM (7) using `*sqlite.Error` from `modernc.org/sqlite`. BUSY (5) is **not** retried: `store.go:75`
 already sets `busy_timeout(5000)` which blocks up to 5 s inside each attempt; adding explicit BUSY
-retries would multiply the maximum block time by the attempt count. Note: SQLite's NOMEM surfaces as
-`out of memory` (not `cannot allocate N bytes`); bead 03's first step confirms the exact error string
-and `*sqlite.Error` accessor before writing the matcher. `internal/store` is the only package that
+retries would multiply the maximum block time by the attempt count. Note: the driver surfaces the
+two memory errors differently. `out of memory (7)` is a `*sqlite.Error` (`Code()`), but `cannot allocate
+N bytes of memory` is a plain `fmt.Errorf` from `conn.malloc` (`modernc.org/sqlite` v1.46.1,
+`conn.go:615`) with no code, so `IsTransient` also matches that message text. `internal/store` is the only package that
 imports the driver (`store.go:26`), so `IsTransient` lives there — not in `consumer`, which avoids a
 new direct driver dependency in consumer.
 
@@ -263,7 +264,7 @@ New: `internal/consumer/retry.go`, `internal/store/retry.go`, `internal/proxy/ta
   `costCell(nil, nil, &x)` renders `local (proj) $x`; `rowCosts(ev)` with a non-local row returns
   `sub != nil`, `local == nil`. Tests the actual `costCell(api, sub, local *float64)` signature.
 - `TestModelsCoverageShowsLocalPriced` — `coverage` with a `ModelStats` whose `PriceModel == config.LocalPriceModel` and an unknown real model name returns `pricingPriced` (substitutes `PriceModel`), not `pricingUnpriced`.
-- `TestIsTransient` — table test for `store.IsTransient`: IOERR (code 10), NOMEM (code 7) → true; BUSY (code 5), constraint violation, `nil` → false. Pins the primary-code extraction so a `*sqlite.Error` wrapping a constraint error is not misclassified as transient.
+- `TestIsTransient` — table test for `store.IsTransient`: IOERR (code 10, and extended 266), NOMEM (code 7) and the plain `cannot allocate N bytes of memory` error → true; BUSY (code 5), constraint violation, `nil` → false. Pins the primary-code extraction so a `*sqlite.Error` wrapping a constraint error is not misclassified as transient.
 - `TestHealthExposesStoreRetryCounters` — after a simulated transient retry, `GET /api/health` returns JSON with `store_transient_retries > 0` and `store_transient_gave_up == 0`; after a give-up, `store_transient_gave_up > 0`.
 - `TestValidateLocalUpstreamLoopback` — `Config.Validate` rejects a non-loopback `LocalUpstreamURL` when `AllowRemote` is false; accepts it when `AllowRemote` is true; accepts a loopback URL in both cases.
 - `TestTailerLocalPrefixClassification` — a model matching only `LocalModelPrefixes` is classified `local`; a model matching only `ApiModelPrefixes` is classified `api`; a model matching both lists is classified `api` (precedence rule, §2 R1c).

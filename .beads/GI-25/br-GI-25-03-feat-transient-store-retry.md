@@ -13,7 +13,9 @@
 ## Description
 
 **First step, before writing the matcher:** confirm two things empirically against the real driver (`modernc.org/sqlite`, imported at `internal/store/store.go:26`), because the plan's R3 (§2) states them as unverified:
-1. The exact error string and accessor SQLite's NOMEM surfaces as. SQLite's `SQLITE_NOMEM` (primary code 7) is documented as `"out of memory"`, not `"cannot allocate N bytes"` (that phrase is a Go-runtime OOM panic message, a different failure entirely) — confirm this against `*sqlite.Error`'s `Code()` method (or equivalent field; check the `modernc.org/sqlite` package's exported error type) before writing `IsTransient`.
+1. The two shapes the logged errors take. Already verified against `modernc.org/sqlite` v1.46.1; re-confirm quickly in the module cache before writing `IsTransient`:
+   - `*sqlite.Error` has `Code() int`; the `disk I/O error (266)` line is `SQLITE_IOERR_READ`, an extended code whose primary code is `Code() & 0xff == 10`, and `out of memory (7)` is primary 7.
+   - The `cannot allocate N bytes of memory` line is **not** a `*sqlite.Error` and not a Go panic. It is a plain `fmt.Errorf("sqlite: cannot allocate %d bytes of memory", n)` returned from `conn.malloc` (`conn.go:615`), so `errors.As` to `*sqlite.Error` misses it.
 2. That `insertOrMerge`'s merge path (`internal/store/merge.go:115-134`: `INSERT` first via `insertEventTx`, then on a unique-constraint error a load via `getEventByRequestIDTx` and `applyMergeTx`, all on the one `*sql.Tx` passed in) is a single atomic transaction, so a caller retrying the whole `InsertEvent` call after a transient failure cannot double-apply a partial write — the failed attempt's transaction rolled back wholesale.
 
 **New `internal/store/retry.go`:**
@@ -22,7 +24,9 @@
 func IsTransient(err error) bool
 ```
 
-Matches SQLite primary result codes IOERR (10) and NOMEM (7) via `*sqlite.Error` from `modernc.org/sqlite` (`errors.As(err, &sqliteErr)`, then check `sqliteErr.Code() & 0xff` or whatever primary-code extraction the driver's error type actually exposes — confirm the exact accessor in step 1 above). **BUSY (5) is explicitly excluded**: `store.go:75` (`Open`'s DSN) already sets `_pragma=busy_timeout(5000)`, which blocks up to 5 s *inside* a single attempt; adding an explicit BUSY retry on top would multiply the maximum per-call block time by the retry attempt count, which is the wrong trade for a lock-contention case `busy_timeout` already handles. `IsTransient` must not misclassify a wrapped constraint-violation error (e.g. the unique-constraint error `isUniqueConstraintError` at `merge.go:98-100` checks) as transient — a constraint violation is permanent and retrying it is pointless work on the hot write path.
+Transient means either of:
+- a `*sqlite.Error` (`errors.As(err, &sqliteErr)`) whose `Code() & 0xff` is IOERR (10) or NOMEM (7); or
+- an error whose message contains `sqlite: cannot allocate ` and ` bytes of memory` (the `conn.malloc` error above, which carries no code). This is a string match on one stable driver message; leave a comment naming `conn.go:615` so a driver upgrade that changes it is findable. **BUSY (5) is explicitly excluded**: `store.go:75` (`Open`'s DSN) already sets `_pragma=busy_timeout(5000)`, which blocks up to 5 s *inside* a single attempt; adding an explicit BUSY retry on top would multiply the maximum per-call block time by the retry attempt count, which is the wrong trade for a lock-contention case `busy_timeout` already handles. `IsTransient` must not misclassify a wrapped constraint-violation error (e.g. the unique-constraint error `isUniqueConstraintError` at `merge.go:98-100` checks) as transient — a constraint violation is permanent and retrying it is pointless work on the hot write path.
 
 `internal/store` is the only package that imports the driver (`store.go:26`); `IsTransient` lives there, not in `consumer`, specifically so `internal/consumer` does not gain a new direct dependency on `modernc.org/sqlite`.
 
@@ -34,7 +38,7 @@ func withRetry(ctx context.Context, fn func() error) error
 
 Up to 4 attempts total (1 initial + 3 retries) with backoff 250ms / 1s / 4s between attempts, calling `store.IsTransient(err)` after each failed attempt to decide whether to retry. Abandons immediately (returns the last error) if `ctx` is cancelled during a backoff sleep — use a `time.Timer` selected against `ctx.Done()`, not a bare `time.Sleep`. A persistent (always-transient) error gives up after the 4th attempt, having consumed at most 250ms+1s+4s ≈ 5.25s.
 
-**Call sites — wrap exactly these four, each individually:**
+**Call sites — wrap exactly these five, each individually** (re-grep the line numbers; br-GI-25-04 also edits `consumer.go`, so they may have shifted if it landed first — the two beads touch different regions and may land in either order):
 - `c.st.InsertEvent(ctx, pe.ev)` in `flush` (`internal/consumer/consumer.go:233`)
 - `c.st.UpsertWarnings(ctx, id, pe.warnings)` in `flush` (`consumer.go:242`)
 - `c.st.SessionEventsForRules(ctx, sessionID)` in `runSessionRule` (`consumer.go:287`)
@@ -62,14 +66,14 @@ No SQLite pragma change (`cache_size`, `temp_store`, `synchronous`) — rejected
 
 ## Outcome Definition
 
-`go test ./internal/store/ -count=1 -run TestIsTransient` passes: IOERR (10) and NOMEM (7) → `true`; BUSY (5), a wrapped unique-constraint error, and `nil` → `false`.
+`go test ./internal/store/ -count=1 -run TestIsTransient` passes: IOERR (10), extended IOERR_READ (266), NOMEM (7) and the plain `sqlite: cannot allocate N bytes of memory` error → `true`; BUSY (5), a wrapped unique-constraint error, and `nil` → `false`.
 `go test ./internal/consumer/ -count=1 -run 'TestWithRetryRetriesTransientOnly|TestWithRetryStopsOnCancel|TestWithRetryGivesUpOncePerFlush'` passes.
 `go test ./internal/api/ -count=1 -run TestHealthExposesStoreRetryCounters` passes: after a simulated transient retry, `GET /api/health` reports `store_transient_retries > 0` and `store_transient_gave_up == 0`; after a simulated give-up, `store_transient_gave_up > 0`.
 `go build ./... && go vet ./... && go test ./... -count=1` all pass, including the unchanged TTFB gate (`go test ./internal/proxy/`).
 
 ## Test Specifications
 
-- `internal/store/retry_test.go`: `TestIsTransient` — table test: a `*sqlite.Error`-wrapping error with primary code 10 (IOERR) → `true`; primary code 7 (NOMEM) → `true`; primary code 5 (BUSY) → `false`; a real unique-constraint violation (produced the same way `merge_test.go` or `store_test.go` already produces one, or `isUniqueConstraintError`'s own fixture) → `false`; `nil` → `false`.
+- `internal/store/retry_test.go`: `TestIsTransient` — table test: a `*sqlite.Error`-wrapping error with primary code 10 (IOERR) → `true`; the extended code 266 (IOERR_READ, the logged one) → `true`; primary code 7 (NOMEM) → `true`; `fmt.Errorf("sqlite: cannot allocate %d bytes of memory", 4096)` (wrapped once with `%w`) → `true`; primary code 5 (BUSY) → `false`; a real unique-constraint violation (produced the same way `merge_test.go` or `store_test.go` already produces one, or `isUniqueConstraintError`'s own fixture) → `false`; `nil` → `false`.
 - `internal/consumer/retry_test.go`: `TestWithRetryRetriesTransientOnly` — a `fn` that returns a transient-classified error twice then succeeds is retried and ultimately returns `nil`; a `fn` that returns a non-transient error is not retried (called exactly once).
 - `internal/consumer/retry_test.go`: `TestWithRetryStopsOnCancel` — cancel `ctx` during the first backoff sleep; `withRetry` returns promptly (bounded, not waiting out the full backoff schedule) with the underlying error, not a different cancellation error that would mask the original failure.
 - `internal/consumer/consumer_test.go` (or `retry_test.go`): `TestWithRetryGivesUpOncePerFlush` — a batch of several events where the injected `Store.InsertEvent` always returns a transient error on the first event; asserts: (a) that first `InsertEvent` is attempted exactly 4 times, (b) every remaining event in the batch is counted into `Stats().Failed` without `InsertEvent` being called again for them, (c) `runSessionRule` (phase 2) is not invoked for this flush, (d) `RecordCall` (phase 3) is not invoked for this flush, (e) `Stats().TransientGaveUp == 1`.
@@ -82,7 +86,7 @@ No SQLite pragma change (`cache_size`, `temp_store`, `synchronous`) — rejected
 - `internal/store/retry_test.go` (create — `TestIsTransient`)
 - `internal/consumer/retry.go` (create — `withRetry`)
 - `internal/consumer/retry_test.go` (create — `TestWithRetryRetriesTransientOnly`, `TestWithRetryStopsOnCancel`)
-- `internal/consumer/consumer.go` (modify — wrap the four call sites in `flush`/`runSessionRule`, flush-wide `gaveUp` flag, two new atomic counters on `Consumer` and `Stats`)
+- `internal/consumer/consumer.go` (modify — wrap the five call sites in `flush`/`runSessionRule`, flush-wide `gaveUp` flag, two new atomic counters on `Consumer` and `Stats`)
 - `internal/consumer/consumer_test.go` (modify — add `TestWithRetryGivesUpOncePerFlush`, or add it to `retry_test.go`)
 - `internal/api/api.go` (modify — two new `healthResponse` fields, populated in `health`)
 - `internal/api/api_test.go` (modify — add `TestHealthExposesStoreRetryCounters`)
