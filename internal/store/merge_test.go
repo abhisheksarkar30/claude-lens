@@ -1616,6 +1616,18 @@ func TestMergeLocalModeMismatch(t *testing.T) {
 		wantAPI(t, got)
 		wantRealCost(t, got)
 	})
+	t.Run("proxy first, complete transcript wins the pick", func(t *testing.T) {
+		// Both sides complete: the incoming row wins the token pick, so the
+		// proxy's real figure cannot ride along. Identity and tokens stay
+		// right and the cost goes to the unpriced convention for reprice to
+		// refill (plan v9).
+		got := mergeGet(t, newTestStore(t), proxyAPI(), jsonlLocal())
+		wantAPI(t, got)
+		wantUnpricedCost(t, "both complete", got)
+		if got.InputTokens != 100 {
+			t.Errorf("InputTokens = %d, want the transcript 100", got.InputTokens)
+		}
+	})
 	t.Run("incomplete proxy row, complete local transcript", func(t *testing.T) {
 		p := proxyAPI()
 		p.CaptureComplete = false
