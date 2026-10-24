@@ -140,6 +140,9 @@ type api struct {
 
 	// reloadFunc backs POST /api/reload (br-GI-16-04), wired by SetReload.
 	reloadFunc func(context.Context) (ReloadReport, error)
+
+	// provider backs /api/provider (br-GI-25-06), wired by SetProvider.
+	provider ProviderSeam
 }
 
 // SetPricing wires GET/POST /api/prices to loader's table and override file.
@@ -219,6 +222,8 @@ func New(st Store, sk *sink.Sink, cons *consumer.Consumer, broker *Broker, asset
 	mux.HandleFunc("POST /api/ingest", a.triggerIngest)
 	mux.HandleFunc("POST /api/shutdown", a.shutdown)
 	mux.HandleFunc("POST /api/reload", a.reload)
+	mux.HandleFunc("/api/provider", methodGet(a.getProvider))
+	mux.HandleFunc("POST /api/provider", a.setProvider)
 
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 	a.mux = mux

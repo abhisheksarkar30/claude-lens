@@ -234,6 +234,24 @@ svg.chart .chart-label { fill: var(--muted); font-size: 10px; text-anchor: middl
   font-size: 12px;
   white-space: nowrap;
 }
+/* The cloud | local toggle beside the badge. The active side is filled; the
+   local side is muted when no local upstream is configured, but stays
+   clickable so the refusal reaches the status line with its reason. */
+.provider-toggle { display: inline-flex; margin-left: 8px; }
+.provider-toggle[hidden] { display: none; }
+.provider-toggle button {
+  padding: 2px 10px;
+  border: 1px solid var(--border, #444);
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.provider-toggle button:first-child { border-radius: 999px 0 0 999px; }
+.provider-toggle button:last-child { border-radius: 0 999px 999px 0; border-left: 0; }
+.provider-toggle button.active { background: var(--border, #444); font-weight: 600; }
+.provider-toggle button.muted { opacity: 0.5; }
+
 /* Keyed on data-state ("<configured>/<on|off>"), written by loadProxyMode from
    the server's own two facts rather than parsed back out of the label text. */
 .proxy-badge[data-state$="/on"] { border-color: var(--ok, #2e7d32); }

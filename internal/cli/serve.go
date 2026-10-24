@@ -10,6 +10,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"time"
@@ -149,6 +150,16 @@ func Serve(args []string) error {
 	// cancel func os.Interrupt drives, so `clens shutdown` triggers the one
 	// shutdown path this function already has rather than a second one.
 	dashAPI.SetShutdown(stop)
+	// Fixed at boot, like the Targets they describe: LocalUpstreamURL is not a
+	// live field, so a reload must not make the toggle show a host the proxy is
+	// not routing to.
+	cloudHost, localHost := hostOf(cfg.UpstreamURL), hostOf(cfg.LocalUpstreamURL)
+	dashAPI.SetProvider(api.ProviderSeam{
+		Get: func() (string, string, string, bool) {
+			return targets.Active(), cloudHost, localHost, localHost != ""
+		},
+		Set: targets.Set,
+	})
 
 	// One Runner, shared by the scheduler below and the dashboard's on-demand
 	// trigger -- the same addCollectors source set `clens refresh` runs, so a
@@ -509,4 +520,13 @@ func printBanner(w io.Writer, cfg *config.Config) {
 	if cfg.BodyPolicy == "off" {
 		fmt.Fprintln(w, "  WARNING: body capture is off — calls are recorded without their bodies.")
 	}
+}
+
+// hostOf is the host[:port] of a URL, or "" for an empty or unparseable one.
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }

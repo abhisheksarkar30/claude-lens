@@ -16,6 +16,9 @@
          figure are different billing models (invariant 5). -->
     <span>api <strong id="total-cost-api">$0.00</strong></span>
     <span>sub <strong id="total-cost-sub">$0.00</strong></span>
+    <!-- A projection at the deepseek-flash rate for local-model calls, not a
+         bill, so it gets its own label and is never added to the other two. -->
+    <span>local (proj) <strong id="total-cost-local">$0.00</strong></span>
   </div>
   <!-- In the header, on every tab -- deliberately not on the Sources tab. The
        incident this exists for was a dashboard that looked fine while Claude
@@ -23,6 +26,11 @@
        were the only thing arriving. A user had to run `clens doctor` and read
        a PASS line to find out. -->
   <span class="proxy-badge" id="proxy-mode" aria-live="polite"></span>
+  <!-- Which upstream new requests go to. Hidden until /api/provider answers. -->
+  <div class="provider-toggle" id="provider-toggle" role="group" aria-label="LLM provider" hidden>
+    <button type="button" data-provider="cloud">cloud</button>
+    <button type="button" data-provider="local">local</button>
+  </div>
   <nav class="tabs" id="tabs">
     <button class="tab active" data-view="overview" type="button">Overview</button>
     <button class="tab" data-view="calls" type="button">Calls</button>
@@ -58,6 +66,7 @@
           <option value="">any</option>
           <option value="api">api</option>
           <option value="subscription">subscription</option>
+          <option value="local">local</option>
         </select></label>
         <!-- The window picker reveals a native input whose type follows the
              granularity (see mountWindowPicker). "any time" is the default and
