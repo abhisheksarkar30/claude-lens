@@ -4,7 +4,7 @@
 
 One entry point: [cmd/clens/main.go](../../cmd/clens/main.go), a `map[string]func([]string) error`
 of 26 subcommands dispatching into [internal/cli](../../internal/cli/). Every subcommand accepts
-the same config flag set (`--proxy-addr`, `--dashboard-addr`, `--upstream-url`, `--db-path`,
+the same config flag set (`--proxy-addr`, `--dashboard-addr`, `--upstream-url`, `--local-upstream-url`, `--db-path`,
 `--body-policy`, `--body-cap-bytes`, `--allow-remote`, `--session-gap-minutes`, `--retention-days`,
 `--hot-days`, `--replay`, `--accounts-path`, `--pprof-addr`) — see [build-and-run.md](build-and-run.md).
 

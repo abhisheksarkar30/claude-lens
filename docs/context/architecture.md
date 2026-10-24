@@ -40,7 +40,7 @@ starts a process rather than doing a job and exiting, and it owns every long-liv
 
 | Listener | Default | Serves |
 |---|---|---|
-| proxy | `127.0.0.1:8797` | [internal/proxy](../../internal/proxy/) — a transparent `/v1/messages` pass-through |
+| proxy | `127.0.0.1:8797` | [internal/proxy](../../internal/proxy/) — a transparent `/v1/messages` pass-through to the active upstream — the cloud API, or a local server once the provider is switched (GI#25) |
 | dashboard | `127.0.0.1:8798` | [internal/api](../../internal/api/) — the JSON routes, the SSE stream, and the embedded [internal/web](../../internal/web/) assets |
 
 Both are loopback-only unless `allow_remote` is set ([internal/config/config.go](../../internal/config/config.go)
@@ -68,6 +68,24 @@ redacted. Pinned by the `TestPassThrough*` cases in [internal/proxy/proxy_test.g
 `internal/config`. Asserted by [internal/proxy/importguard_test.go](../../internal/proxy/importguard_test.go).
 If it ever imports `analyze`, `store`, or `pricing`, the hot path has grown a dependency on the
 cold one.
+
+### Two upstreams, one switch (GI#25)
+
+The proxy forwards to one of two targets held by [`proxy.Targets`](../../internal/proxy/targets.go):
+the cloud API (`UpstreamURL`, always present) and an optional local server (`LocalUpstreamURL`, e.g.
+LM Studio). `Targets.Active()` is a single atomic load with no lock, so it costs the hot path nothing.
+The handler reads it **once per request**, stores it on the request's `captureState`, and `Rewrite`
+resolves the upstream URL from that stamp, so the upstream that answers and the `Provider` written on
+the row cannot disagree when a switch races a request. `Targets.Set` validates the name, refuses
+`local` when no local URL is configured, writes the one-word state file (`<dir of DBPath>/provider`,
+temp file then rename) and only then moves the pointer, all under a mutex. Boot reads the file and
+falls back to `cloud` when it is absent, unrecognised, or says `local` with no local URL; `NewTargets`
+writes nothing, and an empty state directory means no file I/O at all.
+
+`internal/proxy` still imports only `sink` and `config`. The dashboard reaches `Targets` through a
+function-value seam (`api.ProviderSeam`, bound in `serve.go`), the same way it reaches reload and
+shutdown, so `internal/api` imports neither. `proxy.New(cfg, sk)` keeps its signature and builds a
+cloud-only `Targets`; `NewServer` takes the `*Targets` as a third argument.
 
 ### The four sources and their writers
 

@@ -98,7 +98,7 @@ func printNew(w io.Writer, events []*store.EventSummary, since int64) int64 {
 			displayModel(ev),
 			humanTokens(ev.InputTokens),
 			humanTokens(ev.OutputTokens),
-			costCell(ev.CostUSD, ev.ApiEquivalentCostUSD),
+			costCell(rowCosts(ev)),
 		)
 	}
 	return highest

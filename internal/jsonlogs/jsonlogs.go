@@ -11,6 +11,7 @@ package jsonlogs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/parse"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
@@ -73,7 +75,7 @@ type peakComputer interface {
 // claiming it was billed at peak would be a lie (invariant 5).
 func peakWarning(pricer PriceComputer, ev *store.Event) (store.Warning, bool) {
 	pc, ok := pricer.(peakComputer)
-	if !ok || ev.CostSource == "unpriced" || !pc.PeakAt(ev.ModelResolved, ev.StartedAt) {
+	if !ok || ev.BillingMode == config.BillingLocal || ev.CostSource == "unpriced" || !pc.PeakAt(ev.ModelResolved, ev.StartedAt) {
 		return store.Warning{}, false
 	}
 	return store.Warning{
@@ -112,6 +114,7 @@ type Tailer struct {
 	billingMode string
 
 	apiPrefixes    []string
+	localPrefixes  []string
 	apiAccount     string
 	apiBillingMode string
 
@@ -185,6 +188,13 @@ func (t *Tailer) SetModelBilling(prefixes []string, apiAccount, apiBillingMode s
 	t.apiAccount = apiAccount
 	t.apiBillingMode = apiBillingMode
 }
+
+// SetLocalPrefixes lists the model prefixes served by the local provider. A
+// transcript row has no proxy to say which upstream answered it, so the model
+// name is the only signal. The api prefixes are checked first: a model both
+// lists claim stays "api", which keeps real spend visible when the cloud and
+// the local server both serve the same model family.
+func (t *Tailer) SetLocalPrefixes(prefixes []string) { t.localPrefixes = prefixes }
 
 // ModelBilling reports the prefixes that route a row to the api account, and
 // the account/billing mode such a row gets. prefixes is a copy, so a caller
@@ -287,6 +297,12 @@ func (t *Tailer) tailFile(ctx context.Context, f walkedFile) Stats {
 
 	fh, err := os.Open(f.Path)
 	if err != nil {
+		// Claude Code removes transcripts on its own schedule, so a file the
+		// walk listed can be gone by now. That is expected, not an I/O fault,
+		// and logging it like one buries the real open errors.
+		if errors.Is(err, fs.ErrNotExist) {
+			return stats
+		}
 		log.Printf("jsonlogs: open %s: %v", f.Path, err)
 		return stats
 	}
@@ -429,10 +445,20 @@ func (t *Tailer) buildEvent(l *line, f walkedFile) (*store.Event, parse.Meta, pa
 	// prefix is configured pay-as-you-go must land in the api account with a
 	// real cost rather than the hypothetical column.
 	account, billingMode := t.account, t.billingMode
+	matchedAPI := false
 	for _, p := range t.apiPrefixes {
 		if strings.HasPrefix(usage.Model, p) {
 			account, billingMode = t.apiAccount, t.apiBillingMode
+			matchedAPI = true
 			break
+		}
+	}
+	if !matchedAPI {
+		for _, p := range t.localPrefixes {
+			if p != "" && strings.HasPrefix(usage.Model, p) {
+				account, billingMode = config.LocalAccount, config.BillingLocal
+				break
+			}
 		}
 	}
 
@@ -482,10 +508,16 @@ func (t *Tailer) buildEvent(l *line, f walkedFile) (*store.Event, parse.Meta, pa
 	}
 
 	if t.pricer != nil {
-		usd, costSource := t.pricer.Compute(ev.ModelResolved, usage, "", "", ev.StartedAt)
+		// A local row is priced as the cheapest DeepSeek model at an off-peak
+		// instant; ev.ModelResolved keeps the real local model name.
+		priceModel, priceAt := ev.ModelResolved, ev.StartedAt
+		if ev.BillingMode == config.BillingLocal {
+			priceModel, priceAt = config.LocalPriceModel, config.LocalPriceAt
+		}
+		usd, costSource := t.pricer.Compute(priceModel, usage, "", "", priceAt)
 		ev.CostSource = costSource
 		switch ev.BillingMode {
-		case "subscription":
+		case "subscription", config.BillingLocal:
 			ev.ApiEquivalentCostUSD = usd
 		default:
 			ev.CostUSD = usd

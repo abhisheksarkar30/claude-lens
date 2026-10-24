@@ -28,6 +28,14 @@ function fmtUSD(v) {
   return n < 0.01 ? '$' + n.toFixed(6) : '$' + n.toFixed(2);
 }
 
+// A local row's projection is stored in the api-equivalent column, the same
+// one a subscription row's figure lives in, and billing_mode says which it is.
+// Row-level cost cells go through these two so a projection is never shown as
+// a subscription cost. Summary objects need neither: the server already keeps
+// the three sums apart (TotalLocalProjectedCostUSD).
+const subCost = (e) => (e.BillingMode === 'local' ? null : e.ApiEquivalentCostUSD);
+const localCost = (e) => (e.BillingMode === 'local' ? e.ApiEquivalentCostUSD : null);
+
 function fmtTime(iso) {
   if (!iso) return '--';
   const d = new Date(iso);
@@ -203,9 +211,9 @@ function archiveNote(e) {
 }
 
 // captureMarker reports a capture the proxy could not finish, in the CLI's own
-// wording. CaptureComplete is false exactly when a body was cut at the cap,
-// so the line names the cap only in the one case where it is knowably the
-// cause, and says so plainly when the
+// wording. CaptureComplete is defined on sink.CapturedCall (a body cut at the
+// cap, or an upstream abort), so the line names the cap only in the one case
+// where it is knowably the cause, and says so plainly when the
 // row does not record which of the two it was. Claiming the cap unconditionally
 // would be a second, quieter defect in the thing that exists to report the
 // first.
@@ -426,7 +434,8 @@ async function loadCalls() {
     { head: 'prompt', cell: (e) => fmtInt(e.TotalPromptTokens) },
     { head: 'output', cell: (e) => fmtInt(e.OutputTokens) },
     { head: 'api $', cell: (e) => fmtUSD(e.CostUSD) },
-    { head: 'sub $', cell: (e) => fmtUSD(e.ApiEquivalentCostUSD) },
+    { head: 'sub $', cell: (e) => fmtUSD(subCost(e)) },
+    { head: 'local $ (proj)', cell: (e) => fmtUSD(localCost(e)) },
     { head: 'status', cell: (e) => (e.Status ? e.Status : '--') },
   ], rows, 'no calls captured yet');
 
@@ -567,8 +576,8 @@ async function showSession(id, seq) {
     '<tr><td><a href="#" data-call="' + e.ID + '">' + e.ID + '</a></td><td>' +
     esc(fmtTime(e.StartedAt)) + '</td><td>' + esc(e.ModelResolved || e.ModelRequested) +
     '</td><td>' + fmtInt(e.TotalPromptTokens) + '</td><td>' + fmtInt(e.OutputTokens) +
-    '</td><td>' + fmtUSD(e.CostUSD) + '</td><td>' + fmtUSD(e.ApiEquivalentCostUSD) +
-    '</td></tr>').join('');
+    '</td><td>' + fmtUSD(e.CostUSD) + '</td><td>' + fmtUSD(subCost(e)) +
+    '</td><td>' + fmtUSD(localCost(e)) + '</td></tr>').join('');
 
   setSessionDetail(true);
   $('session-detail').innerHTML =
@@ -580,7 +589,7 @@ async function showSession(id, seq) {
     '<tr><th>api $</th><td>' + fmtUSD(body.TotalCostUSD) + '</td></tr>' +
     '<tr><th>sub $</th><td>' + fmtUSD(body.TotalApiEquivalentCostUSD) + '</td></tr></table>' +
     (calls ? '<h3>Calls</h3><table><thead><tr><th>id</th><th>time</th><th>model</th>' +
-      '<th>prompt</th><th>output</th><th>api $</th><th>sub $</th></tr></thead><tbody>' +
+      '<th>prompt</th><th>output</th><th>api $</th><th>sub $</th><th>local $ (proj)</th></tr></thead><tbody>' +
       calls + '</tbody></table>' : '');
 
   $('session-back').addEventListener('click', () => {
@@ -650,17 +659,22 @@ async function loadStats() {
     { label: 'output tokens', value: fmtInt(s.OutputTokens) },
     { label: 'api $', value: fmtUSD(s.TotalCostUSD) },
     { label: 'sub $', value: fmtUSD(s.TotalApiEquivalentCostUSD) },
+    { label: 'local $ (proj)', value: fmtUSD(s.TotalLocalProjectedCostUSD) },
     { label: 'priced', value: fmtInt(s.PricedCount) + '/' + fmtInt(s.PricedCount + s.UnpricedCount) },
   ]);
 
   const byModel = (body.by_model || []).map((m) =>
-    '<tr><td>' + esc(m.Model) + '</td><td>' + fmtInt(m.RequestCount) + '</td><td>' +
+    '<tr><td>' + esc(m.Model) +
+    (m.PriceModel && m.PriceModel !== m.Model ? ' <span class="muted">priced as ' + esc(m.PriceModel) + '</span>' : '') +
+    '</td><td>' + fmtInt(m.RequestCount) + '</td><td>' +
     fmtInt(m.TotalPromptTokens) + '</td><td>' + fmtInt(m.OutputTokens) + '</td><td>' +
-    fmtUSD(m.TotalCostUSD) + '</td><td>' + fmtUSD(m.TotalApiEquivalentCostUSD) + '</td></tr>').join('');
+    fmtUSD(m.TotalCostUSD) + '</td><td>' + fmtUSD(m.TotalApiEquivalentCostUSD) + '</td><td>' +
+    fmtUSD(m.TotalLocalProjectedCostUSD) + '</td></tr>').join('');
   const byPeriod = (body.by_period || []).map((p) =>
     '<tr><td>' + esc(fmtTime(p.PeriodStart)) + '</td><td>' + fmtInt(p.RequestCount) + '</td><td>' +
     fmtInt(p.TotalPromptTokens) + '</td><td>' + fmtInt(p.OutputTokens) + '</td><td>' +
-    fmtUSD(p.TotalCostUSD) + '</td><td>' + fmtUSD(p.TotalApiEquivalentCostUSD) + '</td></tr>').join('');
+    fmtUSD(p.TotalCostUSD) + '</td><td>' + fmtUSD(p.TotalApiEquivalentCostUSD) + '</td><td>' +
+    fmtUSD(p.TotalLocalProjectedCostUSD) + '</td></tr>').join('');
   const bySource = (body.cost_sources || []).map((c) =>
     '<tr><td>' + esc(c.CostSource || 'unpriced') + '</td><td>' + fmtInt(c.RequestCount) +
     '</td><td>' + fmtUSD(c.TotalCostUSD) + '</td></tr>').join('');
@@ -675,7 +689,7 @@ async function loadStats() {
 function wrap(rows, what, empty) {
   if (!rows) return '<p class="muted">' + esc(empty) + '</p>';
   return '<table><thead><tr><th>' + esc(what) + '</th><th>calls</th><th>prompt</th>' +
-    '<th>output</th><th>api $</th><th>sub $</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    '<th>output</th><th>api $</th><th>sub $</th><th>local $ (proj)</th></tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
 // chartByPeriod is a hand-rolled inline SVG bar chart of requests per period.
@@ -954,6 +968,7 @@ async function loadOverview() {
     { label: 'output tokens', value: fmtInt(s.OutputTokens) },
     { label: 'api $ (24h)', value: fmtUSD(s.TotalCostUSD) },
     { label: 'sub $ (24h)', value: fmtUSD(s.TotalApiEquivalentCostUSD) },
+    { label: 'local $ (24h, proj)', value: fmtUSD(s.TotalLocalProjectedCostUSD) },
   ]);
 
   const { body: recent } = await api('/api/requests?limit=25');
@@ -963,7 +978,8 @@ async function loadOverview() {
     { head: 'model', cell: (e) => esc(e.ModelResolved || e.ModelRequested) },
     { head: 'prompt', cell: (e) => fmtInt(e.TotalPromptTokens) },
     { head: 'api $', cell: (e) => fmtUSD(e.CostUSD) },
-    { head: 'sub $', cell: (e) => fmtUSD(e.ApiEquivalentCostUSD) },
+    { head: 'sub $', cell: (e) => fmtUSD(subCost(e)) },
+    { head: 'local $ (proj)', cell: (e) => fmtUSD(localCost(e)) },
   ], recent, 'no calls captured yet');
 }
 
@@ -1126,6 +1142,7 @@ async function loadTotals() {
     $('total-tokens').textContent = fmtInt(s.TotalPromptTokens + s.OutputTokens);
     $('total-cost-api').textContent = fmtUSD(s.TotalCostUSD);
     $('total-cost-sub').textContent = fmtUSD(s.TotalApiEquivalentCostUSD);
+    $('total-cost-local').textContent = fmtUSD(s.TotalLocalProjectedCostUSD);
   } catch (err) {
     /* fail open: a header total is not worth an error banner over the view */
   }
@@ -1154,6 +1171,49 @@ async function loadProxyMode() {
     delete el.dataset.state;
   }
 }
+
+// The provider toggle: which upstream new requests go to. The server owns the
+// state (and persists it across restarts), so a click POSTs and then re-reads
+// rather than flipping the buttons itself -- the page can never show a choice
+// the proxy did not accept. A refused switch (403 from a non-loopback dashboard
+// session, 400 for a local server that is not configured) goes to the status
+// line, never silently dropped.
+async function loadProvider() {
+  const el = $('provider-toggle');
+  try {
+    const { body } = await api('/api/provider');
+    for (const b of el.querySelectorAll('button')) {
+      const which = b.dataset.provider;
+      b.classList.toggle('active', which === body.active);
+      b.setAttribute('aria-pressed', which === body.active ? 'true' : 'false');
+      const unavailable = which === 'local' && !body.local_configured;
+      b.classList.toggle('muted', unavailable);
+      const host = which === 'local' ? body.local_url_host : body.cloud_url_host;
+      b.title = unavailable ? 'no local upstream configured (set LocalUpstreamURL)' : 'route to ' + host;
+    }
+    el.hidden = false;
+  } catch (err) {
+    // Fail open, like loadProxyMode: hide a toggle that cannot be trusted.
+    el.hidden = true;
+  }
+}
+
+$('provider-toggle').addEventListener('click', async (ev) => {
+  const b = ev.target.closest('button[data-provider]');
+  if (!b) return;
+  try {
+    await api('/api/provider', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active: b.dataset.provider }),
+    });
+    setStatus('');
+  } catch (err) {
+    setStatus(err.message, true);
+  }
+  await loadProvider();
+  loadTotals();
+});
 
 // Live updates: every event the consumer commits is pushed over SSE. Re-running
 // the current view's loader on each event is the lazy correct thing here -- the
@@ -1184,5 +1244,6 @@ function subscribe() {
 
 loadTotals();
 loadProxyMode();
+loadProvider();
 show('overview');
 subscribe();

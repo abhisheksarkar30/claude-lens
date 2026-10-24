@@ -80,10 +80,11 @@ Every subcommand accepts the same flag set; precedence is flags > `CLENS_*` > fi
 | `--proxy-addr` | `127.0.0.1:8797` | not deepseek-lens's 8787 — deliberate, to avoid a port collision |
 | `--dashboard-addr` | `127.0.0.1:8798` | |
 | `--upstream-url` | `https://api.anthropic.com` | |
+| `--local-upstream-url` | unset (no local provider) | GI#25: the local (e.g. LM Studio) server the dashboard's provider toggle can switch to; `http`/`https` with a host. A non-loopback host needs `--allow-remote` (which also widens the listeners). Env `CLENS_LOCAL_UPSTREAM_URL` |
 | `--db-path` | `~/.clens/lens.db` | |
 | `--body-policy` | `full` | `full` \| `off`. **`off` keeps the call row and drops only the bodies** (br-GI-7-09). A third value, `truncated`, was accepted and read nowhere; it is now **rejected at startup** rather than silently treated as `full`; see [data-privacy-and-compliance.md](data-privacy-and-compliance.md) |
 | `--body-cap-bytes` | 2097152 (2 MB) | raised from 262144 (256 KB) in GI-11: 58% of this workload's request bodies crossed the old cap and were stored as truncated conversation histories. It bounds **what is stored**, per body, never what is forwarded — and it is the bound on how much prompt and file content sits in the database at rest, so eight times the cap is eight times the exposure per row on a `full` capture. **The store's size grows with it**: the whole reason to raise it was that the bodies were worth keeping, and they are kept in `lens.db`. See [data-privacy-and-compliance.md](data-privacy-and-compliance.md) before lowering or raising it again |
-| `--allow-remote` | off | the footgun flag: without it, `Validate()` rejects a non-loopback bind |
+| `--allow-remote` | off | the footgun flag: without it, `Validate()` rejects a non-loopback bind, and a non-loopback `--local-upstream-url` |
 | `--session-gap-minutes` | — | session boundary heuristic |
 | `--retention-days` | — | drives `clens purge` |
 | `--hot-days` / `CLENS_HOT_DAYS` | 7 | GI#16: bodies older than this move to `<db dir>/archive/bodies-YYYY-MM-DD.db`; `0` disables; must be <= retention. Live-reloadable |
@@ -94,7 +95,7 @@ Every subcommand accepts the same flag set; precedence is flags > `CLENS_*` > fi
 Source: [internal/config/config.go](../../internal/config/config.go) `Default()` and the `Config`
 struct. `clens doctor` prints the resolved values.
 
-Two keys have **no flag** — they are config-file / `CLENS_*` only, and both are deliberately absent
+Three keys have **no flag** — they are config-file / `CLENS_*` only, and all are deliberately absent
 from `Default()` so an unconfigured install falls back to the shipped table's own values rather
 than to a second copy of them that could drift:
 
@@ -102,6 +103,7 @@ than to a second copy of them that could drift:
 |---|---|---|---|
 | `PeakOffPeakDates` | `CLENS_PEAK_OFF_PEAK_DATES` | the 33 bundled 2026 dates | no holiday excluded |
 | `ApiModelPrefixes` | `CLENS_API_MODEL_PREFIXES` | `deepseek-` | nothing routed pay-as-you-go |
+| `LocalModelPrefixes` | `CLENS_LOCAL_MODEL_PREFIXES` | no transcript row is classified `local` | same as unset |
 
 Comma-separated; `none` is the sentinel for an empty list, and unset is *not* the same as empty —
 the difference is preserved by a `nil`-vs-empty check on both sides
@@ -115,7 +117,11 @@ columns as **more expensive, not less**:
   the `api` account, so they fall back to the collector's `subscription` default and their cost
   lands in the hypothetical column instead of `cost_usd`.
 
-`Validate()` rejects a malformed date (not `YYYY-MM-DD`) and an empty or whitespace-only prefix.
+`Validate()` rejects a malformed date (not `YYYY-MM-DD`), an empty or whitespace-only prefix in either list, a
+`LocalUpstreamURL` that is not `http`/`https` with a host or whose non-loopback host lacks `AllowRemote`, and a
+configured account named `local` (reserved, GI#25). `LocalModelPrefixes` is what lets a transcript row be
+recognised as a local call; set it to the local server's model names or a proxy-first local row can end unpriced
+([cost-and-quota.md](cost-and-quota.md#the-local-provider-gi25)).
 `clens doctor` prints the resolved state as `N (default)`, `N`, or `none`.
 
 ## Where the store lives

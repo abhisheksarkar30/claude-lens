@@ -52,7 +52,7 @@ func runModels(args []string, w io.Writer) error {
 	fmt.Fprintln(w, "\nobserved:")
 	for _, s := range stats {
 		label := "priced"
-		if _, ok := table[s.Model]; !ok || s.UnpricedCount > 0 {
+		if _, ok := table[s.PriceModel]; !ok || s.UnpricedCount > 0 {
 			label = "unpriced"
 		}
 		fmt.Fprintf(w, "  %-22s %-9s priced=%d unpriced=%d\n", s.Model, label, s.PricedCount, s.UnpricedCount)

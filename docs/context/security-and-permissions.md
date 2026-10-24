@@ -19,6 +19,7 @@ the bind address *is* the security boundary.
 | Replay (the billable route) | opt-in, off by default (`clens serve --replay`) | [internal/api/replay.go:42](../../internal/api/replay.go#L42) |
 | `POST /api/shutdown` (GI#13) | same-origin **plus** a loopback-caller check on `r.RemoteAddr`; **`--allow-remote` widens neither guard** | [internal/api/shutdown.go](../../internal/api/shutdown.go) |
 | `POST /api/reload` (GI#16) | same guards as shutdown: same-origin **plus** a loopback-caller check; `--allow-remote` widens neither | [internal/api](../../internal/api/) |
+| `POST /api/provider` (GI#25) | same guards as shutdown: same-origin **plus** a loopback-caller check; `--allow-remote` widens neither. It redirects where the caller's credentials are sent | [internal/api/provider.go](../../internal/api/provider.go) |
 | `archive/` directory (GI#16) | `0700` dir, `0600` day files on Unix; **no-ops on Windows** (no ACL is applied, unlike `secrets.toml`). Holds full bodies, so as sensitive as `lens.db` | [internal/store/archive.go](../../internal/store/archive.go) |
 | `net/http/pprof` (`--pprof-addr`, GI#13) | off by default; loopback only, **and `--allow-remote` cannot widen it** | `config.Validate()` hardcodes `allowRemote=false` for this one field ([internal/config/config.go](../../internal/config/config.go)); `internal/cli`'s `startPprof` re-checks with the same `IsLoopbackHost` predicate before spawning the listener, so a `Config` built by anything other than `config.Load` can't skip `Validate` and open one anyway |
 
@@ -51,6 +52,22 @@ package-local predicate in [internal/api/origin.go](../../internal/api/origin.go
 rules below). `--allow-remote` cannot widen this: the route is loopback-only unconditionally. The
 response is written, then the stop func runs on its own goroutine, so a shutdown that cancels the
 server's context first can never race its own response out of existence.
+
+### The provider route (GI#25)
+
+`POST /api/provider` reuses the shutdown route's two guards verbatim (same-origin, then a loopback
+caller on `r.RemoteAddr`; `--allow-remote` widens neither). It is loopback-only for a reason beyond
+process control: switching the provider **redirects where the caller's own credentials are sent**.
+With `local` active, Claude Code's API key or OAuth token reaches the local server instead of
+Anthropic. On a dashboard bound to `0.0.0.0` the toggle therefore works from the machine running
+`clens`, and a click from another machine gets `403`, shown in the status line. `GET /api/provider`
+is a read like the others and returns hosts only, never the configured URLs.
+
+`config.Validate` applies the same instinct to configuration: a `LocalUpstreamURL` whose host is not
+loopback is rejected unless `AllowRemote` is set, which also widens the two listeners — reaching a
+LAN LM Studio costs that. A bad value is a `400`, distinct from the guard failures (`403`) and an
+unwired seam (`503`). The state file (`provider`, beside the database) holds one word and nothing
+sensitive.
 
 ## Credential handling
 

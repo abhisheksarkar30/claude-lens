@@ -15,6 +15,25 @@ import (
 	"time"
 )
 
+// The local provider (a model served on the operator's own machine) is a
+// third billing lineage. Its traffic is never billed: every figure on a local
+// row is a projection, written to api_equivalent_cost_usd and kept out of
+// quota burn and out of every real-cost sum.
+const (
+	BillingLocal = "local"
+	// LocalAccount is the fixed account every local row carries. Validate
+	// reserves the name so a configured account can never collide with it.
+	LocalAccount = "local"
+	// LocalPriceModel is the shipped price row every local token is projected
+	// against: DeepSeek's cheapest model, the baseline the operator chose.
+	LocalPriceModel = "deepseek-flash"
+)
+
+// LocalPriceAt is the instant local rows are priced at, whatever their real
+// time: a Saturday, so the peak multiplier (a cloud demand concept) never
+// applies to a model running locally.
+var LocalPriceAt = time.Date(2026, time.October, 24, 12, 0, 0, 0, time.UTC)
+
 // Account is one configured account clens can attribute captured traffic to.
 // A user holding both a Claude subscription and a separate API key for the
 // same underlying account is two Accounts, one per BillingMode — never one
@@ -51,15 +70,24 @@ type Config struct {
 	// HotDays is how many days a body stays in the live DB before the archiver
 	// moves it to a day file. 0 disables archival (bodies stay hot forever).
 	HotDays       int
-	ReplayEnabled     bool
-	AccountsPath      string
-	Accounts          []Account
+	ReplayEnabled bool
+	AccountsPath  string
+	Accounts      []Account
 
 	// Both are deliberately absent from Default(): nil means "no key set ->
 	// use the shipped default", which is a distinct state from an explicitly
 	// empty list (the `none` sentinel in applyKV).
 	PeakOffPeakDates []string
 	ApiModelPrefixes []string
+
+	// LocalUpstreamURL is the local (e.g. LM Studio) server the dashboard's
+	// provider toggle can route to; empty means no local provider is
+	// configured and "local" cannot be selected. LocalModelPrefixes names the
+	// model ids that mark a transcript row as local, for the JSONL source,
+	// which does not see which upstream answered. It has no shipped default:
+	// unset means no transcript row is classified local.
+	LocalUpstreamURL   string
+	LocalModelPrefixes []string
 
 	// PprofAddr, when set, serves net/http/pprof on this address for the
 	// life of the process -- a diagnostic, not a feature to turn on by
@@ -115,21 +143,23 @@ func configFilePath() string {
 
 // fieldsByEnv maps CLENS_* environment variable names to Config field names.
 var fieldsByEnv = map[string]string{
-	"CLENS_PROXY_ADDR":          "ProxyAddr",
-	"CLENS_DASHBOARD_ADDR":      "DashboardAddr",
-	"CLENS_UPSTREAM_URL":        "UpstreamURL",
-	"CLENS_DB_PATH":             "DBPath",
-	"CLENS_BODY_POLICY":         "BodyPolicy",
-	"CLENS_BODY_CAP_BYTES":      "BodyCapBytes",
-	"CLENS_ALLOW_REMOTE":        "AllowRemote",
-	"CLENS_SESSION_GAP_MINUTES": "SessionGapMinutes",
-	"CLENS_RETENTION_DAYS":      "RetentionDays",
-	"CLENS_HOT_DAYS":            "HotDays",
-	"CLENS_REPLAY_ENABLED":      "ReplayEnabled",
-	"CLENS_ACCOUNTS_PATH":       "AccountsPath",
-	"CLENS_PEAK_OFF_PEAK_DATES": "PeakOffPeakDates",
-	"CLENS_API_MODEL_PREFIXES":  "ApiModelPrefixes",
-	"CLENS_PPROF_ADDR":          "PprofAddr",
+	"CLENS_PROXY_ADDR":           "ProxyAddr",
+	"CLENS_DASHBOARD_ADDR":       "DashboardAddr",
+	"CLENS_UPSTREAM_URL":         "UpstreamURL",
+	"CLENS_DB_PATH":              "DBPath",
+	"CLENS_BODY_POLICY":          "BodyPolicy",
+	"CLENS_BODY_CAP_BYTES":       "BodyCapBytes",
+	"CLENS_ALLOW_REMOTE":         "AllowRemote",
+	"CLENS_SESSION_GAP_MINUTES":  "SessionGapMinutes",
+	"CLENS_RETENTION_DAYS":       "RetentionDays",
+	"CLENS_HOT_DAYS":             "HotDays",
+	"CLENS_REPLAY_ENABLED":       "ReplayEnabled",
+	"CLENS_ACCOUNTS_PATH":        "AccountsPath",
+	"CLENS_PEAK_OFF_PEAK_DATES":  "PeakOffPeakDates",
+	"CLENS_API_MODEL_PREFIXES":   "ApiModelPrefixes",
+	"CLENS_LOCAL_UPSTREAM_URL":   "LocalUpstreamURL",
+	"CLENS_LOCAL_MODEL_PREFIXES": "LocalModelPrefixes",
+	"CLENS_PPROF_ADDR":           "PprofAddr",
 }
 
 // splitList parses a comma-separated value into a slice, trimming blank
@@ -227,6 +257,10 @@ func applyKV(cfg *Config, kv map[string]string) error {
 			cfg.PeakOffPeakDates = splitList(val)
 		case "ApiModelPrefixes":
 			cfg.ApiModelPrefixes = splitList(val)
+		case "LocalUpstreamURL":
+			cfg.LocalUpstreamURL = val
+		case "LocalModelPrefixes":
+			cfg.LocalModelPrefixes = splitList(val)
 		case "PprofAddr":
 			cfg.PprofAddr = val
 		default:
@@ -247,6 +281,7 @@ func applyFlags(cfg *Config, args []string) error {
 	fs.StringVar(&cfg.ProxyAddr, "proxy-addr", cfg.ProxyAddr, "proxy listen address")
 	fs.StringVar(&cfg.DashboardAddr, "dashboard-addr", cfg.DashboardAddr, "dashboard listen address")
 	fs.StringVar(&cfg.UpstreamURL, "upstream-url", cfg.UpstreamURL, "upstream Anthropic API URL")
+	fs.StringVar(&cfg.LocalUpstreamURL, "local-upstream-url", cfg.LocalUpstreamURL, "local (e.g. LM Studio) upstream URL; empty disables the local provider")
 	fs.StringVar(&cfg.DBPath, "db-path", cfg.DBPath, "SQLite database path")
 	fs.StringVar(&cfg.BodyPolicy, "body-policy", cfg.BodyPolicy, "body capture policy: full|off")
 	fs.IntVar(&cfg.BodyCapBytes, "body-cap-bytes", cfg.BodyCapBytes, "max bytes captured per body (default 2097152)")
@@ -370,6 +405,23 @@ func (c *Config) Validate() error {
 	if u.Host == "" {
 		return fmt.Errorf("config: validate: UpstreamURL: invalid value %q (missing host)", c.UpstreamURL)
 	}
+	if c.LocalUpstreamURL != "" {
+		lu, err := url.Parse(c.LocalUpstreamURL)
+		if err != nil {
+			return fmt.Errorf("config: validate: LocalUpstreamURL: invalid value %q: %w", c.LocalUpstreamURL, err)
+		}
+		if lu.Scheme != "http" && lu.Scheme != "https" {
+			return fmt.Errorf("config: validate: LocalUpstreamURL: invalid value %q (scheme must be http or https)", c.LocalUpstreamURL)
+		}
+		if lu.Host == "" {
+			return fmt.Errorf("config: validate: LocalUpstreamURL: invalid value %q (missing host)", c.LocalUpstreamURL)
+		}
+		// Checked against the host alone: the URL may omit a port, which
+		// validateLoopback's host:port split would reject.
+		if !c.AllowRemote && !IsLoopbackHost(lu.Hostname()) {
+			return fmt.Errorf("config: validate: LocalUpstreamURL: non-loopback host %q requires AllowRemote", lu.Hostname())
+		}
+	}
 	if c.SessionGapMinutes <= 0 {
 		return fmt.Errorf("config: validate: SessionGapMinutes: must be positive, got %d", c.SessionGapMinutes)
 	}
@@ -392,6 +444,16 @@ func (c *Config) Validate() error {
 	for _, p := range c.ApiModelPrefixes {
 		if strings.TrimSpace(p) == "" {
 			return fmt.Errorf("config: validate: ApiModelPrefixes: empty or whitespace-only prefix")
+		}
+	}
+	for _, p := range c.LocalModelPrefixes {
+		if strings.TrimSpace(p) == "" {
+			return fmt.Errorf("config: validate: LocalModelPrefixes: empty or whitespace-only prefix")
+		}
+	}
+	for _, a := range c.Accounts {
+		if a.Name == LocalAccount {
+			return fmt.Errorf("config: validate: Accounts: account name %q is reserved for local-provider traffic", LocalAccount)
 		}
 	}
 	if c.PprofAddr != "" {

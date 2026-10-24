@@ -33,14 +33,22 @@ type CapturedCall struct {
 	// the credential's value.
 	AuthKind string
 
+	// Provider names the upstream target that served the call: "local" for
+	// the operator's own model server, "cloud" for the default cloud upstream.
+	// The proxy stamps it from the active target; the consumer reads it to bill
+	// the call as a projection instead of real spend.
+	Provider string
+
 	ReqHeaders  http.Header // already redacted by the caller
 	RespHeaders http.Header // already redacted by the caller
 	ReqBody     []byte      // body policy already applied by the caller
 	RespBody    []byte      // nil while streaming; filled by a separate accumulator
 
-	// CaptureComplete is false exactly when either body was truncated by the
-	// cap — the merge-precedence flag downstream storage reads. It says
-	// nothing about SSE framing: the hot path never parses the stream.
+	// CaptureComplete is false when either teed body was cut at the cap, or
+	// the upstream response body ended with a read error other than a client
+	// cancel -- the merge-precedence flag downstream storage reads. This is
+	// the canonical definition; the other comments on the flag point here. It
+	// says nothing about SSE framing: the hot path never parses the stream.
 	//
 	// Both bodies: a request body over the cap is stored as a prefix exactly
 	// as a response body is, and a flag derived from one of them reports a

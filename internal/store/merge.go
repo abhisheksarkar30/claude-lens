@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
+
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 )
 
 // eventWriteColumns lists every events column in the fixed order
@@ -339,6 +342,7 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	// api_key + subscription, which is a different case, and this change
 	// removes the only production path that produced its trigger.
 	merged.BillingMode = winner.BillingMode
+	alignBillingIdentity(&merged, existing, incoming, winner)
 	// The winner's capture could not classify its credential, so it hands over
 	// no mode -- billing_modeForAuthKind returns "" for anything authkind.go
 	// does not recognize. Assigning it unconditionally would blank a non-empty
@@ -464,7 +468,77 @@ func mergeEvents(existing, incoming *Event) (result *Event, mismatch bool) {
 	}
 	merged.TranscriptRole = preferNonEmpty(existing.TranscriptRole, incoming.TranscriptRole)
 
+	enforceLocalAccountInvariant(&merged, existing, incoming)
 	return &merged, mismatch
+}
+
+// proxyInvolved reports whether the proxy had a hand in e. A transcript-first
+// row keeps Source "jsonl" and only gains "proxy" in SourceRefs once the proxy
+// row merges in, so a bare Source test would call it proxy-free on its next
+// merge -- the same union reflagScope uses.
+func proxyInvolved(e *Event) bool {
+	return e.Source == "proxy" || slices.Contains(e.SourceRefs, "proxy")
+}
+
+// alignBillingIdentity makes the proxy the authority on who a call was billed
+// to. The proxy saw the request's credential and which upstream answered it; a
+// transcript row only has a model name to guess from. It acts only when one
+// side is local and exactly one side is proxy-involved: with neither (a transcript re-ingest) or
+// both (one provider, so the modes agree) there is nothing to arbitrate.
+//
+// Tokens still come from winner. A cost figure is meaningful only in the mode
+// it was priced for, so when winner's mode differs from the identity the row
+// ends up with, its figure is dropped to the unpriced convention (NULL, never
+// $0.00) rather than left in a column that would put it in the wrong sum.
+func alignBillingIdentity(merged, existing, incoming, winner *Event) {
+	// Only a pairing that involves local needs arbitrating. Between api and
+	// subscription the winner's mode has always been taken (a transcript
+	// re-ingest of a DeepSeek call flips subscription to api by design), and
+	// that stays as it was.
+	if existing.BillingMode != config.BillingLocal && incoming.BillingMode != config.BillingLocal {
+		return
+	}
+	exP, inP := proxyInvolved(existing), proxyInvolved(incoming)
+	if exP == inP {
+		return
+	}
+	proxySide := existing
+	if inP {
+		proxySide = incoming
+	}
+	// An unclassified credential hands over no mode; keep the plain pick.
+	if proxySide.BillingMode == "" {
+		return
+	}
+	merged.BillingMode = proxySide.BillingMode
+	if proxySide.Account != "" {
+		merged.Account = proxySide.Account
+	}
+	if winner.BillingMode != merged.BillingMode {
+		merged.CostUSD = nil
+		merged.ApiEquivalentCostUSD = nil
+		merged.CostSource = "unpriced"
+	}
+}
+
+// enforceLocalAccountInvariant keeps "billing_mode is local" and "account is
+// the local account" the same statement on every merged row. Quota burn is
+// keyed by account name alone, so a local row left under a real subscription
+// account would burn that account's quota, and a real row left under the local
+// account would silently drop out of it.
+func enforceLocalAccountInvariant(merged, existing, incoming *Event) {
+	switch {
+	case merged.BillingMode == config.BillingLocal:
+		merged.Account = config.LocalAccount
+	case merged.Account == config.LocalAccount:
+		merged.Account = ""
+		for _, e := range []*Event{existing, incoming} {
+			if e.Account != "" && e.Account != config.LocalAccount {
+				merged.Account = e.Account
+				break
+			}
+		}
+	}
 }
 
 // The two sides a retained body can come from, as a bit set: a merged row can

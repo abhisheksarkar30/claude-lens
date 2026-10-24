@@ -71,10 +71,10 @@ type EventSummary struct {
 	ReplayOf    string
 	ReplayEdits string
 
-	// CaptureComplete is false exactly when either body was truncated at the
-	// read cap — the merge-precedence flag. Which of the two bodies was cut
-	// is not recorded on the row; the detail view names it by comparing each
-	// stored body's length against the read cap it was configured with.
+	// CaptureComplete: see sink.CapturedCall.CaptureComplete. It is the
+	// merge-precedence flag. Which cause or which body was cut is not recorded
+	// on the row; the detail view names a capped body by comparing each stored
+	// body's length against the read cap it was configured with.
 	CaptureComplete bool
 
 	// Proxy-only, empty for a source="jsonl" row.
@@ -221,11 +221,18 @@ type StatsSummary struct {
 
 	TotalCostUSD              *float64
 	TotalApiEquivalentCostUSD *float64
+	// TotalLocalProjectedCostUSD is the projected cost of local-provider rows.
+	// It is a third aggregate and is never added to either of the two above.
+	TotalLocalProjectedCostUSD *float64
 }
 
 // ModelStats is one StatsByModel row.
 type ModelStats struct {
 	Model string
+	// PriceModel is the shipped row this model's cost is computed from: Model
+	// itself, except for local rows, which are priced as config.LocalPriceModel.
+	// It differing from Model is the only local signal the coverage view needs.
+	PriceModel string
 	StatsSummary
 }
 

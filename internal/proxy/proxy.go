@@ -10,12 +10,11 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"strconv"
 	"time"
 
@@ -23,26 +22,44 @@ import (
 	"github.com/abhisheksarkar30/claude-lens/internal/sink"
 )
 
-// New builds the reverse proxy handler for cfg.UpstreamURL. Every request
-// and response is teed into sk — bodies capped at cfg.BodyCapBytes,
-// sensitive headers redacted — without ever delaying the client: the hot
-// path copies bytes and does nothing else. Any error on the capture side
-// is recorded on the submitted call and the response is returned
-// unmodified (invariant 6, fail open).
+// New builds the reverse proxy handler for cfg.UpstreamURL alone, with no
+// local provider and no persisted provider choice. See NewWithTargets.
 func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
-	target, err := url.Parse(cfg.UpstreamURL)
+	t, err := NewTargets(cfg, "")
 	if err != nil {
-		return nil, fmt.Errorf("proxy: invalid upstream URL %q: %w", cfg.UpstreamURL, err)
+		return nil, err
 	}
+	return NewWithTargets(cfg, sk, t)
+}
 
+// NewWithTargets builds the reverse proxy handler for whichever upstream t
+// names as active. Every request and response is teed into sk — bodies
+// capped at cfg.BodyCapBytes, sensitive headers redacted — without ever
+// delaying the client: the hot path copies bytes and does nothing else. Any
+// error on the capture side is recorded on the submitted call and the
+// response is returned unmodified (invariant 6, fail open).
+func NewWithTargets(cfg *config.Config, sk *sink.Sink, t *Targets) (http.Handler, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConnsPerHost = 100
 
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(target)
+			// The provider was read once, in the handler, and rides on the
+			// capture state: the upstream that serves the request and the
+			// provider stamped on its row cannot disagree, whatever Set does
+			// in between.
+			which := t.Active()
+			if st, ok := pr.In.Context().Value(stateKey{}).(*captureState); ok {
+				which = st.provider
+			}
+			pr.SetURL(t.resolve(which))
 		},
 		Transport: transport,
+		// The stdlib logs "read error during body copy" here for an upstream
+		// body that fails mid-stream. teeCloser records that error and the
+		// onClose closures log it with the call's identity, so the stdlib's
+		// unlabelled duplicate is discarded.
+		ErrorLog: log.New(io.Discard, "", 0),
 		// Flush after every write. This is what makes SSE stream through
 		// rather than accumulate in a buffer. Non-negotiable — it is the
 		// hot-path invariant the TTFB test exists to catch a regression in.
@@ -79,35 +96,50 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 			// No buffer and no TeeReader: this wrapper copies no bytes, it
 			// exists only so onClose knows the call is over. CaptureComplete
 			// is true because nothing was narrowed -- an absent body is the
-			// policy's doing, not a cap's or a stream's.
+			// policy's doing, not a cap's or a stream's. An upstream abort is
+			// neither, so it still clears the flag.
 			orig := res.Body
-			res.Body = &teeCloser{r: orig, c: orig, onClose: func() {
+			t := &teeCloser{r: orig, c: orig}
+			t.onClose = func() {
+				if abort := t.aborted(); abort != nil {
+					logAbort(st, 0, abort)
+					st.submit(status, respHeaders, nil, false, abort)
+					return
+				}
 				st.submit(status, respHeaders, nil, true, nil)
-			}}
+			}
+			res.Body = t
 			return nil
 		}
 		respBuf := newBoundedBuffer(bodyCap)
 		orig := res.Body
-		res.Body = &teeCloser{
-			r: io.TeeReader(orig, respBuf),
-			c: orig,
-			onClose: func() {
-				// Both buffers, not just the response's. A request body over the
-				// cap is stored as a prefix just as a response body is, and
-				// reporting only one half leaves the row claiming a complete
-				// capture while holding a truncated request -- the exact
-				// "truncated looks identical to complete" defect the marker
-				// exists to prevent, in the half a response-side fixture never
-				// reaches.
-				//
-				// st.reqBody is non-nil here and needs no guard: this closure
-				// runs only on the captureBodies path, where the field is set
-				// before the request is sent and the request's body is fully
-				// teed by the time the response body closes.
-				st.submit(status, respHeaders, respBuf.Bytes(),
-					!respBuf.truncated && !st.reqBody.truncated, nil)
-			},
+		t := &teeCloser{r: io.TeeReader(orig, respBuf), c: orig}
+		t.onClose = func() {
+			// An upstream read error ends the stream early, so whatever was
+			// teed is a prefix however small it is: the capture is incomplete
+			// whatever the buffers' own flags say, and the error rides on the
+			// call so the consumer raises upstream_error.
+			if abort := t.aborted(); abort != nil {
+				logAbort(st, len(respBuf.Bytes()), abort)
+				st.submit(status, respHeaders, respBuf.Bytes(), false, abort)
+				return
+			}
+			// Both buffers, not just the response's. A request body over the
+			// cap is stored as a prefix just as a response body is, and
+			// reporting only one half leaves the row claiming a complete
+			// capture while holding a truncated request -- the exact
+			// "truncated looks identical to complete" defect the marker
+			// exists to prevent, in the half a response-side fixture never
+			// reaches.
+			//
+			// st.reqBody is non-nil here and needs no guard: this closure
+			// runs only on the captureBodies path, where the field is set
+			// before the request is sent and the request's body is fully
+			// teed by the time the response body closes.
+			st.submit(status, respHeaders, respBuf.Bytes(),
+				!respBuf.truncated && !st.reqBody.truncated, nil)
 		}
+		res.Body = t
 		return nil
 	}
 
@@ -122,6 +154,7 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 			authKind:   authKind,
 			reqHeaders: redactHeaders(r.Header),
 			sk:         sk,
+			provider:   t.Active(),
 		}
 		if captureBodies {
 			reqBuf := newBoundedBuffer(bodyCap)
@@ -163,12 +196,12 @@ func WithReplay(r *http.Request, meta ReplayMeta) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), replayKey{}, meta))
 }
 
-// NewServer builds the http.Server that fronts New's handler, with the
-// timeouts the hot path requires: a bounded ReadHeaderTimeout, no
+// NewServer builds the http.Server that fronts NewWithTargets' handler, with
+// the timeouts the hot path requires: a bounded ReadHeaderTimeout, no
 // WriteTimeout (a streaming response can legitimately run for minutes), and
 // an IdleTimeout to reclaim idle keep-alive connections.
-func NewServer(cfg *config.Config, sk *sink.Sink) (*http.Server, error) {
-	h, err := New(cfg, sk)
+func NewServer(cfg *config.Config, sk *sink.Sink, t *Targets) (*http.Server, error) {
+	h, err := NewWithTargets(cfg, sk, t)
 	if err != nil {
 		return nil, err
 	}
@@ -195,6 +228,9 @@ type captureState struct {
 	reqHeaders http.Header
 	reqBody    *boundedBuffer
 	sk         *sink.Sink
+
+	// provider is the Targets.Active value this request was routed by.
+	provider string
 
 	noCapture bool
 
@@ -240,6 +276,7 @@ func (st *captureState) submit(status int, respHeaders http.Header, respBody []b
 		ReplayOf:        st.replayOf,
 		ReplayEdits:     st.replayEdits,
 		RequestIDHeader: requestIDHeader(respHeaders),
+		Provider:        st.provider,
 		Err:             callErr,
 	}
 	if !st.sk.Submit(call) {
@@ -303,9 +340,30 @@ type teeCloser struct {
 	r       io.Reader
 	c       io.Closer
 	onClose func()
+	readErr error
 }
 
-func (t *teeCloser) Read(p []byte) (int, error) { return t.r.Read(p) }
+// Read remembers the first read error that is neither a clean EOF nor a
+// cancellation. For a response body that error means the upstream dropped
+// the stream mid-response. A cancelled context is the client stopping the
+// stream, which delivered everything the session produced, so it is not an
+// abort. It compares two values and allocates nothing: it is the hot path.
+func (t *teeCloser) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if err != nil && err != io.EOF && t.readErr == nil && !errors.Is(err, context.Canceled) {
+		t.readErr = err
+	}
+	return n, err
+}
+
+// aborted is the read error Read recorded, or nil for a stream that ended
+// cleanly or was cancelled by the client.
+func (t *teeCloser) aborted() error { return t.readErr }
+
+func logAbort(st *captureState, captured int, err error) {
+	log.Printf("proxy: upstream stream aborted method=%s path=%s captured=%d err=%v",
+		st.method, st.path, captured, err)
+}
 
 func (t *teeCloser) Close() error {
 	err := t.c.Close()

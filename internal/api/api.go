@@ -140,6 +140,9 @@ type api struct {
 
 	// reloadFunc backs POST /api/reload (br-GI-16-04), wired by SetReload.
 	reloadFunc func(context.Context) (ReloadReport, error)
+
+	// provider backs /api/provider (br-GI-25-06), wired by SetProvider.
+	provider ProviderSeam
 }
 
 // SetPricing wires GET/POST /api/prices to loader's table and override file.
@@ -219,6 +222,8 @@ func New(st Store, sk *sink.Sink, cons *consumer.Consumer, broker *Broker, asset
 	mux.HandleFunc("POST /api/ingest", a.triggerIngest)
 	mux.HandleFunc("POST /api/shutdown", a.shutdown)
 	mux.HandleFunc("POST /api/reload", a.reload)
+	mux.HandleFunc("/api/provider", methodGet(a.getProvider))
+	mux.HandleFunc("POST /api/provider", a.setProvider)
 
 	mux.Handle("/", http.FileServer(http.FS(assets)))
 	a.mux = mux
@@ -716,6 +721,10 @@ type healthResponse struct {
 	ConsumerFailed    uint64     `json:"consumer_failed"`
 	ConsumerDrained   uint64     `json:"consumer_drained"`
 	ConsumerFlushes   uint64     `json:"consumer_flushes"`
+	// StoreTransientRetries counts retries of a transient SQLite error (I/O or
+	// out of memory); StoreTransientGaveUp counts flushes whose retries ran out.
+	StoreTransientRetries uint64 `json:"store_transient_retries"`
+	StoreTransientGaveUp  uint64 `json:"store_transient_gave_up"`
 	LastWriteAt       *time.Time `json:"last_write_at,omitempty"`
 	LastWriteAgeMs    int64      `json:"last_write_age_ms,omitempty"`
 	// ReplayRejected counts replay attempts turned away by either guard. It is
@@ -734,6 +743,9 @@ func (a *api) health(w http.ResponseWriter, r *http.Request) {
 		ConsumerFailed:    cs.Failed,
 		ConsumerDrained:   cs.Drained,
 		ConsumerFlushes:   cs.FlushCount,
+
+		StoreTransientRetries: cs.TransientRetries,
+		StoreTransientGaveUp:  cs.TransientGaveUp,
 		ReplayRejected:    a.replayRejected.Load(),
 	}
 	if !cs.LastWriteAt.IsZero() {

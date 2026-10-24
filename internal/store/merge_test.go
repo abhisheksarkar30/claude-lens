@@ -10,6 +10,8 @@ import (
 
 	"github.com/abhisheksarkar30/claude-lens/internal/parse"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
+
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 )
 
 // Test 11a (B-owned metadata columns survive the merge): the columns a
@@ -1452,4 +1454,208 @@ func TestMergeEventsPrefersPricedOverUnpriced(t *testing.T) {
 	if got.CostSource != "user" {
 		t.Fatalf("CostSource = %q, want user (incoming.CaptureComplete=%v)", got.CostSource, incoming.CaptureComplete)
 	}
+}
+
+// --- local provider (GI-25) ---
+
+// mergeSide builds one side of a local-provider merge: a proxy or jsonl row
+// for request id, in the given billing identity, with its cost in the column
+// that identity routes to.
+func mergeSide(id, source, mode, account string, cost float64) *Event {
+	ev := fullEvent(id)
+	ev.Source, ev.FirstSource = source, source
+	ev.BillingMode, ev.Account = mode, account
+	ev.CostUSD, ev.ApiEquivalentCostUSD = nil, nil
+	if mode == "api" {
+		ev.CostUSD = f64(cost)
+	} else {
+		ev.ApiEquivalentCostUSD = f64(cost)
+	}
+	return ev
+}
+
+func mergeGet(t *testing.T, st *Store, events ...*Event) *Event {
+	t.Helper()
+	ctx := context.Background()
+	var rowID int64
+	for _, ev := range events {
+		var err error
+		if rowID, _, err = st.InsertEvent(ctx, ev); err != nil {
+			t.Fatalf("InsertEvent(%s %s): %v", ev.Source, ev.BillingMode, err)
+		}
+	}
+	got, err := st.GetEvent(ctx, rowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func wantLocalIdentity(t *testing.T, label string, got *Event) {
+	t.Helper()
+	if got.BillingMode != config.BillingLocal || got.Account != config.LocalAccount {
+		t.Errorf("%s: mode/account = %q/%q, want local/local", label, got.BillingMode, got.Account)
+	}
+	if got.CostUSD != nil {
+		t.Errorf("%s: cost_usd = %v, a local row never carries real money", label, *got.CostUSD)
+	}
+}
+
+func wantUnpricedCost(t *testing.T, label string, got *Event) {
+	t.Helper()
+	if got.CostUSD != nil || got.ApiEquivalentCostUSD != nil || got.CostSource != "unpriced" {
+		t.Errorf("%s: cost = %v/%v source %q, want NULL/NULL unpriced", label, got.CostUSD, got.ApiEquivalentCostUSD, got.CostSource)
+	}
+}
+
+// The proxy knows which upstream answered; a transcript row guesses from the
+// model name and, with no local prefix configured, calls the same call a
+// subscription one. The local identity must survive that in either arrival
+// order, and across a later transcript re-ingest.
+func TestMergeKeepsLocalSticky(t *testing.T) {
+	proxyLocal := func() *Event { return mergeSide("r", "proxy", config.BillingLocal, config.LocalAccount, 0.01) }
+	jsonlSub := func() *Event { return mergeSide("r", "jsonl", "subscription", "Max", 5.0) }
+
+	t.Run("proxy first, transcript second", func(t *testing.T) {
+		got := mergeGet(t, newTestStore(t), proxyLocal(), jsonlSub())
+		wantLocalIdentity(t, "proxy-first", got)
+		// The transcript wins tokens; its subscription figure is not a local one.
+		wantUnpricedCost(t, "proxy-first", got)
+	})
+	t.Run("transcript first, proxy second", func(t *testing.T) {
+		got := mergeGet(t, newTestStore(t), jsonlSub(), proxyLocal())
+		wantLocalIdentity(t, "jsonl-first", got)
+		if got.ApiEquivalentCostUSD == nil || *got.ApiEquivalentCostUSD != 0.01 {
+			t.Errorf("projected cost = %v, want the proxy figure 0.01 in api_equivalent_cost_usd", got.ApiEquivalentCostUSD)
+		}
+	})
+	t.Run("transcript, proxy, transcript again", func(t *testing.T) {
+		// The second merge leaves Source "jsonl" with source_refs holding
+		// "proxy"; the third must still see the proxy's hand in it.
+		got := mergeGet(t, newTestStore(t), jsonlSub(), proxyLocal(), jsonlSub())
+		wantLocalIdentity(t, "three events", got)
+	})
+}
+
+// A proxy row that never observed usage, or whose capture is incomplete, loses
+// the token pick to the transcript. The identity still comes from the proxy,
+// and the transcript's real tokens survive.
+func TestMergeLocalZeroUsageTokensSurvive(t *testing.T) {
+	zero := func() *Event {
+		ev := mergeSide("r", "proxy", config.BillingLocal, config.LocalAccount, 0.01)
+		ev.InputTokens, ev.OutputTokens, ev.CacheWrite5mTokens, ev.CacheWrite1hTokens, ev.CacheReadTokens, ev.ThinkingTokens = 0, 0, 0, 0, 0, 0
+		return ev
+	}
+	sub := func() *Event { return mergeSide("r", "jsonl", "subscription", "Max", 5.0) }
+	for name, order := range map[string][]*Event{
+		"proxy first": {zero(), sub()},
+		"jsonl first": {sub(), zero()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := mergeGet(t, newTestStore(t), order...)
+			if got.InputTokens != 100 || got.OutputTokens != 50 {
+				t.Errorf("tokens = %d/%d, want the transcript 100/50", got.InputTokens, got.OutputTokens)
+			}
+			wantLocalIdentity(t, name, got)
+			wantUnpricedCost(t, name, got)
+		})
+	}
+}
+
+func TestMergeLocalIncompleteTokensSurvive(t *testing.T) {
+	incomplete := func() *Event {
+		ev := mergeSide("r", "proxy", config.BillingLocal, config.LocalAccount, 0.01)
+		ev.CaptureComplete = false
+		ev.InputTokens, ev.OutputTokens = 7, 3
+		return ev
+	}
+	sub := func() *Event { return mergeSide("r", "jsonl", "subscription", "Max", 5.0) }
+	for name, order := range map[string][]*Event{
+		"proxy first": {incomplete(), sub()},
+		"jsonl first": {sub(), incomplete()},
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := mergeGet(t, newTestStore(t), order...)
+			if got.InputTokens != 100 || got.OutputTokens != 50 {
+				t.Errorf("tokens = %d/%d, want the complete transcript 100/50", got.InputTokens, got.OutputTokens)
+			}
+			wantLocalIdentity(t, name, got)
+			wantUnpricedCost(t, name, got)
+		})
+	}
+}
+
+// The proxy is the authority in the other direction too: a transcript row that
+// a local prefix claims must not turn a real api call local.
+func TestMergeLocalModeMismatch(t *testing.T) {
+	proxyAPI := func() *Event { return mergeSide("r", "proxy", "api", "payg", 0.42) }
+	jsonlLocal := func() *Event { return mergeSide("r", "jsonl", config.BillingLocal, config.LocalAccount, 0.01) }
+
+	wantAPI := func(t *testing.T, got *Event) {
+		t.Helper()
+		if got.BillingMode != "api" || got.Account != "payg" {
+			t.Errorf("mode/account = %q/%q, want api/payg", got.BillingMode, got.Account)
+		}
+	}
+	wantRealCost := func(t *testing.T, got *Event) {
+		t.Helper()
+		if got.CostUSD == nil || *got.CostUSD != 0.42 || got.ApiEquivalentCostUSD != nil {
+			t.Errorf("cost = %v/%v, want the proxy real 0.42 in cost_usd", got.CostUSD, got.ApiEquivalentCostUSD)
+		}
+	}
+
+	t.Run("proxy first, proxy wins the pick", func(t *testing.T) {
+		tr := jsonlLocal()
+		tr.CaptureComplete = false // so the complete proxy row keeps the token pick
+		got := mergeGet(t, newTestStore(t), proxyAPI(), tr)
+		wantAPI(t, got)
+		wantRealCost(t, got)
+	})
+	t.Run("transcript first, proxy wins the pick", func(t *testing.T) {
+		got := mergeGet(t, newTestStore(t), jsonlLocal(), proxyAPI())
+		wantAPI(t, got)
+		wantRealCost(t, got)
+	})
+	t.Run("proxy first, complete transcript wins the pick", func(t *testing.T) {
+		// Both sides complete: the incoming row wins the token pick, so the
+		// proxy's real figure cannot ride along. Identity and tokens stay
+		// right and the cost goes to the unpriced convention for reprice to
+		// refill (plan v9).
+		got := mergeGet(t, newTestStore(t), proxyAPI(), jsonlLocal())
+		wantAPI(t, got)
+		wantUnpricedCost(t, "both complete", got)
+		if got.InputTokens != 100 {
+			t.Errorf("InputTokens = %d, want the transcript 100", got.InputTokens)
+		}
+	})
+	t.Run("incomplete proxy row, complete local transcript", func(t *testing.T) {
+		p := proxyAPI()
+		p.CaptureComplete = false
+		got := mergeGet(t, newTestStore(t), p, jsonlLocal())
+		wantAPI(t, got)
+		wantUnpricedCost(t, "mismatch", got)
+		if got.InputTokens != 100 {
+			t.Errorf("InputTokens = %d, want the transcript 100", got.InputTokens)
+		}
+	})
+}
+
+// Re-ingesting a transcript after the local prefix list changed flips its mode
+// with no proxy involved. The account must follow the mode, in both directions,
+// because quota burn is keyed by account name alone.
+func TestMergeLocalAccountInvariant(t *testing.T) {
+	t.Run("subscription row re-ingested as local", func(t *testing.T) {
+		got := mergeGet(t, newTestStore(t),
+			mergeSide("r", "jsonl", "subscription", "Max", 5.0),
+			mergeSide("r", "jsonl", config.BillingLocal, config.LocalAccount, 0.01))
+		wantLocalIdentity(t, "to local", got)
+	})
+	t.Run("local row re-ingested as subscription", func(t *testing.T) {
+		got := mergeGet(t, newTestStore(t),
+			mergeSide("r", "jsonl", config.BillingLocal, config.LocalAccount, 0.01),
+			mergeSide("r", "jsonl", "subscription", "Max", 5.0))
+		if got.BillingMode != "subscription" || got.Account != "Max" {
+			t.Errorf("mode/account = %q/%q, want subscription/Max (no leftover local account)", got.BillingMode, got.Account)
+		}
+	})
 }

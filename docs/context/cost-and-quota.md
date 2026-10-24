@@ -9,7 +9,8 @@ Two rules generate most of the code in [internal/pricing](../../internal/pricing
 [internal/quota](../../internal/quota/), and [internal/reconcile](../../internal/reconcile/), and
 most of the tests:
 
-1. **Two billing models are never summed.** Not in SQL, not in Go, not in the dashboard's totals.
+1. **Billing models are never summed.** Not in SQL, not in Go, not in the dashboard's totals. `api` and
+   `subscription` are the two real ones; `local` (GI#25) is a third, projected figure kept out of both.
 2. **An invented number is worse than no number.** `$0.00` reads as "this was free"; `unpriced`
    tells you to go configure something.
 
@@ -27,16 +28,48 @@ code that implements it.
 | Team | `subscription` | API-equivalent value | snapshot % + shared-seat context |
 | Enterprise | `subscription` | API-equivalent value | snapshot % + configured spend limit |
 | Pay-as-you-go | `api` | real billed dollars (source D) and computed dollars in `cost_usd` (sources A/B) | Admin rate-limit reports |
+| Local model (LM Studio) | `local` | a projection at the `deepseek-flash` rate, labelled `local (proj)` — not a bill | none: kept out of quota burn |
 
-All seven reduce to **two** billing modes. The separation is carried in the schema, not in a
+The seven plans reduce to **two** real billing modes; a call served by a local model is a third, `local` ([below](#the-local-provider-gi25)). The separation is carried in the schema, not in a
 convention: a `subscription` figure is written to `api_equivalent_cost_usd` and `cost_usd` is left
-NULL; an `api` figure is written to `cost_usd`. Both live in [internal/store](../../internal/store/),
+NULL, and so is a `local` figure; an `api` figure is written to `cost_usd`. All live in [internal/store](../../internal/store/),
 enforced by an invariant test — see [storage-schema.md](storage-schema.md) and
 [decisions/001](decisions/001-billing-split-by-column.md).
 
 `billing_mode` comes from the **configured account**, not from the credential shape alone. A mixed
 account (a Pro subscription *and* a separate API key) is two accounts, rendered side by side and
 never summed.
+
+## The local provider (GI#25)
+
+A call served by a model on the operator's own machine (LM Studio) costs nothing, but its tokens are
+still worth pricing. It gets its own billing mode and a projected figure, so it can be compared with
+what the same tokens would cost elsewhere. It is never a bill and never enters a real-cost sum.
+
+| Fact | Where |
+|---|---|
+| The proxy **stamps the provider on the request** (`CapturedCall.Provider`); the consumer maps `"local"` to `billing_mode='local'` and `account='local'`. It is not inferred from the model name, because a local and a cloud model can share one — [decisions/012](decisions/012-provider-stamped-on-the-request.md) | [internal/consumer/consumer.go](../../internal/consumer/consumer.go) `processCall` |
+| The account name `local` is **reserved**: `Validate` rejects a configured account of that name, because quota burn is keyed by account name alone | [internal/config/config.go](../../internal/config/config.go) |
+| Priced as `config.LocalPriceModel` (`deepseek-flash`, the cheapest shipped row) at `config.LocalPriceAt`, a fixed Saturday, so the peak multiplier never applies and no `peak_pricing` warning is raised. `model_resolved` keeps the local model's own name | config.go, consumer.go, [internal/jsonlogs/jsonlogs.go](../../internal/jsonlogs/jsonlogs.go) |
+| The figure lives in `api_equivalent_cost_usd`; `cost_usd` stays NULL. Every cost sum has its own `local` aggregate (`TotalLocalProjectedCostUSD`) beside the `api` and `subscription` ones; an unpriced local row is NULL, never `$0.00`. A session carries no local total | `statsSelectColumnsInner` in [internal/store/store.go](../../internal/store/store.go) |
+| Absent from quota burn: its account, `local`, has no quota window | `TestLocalRowsAreAbsentFromQuotaBurn` in [internal/quota](../../internal/quota/) |
+| JSONL transcripts do not see which upstream answered. `LocalModelPrefixes` (config / `CLENS_LOCAL_MODEL_PREFIXES` only, no shipped default) classifies a transcript row `local` by model-name prefix; the `ApiModelPrefixes` check runs first | `SetLocalPrefixes` in jsonlogs.go; wired in [internal/cli/ingest.go](../../internal/cli/ingest.go) |
+| `clens reprice` prices a local row as the substitute model, not under its own name | `RepriceCosts` in store.go |
+
+**The merge.** When one side of a merge is `local` and exactly one side came from the proxy (its
+`Source` is `proxy`, or its `source_refs` contain it), the proxy side decides `billing_mode` and
+`account`, since it knows which upstream answered. The token-supplying side is picked as before: the
+completeness pick and the `usageObserved` swap are untouched, and with both sides complete the
+incoming row wins. If the side that supplied the tokens priced the call in a different mode than the
+final identity, both cost columns are NULL with `cost_source='unpriced'` rather than a figure in the
+wrong column; `clens reprice` fills them. Post-condition on every merge output:
+`billing_mode='local'` if and only if `account='local'`. Code: `alignBillingIdentity` and
+`enforceLocalAccountInvariant` in [internal/store/merge.go](../../internal/store/merge.go).
+
+Two orders end unpriced, with identity and tokens still right: a proxy-first merge of a local call
+against its complete transcript row while `LocalModelPrefixes` is unset, and a proxy `api` row merged
+against a complete transcript row that a prefix wrongly classifies `local`. Configure the prefixes
+and run `clens reprice` to refill them (plan v9, `docs/planning/GI-25-local-llm-toggle-and-store-hardening.md`).
 
 ## Auth-kind classification
 
@@ -145,7 +178,8 @@ sets only input/output does not silently acquire a 1.25×/2× write rate. Unknow
 non-zero-write rows return false and the derivation proceeds as before.
 
 Which models bill pay-as-you-go is a **prefix list, not a code rule** —
-`shippedAPIModelPrefixes = ["deepseek-"]`, overridable from config. The routing it drives lives in
+`shippedAPIModelPrefixes = ["deepseek-"]`, overridable from config. The local list is separate: `LocalModelPrefixes` has no shipped default (see
+the next section). The routing it drives lives in
 the collector rather than here: see [workflows.md](workflows.md) and
 [internal/jsonlogs](../../internal/jsonlogs/).
 

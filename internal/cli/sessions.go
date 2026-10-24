@@ -69,7 +69,7 @@ func runSessions(args []string, w io.Writer) error {
 			strconv.Itoa(s.RequestCount),
 			humanTokens(s.TotalPromptTokens),
 			humanTokens(s.OutputTokens),
-			costCell(s.TotalCostUSD, s.TotalApiEquivalentCostUSD),
+			costCell(s.TotalCostUSD, s.TotalApiEquivalentCostUSD, nil),
 			warnCount(s.UnpricedCount),
 			warnCount(s.WarningCount),
 			strings.Join(s.ModelSet, ","),

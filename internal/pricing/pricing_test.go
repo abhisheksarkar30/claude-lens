@@ -4,9 +4,11 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/parse"
 )
 
@@ -871,5 +873,27 @@ func TestComputeNilUsedClassReturnsUnpriced(t *testing.T) {
 	usd, source = table.Compute(model, parse.Usage{InputTokens: 100}, "", "", time.Now())
 	if usd == nil || source == "unpriced" {
 		t.Fatalf("Compute with a nil rate on an unused class = (%v, %q), want a price", usd, source)
+	}
+}
+
+// The local projection is only honest while LocalPriceModel is a real shipped
+// row, off-peak at LocalPriceAt, and the cheapest DeepSeek row.
+func TestLocalPriceModelIsTheCheapestShippedDeepseekRow(t *testing.T) {
+	table := ShippedTable()
+	row, ok := table[config.LocalPriceModel]
+	if !ok {
+		t.Fatalf("%q is not a shipped model", config.LocalPriceModel)
+	}
+	if row.Peak != nil && row.Peak.IsPeak(config.LocalPriceAt) {
+		t.Errorf("LocalPriceAt %v is inside %s's peak window", config.LocalPriceAt, config.LocalPriceModel)
+	}
+	sum := func(r Rate) *big.Rat {
+		t := new(big.Rat).Add(r.InputRate, r.OutputRate)
+		return t.Add(t, r.CacheReadRate)
+	}
+	for name, r := range table {
+		if strings.HasPrefix(name, "deepseek-") && sum(r).Cmp(sum(row)) < 0 {
+			t.Errorf("%s is cheaper than %s", name, config.LocalPriceModel)
+		}
 	}
 }

@@ -20,9 +20,9 @@ a transpile step, or a `<script src="https://…">` is a design change, not a re
 
 | File | Lines | Role |
 |---|---|---|
-| [index.html](../../internal/web/index.html) | 178 | the shell: header totals, the proxy-mode badge, the tab nav, one `<section class="view">` per tab |
-| [app.js](../../internal/web/app.js) | 1183 | every fetch, every table render, the three SVG charts, the body/header renderers, and the one SSE subscription |
-| [style.css](../../internal/web/style.css) | 240 | |
+| [index.html](../../internal/web/index.html) | 190 | the shell: header totals (api, sub and the projected local figure), the proxy-mode badge, the provider toggle, the tab nav, one `<section class="view">` per tab |
+| [app.js](../../internal/web/app.js) | 1249 | every fetch, every table render, the three SVG charts, the body/header renderers, and the one SSE subscription |
+| [style.css](../../internal/web/style.css) | 258 | |
 
 ## The proxy-mode badge
 
@@ -43,6 +43,25 @@ shell, which `settings.json` never sees. That state reads *"not set in settings.
 **never** read *"client elsewhere"* — `clens doctor` cannot tell the two apart, which is how the
 incident went unnoticed. The six labels are tabulated in the plan's §10.
 
+## The provider toggle and the local cost columns (GI#25)
+
+A `cloud | local` segmented control sits beside the proxy-mode badge on every tab.
+`loadProvider()` reads `GET /api/provider` and marks the active side; a click `POST`s
+`{active}` and then **re-reads** instead of flipping the buttons itself, so the page never shows a
+choice the proxy did not accept. The `local` side is dimmed (still clickable) when no local upstream
+is configured, so the refusal reaches the status line with its reason; a `403` from a non-loopback
+session lands there too. The control is hidden until `/api/provider` answers. See
+[security-and-permissions.md](security-and-permissions.md) for why the route is loopback-only.
+
+A local row's projection sits in the same `ApiEquivalentCostUSD` field as a subscription row's
+figure, and `BillingMode` says which it is. Row-level cells therefore go through two helpers,
+`subCost(e)` and `localCost(e)`, and the Calls, Overview and session-detail tables carry a separate
+`local $ (proj)` column. Summary objects need no helper: the server already keeps the three sums
+apart, so the header totals, the Overview and Stats cards and the by-model/by-period tables read
+`TotalLocalProjectedCostUSD` directly. The by-model table labels a local model `priced as
+deepseek-flash` (`ModelStats.PriceModel`). The Calls billing filter gains a `local` option. The
+sessions list has no local column: a session carries no local total.
+
 ## Rendering headers and bodies
 
 The call detail renders both sides' header blobs as `kv` tables and both bodies in a `<details>`
@@ -58,7 +77,8 @@ means one place `esc(` has to be (see the injection note in
   decodes before rendering, and the byte count in the `<summary>` comes from the *decoded* length —
   not the string length, which would be wrong for any non-UTF-8 body.
 - **The markers are separate claims, and none implies another.** The *capture* marker
-  (`captureMarker`) fires off `CaptureComplete` and names which body sits at the cap when that is
+  (`captureMarker`) fires off `CaptureComplete` (false for a capped body or, since GI#25, an upstream abort — its wording
+  already says "or the stream ended early") and names which body sits at the cap when that is
   knowable; the *read-path* markers (`readPathMarker`) fire off `RespBodyCompleteness`, with the
   unwired-cap check first; and the *transcript* marker (`transcriptCapMarker`) fires off nothing at
   all except length-against-`BodyCapBytes`, because a reconstruction is not a capture and
@@ -94,6 +114,7 @@ Tab switching is **not** URL routing — no hash, no history, no deep links. A t
 | `reconcile` | computed vs billed cost, side by side per day and model | `/api/reconcile` |
 | `models` | the catalogue, plus every model traffic used, priced or not | `/api/models` |
 | `settings` | health, the rate table, and its edit path | `/api/health`, `/api/prices` |
+| (header, every tab) | the provider toggle: which upstream new requests go to | `/api/provider` |
 
 ## The time-window picker
 

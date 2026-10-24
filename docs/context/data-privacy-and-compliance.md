@@ -60,7 +60,7 @@ and everything keyed on the body does not.
 
 `--body-cap-bytes` (default `2097152`, i.e. 2 MB) bounds the capture independently of the policy,
 **per body**. `events.capture_complete` records whether what was stored is the whole thing or was
-narrowed — so a reader can tell "this is everything" from "this is what we kept", which is the
+narrowed or cut short (definition: `sink.CapturedCall.CaptureComplete`) — so a reader can tell "this is everything" from "this is what we kept", which is the
 difference between an absent field and a truncated one. It covers **both** bodies: a request body cut
 at the cap clears it exactly as a response body does (br-GI-7-08). What the row does *not* record is
 which of the two was cut, so a surface that needs to say so infers it from the body's length against
@@ -99,8 +99,8 @@ and the cap through a `SetBodyPolicy` seam wired in `internal/cli`'s `newTailer`
 
 Two consequences are worth knowing, because both are deliberate and neither is obvious:
 
-- **A capped reconstruction does not clear `capture_complete`.** That flag is about the two *teed*
-  bodies — br-GI-7-08 widened it to "both sides of the capture" and this is not a third. A
+- **A capped reconstruction does not clear `capture_complete`.** That flag is about the capture — the two *teed*
+  bodies and the upstream read (definition: `sink.CapturedCall.CaptureComplete`) — br-GI-7-08 widened it to "both sides of the capture" and this is not a third. A
   reconstruction cut at a cap has narrowed nothing that was ever captured, and `transcript_content`
   lives in its own columns precisely because it is not a capture.
 - **An unwired cap means no cap**, not a zero-byte one, so a caller that forgets the seam captures

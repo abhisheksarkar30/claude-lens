@@ -742,3 +742,51 @@ func TestDetailUnwiredCapServesRawBody(t *testing.T) {
 		})
 	}
 }
+
+// ioErrStore fails every InsertEvent the way a SQLite I/O fault does.
+type ioErrStore struct{}
+
+type ioErr struct{}
+
+func (ioErr) Error() string { return "disk I/O error (266)" }
+func (ioErr) Code() int     { return 266 }
+
+func (ioErrStore) InsertEvent(context.Context, *store.Event) (int64, string, error) {
+	return 0, "", ioErr{}
+}
+func (ioErrStore) UpsertWarnings(context.Context, int64, []store.Warning) error { return nil }
+func (ioErrStore) SessionEventsForRules(context.Context, string) ([]*store.Event, error) {
+	return nil, nil
+}
+
+func TestHealthExposesStoreRetryCounters(t *testing.T) {
+	st := newTestStore(t)
+	sk := sink.New(16)
+	cons := consumer.New(sk, ioErrStore{}, nil)
+	cons.SetRetryBackoff(time.Millisecond, time.Millisecond, time.Millisecond)
+	handler := New(st, sk, cons, NewBroker(), testAssets(), nil, false)
+
+	// Nothing has failed yet.
+	got := decodeJSON[healthResponse](t, getOK(t, handler, "/api/health").Body)
+	if got.StoreTransientRetries != 0 || got.StoreTransientGaveUp != 0 {
+		t.Fatalf("counters before any failure = %d/%d, want 0/0", got.StoreTransientRetries, got.StoreTransientGaveUp)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go cons.Run(ctx)
+	sk.Submit(&sink.CapturedCall{RequestIDHeader: "r1", StartedAt: time.Now(), Method: "POST", Path: "/v1/messages", Status: 200})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for cons.Stats().TransientGaveUp == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("consumer never gave up on the failing store")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	got = decodeJSON[healthResponse](t, getOK(t, handler, "/api/health").Body)
+	if got.StoreTransientRetries != 3 || got.StoreTransientGaveUp != 1 {
+		t.Errorf("health retries=%d gave_up=%d, want 3 and 1", got.StoreTransientRetries, got.StoreTransientGaveUp)
+	}
+}

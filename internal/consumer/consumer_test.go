@@ -1041,3 +1041,85 @@ func TestHashFallbackTwoAttemptsProduceDistinctIDs(t *testing.T) {
 		t.Fatalf("two attempts with identical bodies produced the same RequestID %q, want distinct", first)
 	}
 }
+
+// An aborted stream carries both warnings: upstream_error for the cause and
+// stream_incomplete for the shape. An aborted JSON body carries only the
+// first, because the rule requires a stream.
+func TestConsumerAbortedCallWarnings(t *testing.T) {
+	cases := []struct {
+		name       string
+		stream     bool
+		wantStream bool
+	}{{"stream", true, true}, {"json", false, false}}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newTestStore(t)
+			sk := sink.New(sink.DefaultCapacity)
+			c := New(sk, st, nil)
+			c.SetAnalyzers(analyze.Engine{})
+			ctx, cancel := context.WithCancel(context.Background())
+			go c.Run(ctx)
+			defer cancel()
+
+			call := basicCall("req-abort-" + tc.name)
+			call.CaptureComplete = false
+			call.Err = errors.New("unexpected EOF")
+			if tc.stream {
+				call.RespHeaders = http.Header{"Content-Type": {"text/event-stream"}}
+				call.RespBody = sseBody("claude-sonnet-5", 20, 8)
+			}
+			sk.Submit(call)
+
+			ev := waitForEvents(t, st, 1)[0]
+			warnings, err := st.EventWarnings(context.Background(), ev.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !hasWarningKind(warnings, "upstream_error") {
+				t.Errorf("no upstream_error: %v", warnings)
+			}
+			if got := hasWarningKind(warnings, string(analyze.KindStreamIncomplete)); got != tc.wantStream {
+				t.Errorf("stream_incomplete = %v, want %v: %v", got, tc.wantStream, warnings)
+			}
+		})
+	}
+}
+
+// A call served by the local provider is a projection: priced as the
+// cheapest DeepSeek model at an off-peak instant (so a peak-hour timestamp
+// and an unknown local model name change nothing), written to the
+// api-equivalent column, under the fixed local account, with no peak warning.
+func TestLocalRowIsPricedAsDeepseekFlashBase(t *testing.T) {
+	table := pricing.ShippedTable()
+	c := New(sink.New(1), nil, []config.Account{{Name: "Pro", BillingMode: "subscription", Plan: "pro"}})
+	c.SetPriceTable(table)
+	c.SetAnalyzers(analyze.Engine{})
+
+	call := basicCall("req-local")
+	call.Provider = config.BillingLocal
+	call.AuthKind = "oauth" // a subscription credential must not claim the row
+	call.ReqBody = []byte(`{"model":"qwen3.6-35b-a3b-mlx","messages":[]}`)
+	call.RespBody = nonStreamBody("qwen3.6-35b-a3b-mlx", 1_000_000, 1_000_000)
+	// Monday 02:00 UTC is inside deepseek-flash's peak window.
+	call.StartedAt = time.Date(2026, time.October, 26, 2, 0, 0, 0, time.UTC)
+
+	ev := c.processCall(call).ev
+	pe := c.processCall(call)
+
+	if ev.BillingMode != config.BillingLocal || ev.Account != config.LocalAccount {
+		t.Errorf("mode/account = %q/%q, want local/local", ev.BillingMode, ev.Account)
+	}
+	if ev.ModelResolved != "qwen3.6-35b-a3b-mlx" {
+		t.Errorf("ModelResolved = %q, the real local model name must be kept", ev.ModelResolved)
+	}
+	if ev.CostUSD != nil || ev.ApiEquivalentCostUSD == nil {
+		t.Fatalf("cost routed wrong: cost_usd=%v api_equivalent=%v", ev.CostUSD, ev.ApiEquivalentCostUSD)
+	}
+	want, source := table.Compute(config.LocalPriceModel, parse.Usage{InputTokens: 1_000_000, OutputTokens: 1_000_000}, "", "", config.LocalPriceAt)
+	if source == "unpriced" || want == nil || *ev.ApiEquivalentCostUSD != *want {
+		t.Errorf("projected cost = %v (source %q), want deepseek-flash off-peak %v", *ev.ApiEquivalentCostUSD, ev.CostSource, want)
+	}
+	if hasWarningKind(pe.warnings, "peak_pricing") {
+		t.Error("a local row carries a peak_pricing warning")
+	}
+}

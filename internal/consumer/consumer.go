@@ -63,6 +63,7 @@ type Consumer struct {
 	pricer       PriceComputer
 	bodyCapBytes int
 
+	backoff       []time.Duration // waits between store retries
 	batchSize     int
 	flushInterval time.Duration
 	shutdownGrace time.Duration
@@ -71,6 +72,11 @@ type Consumer struct {
 	failed      atomic.Uint64
 	drained     atomic.Uint64
 	flushCount  atomic.Uint64
+
+	// transientRetries counts retries of a transient store error;
+	// transientGaveUp counts flushes that exhausted them.
+	transientRetries atomic.Uint64
+	transientGaveUp  atomic.Uint64
 	lastWriteAt atomic.Int64 // UnixNano; 0 means "never"
 }
 
@@ -86,6 +92,7 @@ func New(sk *sink.Sink, st Store, accounts []config.Account) *Consumer {
 		st:            st,
 		accounts:      accounts,
 		bodyCapBytes:  defaultBodyCapBytes,
+		backoff:       defaultBackoff,
 		batchSize:     defaultBatchSize,
 		flushInterval: defaultFlushInterval,
 		shutdownGrace: defaultShutdownGrace,
@@ -113,6 +120,11 @@ func (c *Consumer) SetAnalyzers(analyzers ...Analyzer)       { c.analyzers = ana
 func (c *Consumer) SetSessionRule(r SessionRule)             { c.sessionRule = r }
 func (c *Consumer) SetPriceTable(p PriceComputer)            { c.pricer = p }
 
+// SetRetryBackoff replaces the waits between retries of a transient store
+// error (the number of waits is the number of retries). It exists so a test
+// need not sit through the production schedule.
+func (c *Consumer) SetRetryBackoff(waits ...time.Duration) { c.backoff = waits }
+
 // SetBodyDecoding sets the decode cap applied to a captured response body
 // before parsing -- the same cfg.BodyCapBytes the proxy tees with.
 func (c *Consumer) SetBodyDecoding(capBytes int) {
@@ -130,6 +142,9 @@ type Stats struct {
 	Dropped     uint64 // from the sink's own accepted/dropped counters
 	FlushCount  uint64
 	LastWriteAt time.Time
+
+	TransientRetries uint64
+	TransientGaveUp  uint64
 }
 
 func (c *Consumer) Stats() Stats {
@@ -145,6 +160,9 @@ func (c *Consumer) Stats() Stats {
 		Dropped:     dropped,
 		FlushCount:  c.flushCount.Load(),
 		LastWriteAt: lastWrite,
+
+		TransientRetries: c.transientRetries.Load(),
+		TransientGaveUp:  c.transientGaveUp.Load(),
 	}
 }
 
@@ -220,6 +238,11 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 	c.flushCount.Add(1)
 	wrote := false
 
+	// gaveUp is set once a call exhausts its retries. The rest of the flush
+	// then makes no store calls at all, so one outage costs about one backoff
+	// schedule, not one per remaining row, session and fold.
+	gaveUp := false
+
 	// order+firstEv track, per distinct returned session id, the first
 	// inserted row seen for it, in arrival order (D8): the fold below must
 	// carry that row's PrefixHash, not the last one's -- prefix_hash is
@@ -230,7 +253,16 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 	firstEv := map[string]*store.Event{}
 
 	for _, pe := range batch {
-		id, sessionID, err := c.st.InsertEvent(ctx, pe.ev)
+		if gaveUp {
+			c.failed.Add(1)
+			continue
+		}
+		var id int64
+		var sessionID string
+		err := c.try(ctx, &gaveUp, func() (err error) {
+			id, sessionID, err = c.st.InsertEvent(ctx, pe.ev)
+			return err
+		})
 		if err != nil {
 			log.Printf("consumer: insert event %s: %v", pe.ev.RequestID, err)
 			c.failed.Add(1)
@@ -239,7 +271,7 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 		wrote = true
 
 		if len(pe.warnings) > 0 {
-			if err := c.st.UpsertWarnings(ctx, id, pe.warnings); err != nil {
+			if err := c.try(ctx, &gaveUp, func() error { return c.st.UpsertWarnings(ctx, id, pe.warnings) }); err != nil {
 				log.Printf("consumer: upsert warnings for event %d: %v", id, err)
 			}
 		}
@@ -260,7 +292,10 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 	// batch -- not once per row.
 	if c.sessionRule != nil {
 		for _, sessionID := range order {
-			c.runSessionRule(ctx, sessionID)
+			if gaveUp {
+				break
+			}
+			c.runSessionRule(ctx, sessionID, &gaveUp)
 		}
 	}
 
@@ -269,7 +304,12 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 	// the pass attached to any row of this same session.
 	if c.aggregator != nil {
 		for _, sessionID := range order {
-			if err := c.aggregator.RecordCall(ctx, sessionID, firstEv[sessionID]); err != nil {
+			if gaveUp {
+				break
+			}
+			if err := c.try(ctx, &gaveUp, func() error {
+				return c.aggregator.RecordCall(ctx, sessionID, firstEv[sessionID])
+			}); err != nil {
 				log.Printf("consumer: record session call for %s: %v", sessionID, err)
 			}
 		}
@@ -280,11 +320,26 @@ func (c *Consumer) flush(ctx context.Context, batch []*pendingEvent) {
 	}
 }
 
+// try runs fn with retry on transient store errors and records, once per
+// flush, that the retries ran out.
+func (c *Consumer) try(ctx context.Context, gaveUp *bool, fn func() error) error {
+	err := withRetry(ctx, c.backoff, &c.transientRetries, fn)
+	if err != nil && store.IsTransient(err) && !*gaveUp {
+		*gaveUp = true
+		c.transientGaveUp.Add(1)
+	}
+	return err
+}
+
 // runSessionRule runs the session-scoped analysis pass over sessionID's
 // whole row history and upserts each finding onto the row it names,
 // grouped so a row with several findings gets one call.
-func (c *Consumer) runSessionRule(ctx context.Context, sessionID string) {
-	rows, err := c.st.SessionEventsForRules(ctx, sessionID)
+func (c *Consumer) runSessionRule(ctx context.Context, sessionID string, gaveUp *bool) {
+	var rows []*store.Event
+	err := c.try(ctx, gaveUp, func() (err error) {
+		rows, err = c.st.SessionEventsForRules(ctx, sessionID)
+		return err
+	})
 	if err != nil {
 		log.Printf("consumer: session rows for %s: %v", sessionID, err)
 		return
@@ -297,7 +352,10 @@ func (c *Consumer) runSessionRule(ctx context.Context, sessionID string) {
 		grouped[w.EventID] = append(grouped[w.EventID], w)
 	}
 	for eventID, warnings := range grouped {
-		if err := c.st.UpsertWarnings(ctx, eventID, warnings); err != nil {
+		if *gaveUp {
+			return
+		}
+		if err := c.try(ctx, gaveUp, func() error { return c.st.UpsertWarnings(ctx, eventID, warnings) }); err != nil {
 			log.Printf("consumer: upsert session warnings for event %d: %v", eventID, err)
 		}
 	}
@@ -352,12 +410,24 @@ func (c *Consumer) processCall(call *sink.CapturedCall) *pendingEvent {
 	account, billingMode := c.resolveAccountNow(call.AuthKind)
 	ev.Account = account
 	ev.BillingMode = billingMode
+	if call.Provider == config.BillingLocal {
+		// Whatever credential the client sent, a call served locally is never
+		// billed to it: it is a projection under the fixed local account.
+		ev.Account = config.LocalAccount
+		ev.BillingMode = config.BillingLocal
+	}
 
 	if c.pricer != nil {
-		usd, costSource := c.pricer.Compute(ev.ModelResolved, usage, usage.Speed, ev.ServiceTier, call.StartedAt)
+		// A local call is priced as the cheapest DeepSeek model at an
+		// off-peak instant; ev.ModelResolved keeps the real local model name.
+		priceModel, priceAt := ev.ModelResolved, call.StartedAt
+		if ev.BillingMode == config.BillingLocal {
+			priceModel, priceAt = config.LocalPriceModel, config.LocalPriceAt
+		}
+		usd, costSource := c.pricer.Compute(priceModel, usage, usage.Speed, ev.ServiceTier, priceAt)
 		ev.CostSource = costSource
 		switch ev.BillingMode {
-		case "subscription":
+		case "subscription", config.BillingLocal:
 			ev.ApiEquivalentCostUSD = usd
 		default:
 			ev.CostUSD = usd
@@ -374,8 +444,11 @@ func (c *Consumer) processCall(call *sink.CapturedCall) *pendingEvent {
 		})
 	}
 	warnings = append(warnings, c.runAnalyzers(meta, usage, ev)...)
-	if w, ok := peakWarning(c.pricer, ev, call.StartedAt); ok {
-		warnings = append(warnings, w)
+	// A local row was never billed at a cloud peak rate.
+	if ev.BillingMode != config.BillingLocal {
+		if w, ok := peakWarning(c.pricer, ev, call.StartedAt); ok {
+			warnings = append(warnings, w)
+		}
 	}
 
 	return &pendingEvent{ev: ev, warnings: warnings}
