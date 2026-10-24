@@ -716,6 +716,10 @@ type healthResponse struct {
 	ConsumerFailed    uint64     `json:"consumer_failed"`
 	ConsumerDrained   uint64     `json:"consumer_drained"`
 	ConsumerFlushes   uint64     `json:"consumer_flushes"`
+	// StoreTransientRetries counts retries of a transient SQLite error (I/O or
+	// out of memory); StoreTransientGaveUp counts flushes whose retries ran out.
+	StoreTransientRetries uint64 `json:"store_transient_retries"`
+	StoreTransientGaveUp  uint64 `json:"store_transient_gave_up"`
 	LastWriteAt       *time.Time `json:"last_write_at,omitempty"`
 	LastWriteAgeMs    int64      `json:"last_write_age_ms,omitempty"`
 	// ReplayRejected counts replay attempts turned away by either guard. It is
@@ -734,6 +738,9 @@ func (a *api) health(w http.ResponseWriter, r *http.Request) {
 		ConsumerFailed:    cs.Failed,
 		ConsumerDrained:   cs.Drained,
 		ConsumerFlushes:   cs.FlushCount,
+
+		StoreTransientRetries: cs.TransientRetries,
+		StoreTransientGaveUp:  cs.TransientGaveUp,
 		ReplayRejected:    a.replayRejected.Load(),
 	}
 	if !cs.LastWriteAt.IsZero() {

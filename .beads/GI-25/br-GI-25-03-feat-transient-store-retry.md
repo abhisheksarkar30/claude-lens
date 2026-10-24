@@ -92,3 +92,5 @@ No SQLite pragma change (`cache_size`, `temp_store`, `synchronous`) — rejected
 - `internal/api/api_test.go` (modify — add `TestHealthExposesStoreRetryCounters`)
 
 ## Review Notes
+
+Implemented. `go build`, `go vet` and `go test ./...` green, TTFB gate included. Verified `insertOrMerge` (`merge.go:115-134`) runs INSERT then merge inside the one passed-in transaction, so retrying the whole `InsertEvent` cannot double-apply. Deviations from the bead text: `IsTransient` matches through an interface with a `Code()` method rather than `*sqlite.Error`, so `store` keeps the blank driver import and the test uses a stub (the real driver's unique-violation is used for the negative case); `withRetry` takes the backoff and counter as parameters and the schedule is a `Consumer` field set by `SetRetryBackoff`, so tests and the `/api/health` test do not wait 5.25s.
