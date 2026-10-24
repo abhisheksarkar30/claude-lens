@@ -1,4 +1,4 @@
-<!-- version=7, status=converged -->
+<!-- version=8, status=converged -->
 # GI-25 — Local LLM provider toggle with its own billing mode, mid-stream truncation recorded as complete, and transient store errors dropping events
 
 Issue: https://github.com/abhisheksarkar30/claude-lens/issues/25
@@ -35,7 +35,7 @@ visible rather than claiming a root cause for the burst itself (R3).
 | R1b | Local rows out of quota burn | Burn is keyed by account name (`api/quota.go:119,125` → `quota.ComputeBurn(…, acct.Name, "", …)`), and only `billing_mode == "subscription"` accounts are iterated (`quota.go:114`, `cli/quota.go:47`). A local row carries account `local`, which matches no subscription account | Fixed account name `local`; no quota code change, one regression test |
 | R1c | Local JSONL transcripts must not be double-counted as `subscription` | The tailer classifies per row by model prefix (`jsonlogs.go:431-437`); an unlisted local model lands in `subscription` with its own (likely unpriced) cost, and `merge.go:341` takes the *winner's* mode, so a JSONL winner would flip a proxy `local` row | `LocalModelPrefixes` config mirroring `ApiModelPrefixes`; tailer checks `ApiModelPrefixes` before `LocalModelPrefixes` — a model prefix matching both lists is classified `api` (preserves real spend when cloud and local both serve DeepSeek-family models); merge: see §3.4 |
 | R2 | Truncated captures handled | **`httputil: ReverseProxy read error during body copy` is logged when `src.Read` fails, `$GOROOT/src/net/http/httputil/reverseproxy.go:648-650`: `src` is the upstream body, so this is the upstream (3.173.21.63:443, the DeepSeek edge) dropping the stream mid-response. A client cancel is excluded via `errors.Is(err, context.Canceled)`. `ErrorHandler` does not fire after headers are sent (`proxy.go:50-55`). The tee never records the read error, so `onClose` submits `captureComplete = !respBuf.truncated && !reqBody.truncated` (`proxy.go:107-108`), i.e. `true`, for a body cut mid-stream.** The body cap (8 MiB per `~/.clens/config.toml`) is a different, already-marked mechanism | Capture the read error in `teeCloser`; submit `captureComplete=false`; log from `onClose` with method, path, and bytes received. The existing `ruleStreamIncomplete` rule (`analyze/rules.go:183-189`) fires on `usage.IsStream && !ev.CaptureComplete`, so the row gets the `stream_incomplete` warning for free — no new warning kind. Client cancel (`errors.Is(err, context.Canceled)`) deliberately keeps `CaptureComplete=true`: a client that stopped the stream received what the session produced, which is not an upstream truncation. Retrying a half-streamed response is impossible and is **not** attempted |
-| R2a | Retention duration | Archival is `--hot-days` (default 7, `config.go:86`), live-reloadable; deletion is `--retention-days` (default 0). Neither touches what a capture stores. The live DB is 19.6 GB with a 6.5 GB archive, and no `VACUUM` ever runs, so archiving does not shrink the file | **Not a code change.** Operator recommendation in §7: lower `HotDays`. Defaults unchanged |
+| R2a | Retention duration | Archival is `--hot-days` (default 7, `config.go:86`), live-reloadable; deletion is `--retention-days` (default 0). Neither touches what a capture stores. The live DB is 19.6 GB with a 6.5 GB archive, and `serve` never runs a `VACUUM` (`clens purge --vacuum` exists but is operator-invoked), so archiving does not shrink the file | **Not a code change.** Operator recommendation in §7: lower `HotDays`. Defaults unchanged |
 | R3 | SQLite `disk I/O error (266)`, `cannot allocate … bytes`, `out of memory (7)` | `Open` sets only `busy_timeout`, `foreign_keys`, `journal_mode(WAL)` (`store.go:74-82`) and one connection. `busy_timeout` retries only lock contention. No retry exists for IOERR/NOMEM anywhere in `internal/store` or `internal/consumer`; `flush` logs and drops (`consumer.go:233-238`, `287-291`, `272-274`). Error 266 is `SQLITE_IOERR_READ`; the burst of IOERR + NOMEM within seconds points at host resource exhaustion on a 19.6 GB file with 15 GB RAM, **hypothesis, unchecked** | Bounded retry with backoff for transient classes on the consumer write sites; classified counters on the consumer's `Stats`, exposed through `/api/health`, so a burst is visible, not just a log scroll. `doctor` has no in-process access to consumer counters (it opens the store directly — `doctor.go:139-161`); the counters are reachable only through `GET /api/health` (`api.go:712-745`). No pragma change on speculation (§9) |
 | R3a | `jsonlogs: open … cannot find the file` | TOCTOU between `walkFiles` (`jsonlogs.go:223,245-262`) and `os.Open` (`288-291`): Claude Code removed the file between the two. The cursor row is keyed by path; a vanished file simply stops appearing | `errors.Is(err, fs.ErrNotExist)` → silent skip. Other open errors still log |
 | R3b | `archived the bodies of N row(s)` | Informational line, `internal/cli/serve.go:416`, once at boot and every 24 h | No change |
@@ -93,8 +93,8 @@ s backoff, abandoning on `ctx` cancel. Applied at `InsertEvent`, `UpsertWarnings
 per-call level. Flush-wide gave-up flag: once any retried call gives up (in any phase), the flush
 stops — remaining `InsertEvent`s are counted in `c.failed`, and phases 2 (`runSessionRule`) and 3
 (`RecordCall`) are skipped for that flush. Bound: one give-up (~5.25 s) per flush, regardless of
-the number of events, sessions, or RecordCall invocations in the batch. Bead 03's first step also confirms that `InsertEvent`'s merge path (the `UPDATE`
-before `INSERT` in `store.go`) is a single atomic transaction so a retry cannot double-apply a
+the number of events, sessions, or RecordCall invocations in the batch. Bead 03's first step also confirms that `InsertEvent`'s merge path (`insertOrMerge`,
+`merge.go:115-134`: `INSERT` first, then on a unique-constraint error a load and `applyMergeTx`, all on one `tx`) is a single atomic transaction so a retry cannot double-apply a
 partial write. The consumer goroutine blocks during backoff; the sink is bounded so a long burst drops
 captures at the sink with the existing `proxy: dropped capture` log. Counters: `transientRetries`,
 `transientGaveUp` on `Stats`, exposed through `GET /api/health` as JSON fields `store_transient_retries` and `store_transient_gave_up` in the existing `healthResponse` struct (`api.go:712-724`).
@@ -125,7 +125,7 @@ into the subscription figure or labelled "sub" without these changes:
 | `cli/stats.go:194-203` (`writeGrouped`) | add `case ev.BillingMode == "local" && ev.ApiEquivalentCostUSD != nil: g.localCost += *ev.ApiEquivalentCostUSD; g.hasLocal = true` bucket **before** the existing `case ev.ApiEquivalentCostUSD != nil:` at `:198` (otherwise a local row with a non-nil api_equivalent_cost_usd is caught by the subscription case first); a local row with nil cost (no-fire branch, unpriced model, zero-usage) falls through to `default: g.unpriced++`; print a labelled `local (projected)` column beside `api` and `sub`; at `:230` the print reads `g.localCost`/`g.hasLocal`; the column is omitted when zero so existing output is unchanged |
 | `cli/format.go:86-88` (`costCell`) | Change signature to `costCell(api, sub, local *float64)`; add `rowCosts(ev *store.EventSummary) (api, sub, local *float64)` helper (`store.EventSummary` is the type `ls.go` and `tail.go` iterate; `store.Event` embeds `EventSummary`, so `show.go` passes `&ev.EventSummary`): returns `ev.ApiEquivalentCostUSD` as `local` (and nil as `sub`) when `ev.BillingMode == config.BillingLocal`; otherwise `ev.ApiEquivalentCostUSD` as `sub` and nil as `local`. The 3 per-row call sites (`ls.go:95`, `tail.go:101`, `show.go:72`) call `rowCosts(ev)`. `sessions.go:72` passes `(s.TotalCostUSD, s.TotalApiEquivalentCostUSD, nil)` directly — session money sums exclude local rows (§3.4 Sessions note), so the `local` argument is always nil. Renders `local (proj) $x` for local rows; `api - / sub $x` otherwise. Aggregate sites (`stats.go:89,112,140`) pass `TotalLocalProjectedCostUSD` from `StatsSummary`/`PeriodStats` via the scan change in the routing table row above — they do not call `rowCosts`. |
 | `web/app.js` per-row and summary cells | render `local (proj) $x` when `billing_mode == "local"` in one `fmtCost(e)` helper (`:429, :570, :966` per-row; `:552, :581, :652, :659, :663, :956, :1128` summaries all read `TotalApiEquivalentCostUSD` — summaries gain a parallel `TotalLocalProjectedCostUSD` tile, added at `store.go:1674-1675` above) |
-| `store.go:1345` + `api/models.go:96-104` (`coverage`) | `StatsByModel` sets `ModelStats.PriceModel string` on each result row: `config.LocalPriceModel` when `billing_mode = 'local'`, else `s.Model` — computed in the store where `config` is importable, replacing the discarded billingMode scan at `:1345`. `api/models.go` folds this as `row.priceModel` (`models.go:66-80`); `coverage` substitutes `row.priceModel` for the catalogue look-up (`models.go:96-104`) — `api/models.go` never names a `config` constant (enforced by `TestAPIWebImportGuard` at `importguard_test.go:36`). `cli/models.go` reads `s.PriceModel` directly to choose the catalogue key. No `BillingMode string` field on `ModelStats`, no `local bool` field on `modelCoverage`. |
+| `store.go:1345` + `api/models.go:96-104` (`coverage`) | `StatsByModel` sets `ModelStats.PriceModel string` on each result row: `config.LocalPriceModel` when `billing_mode = 'local'`, else `s.Model` — computed in the store where `config` is importable, replacing the discarded billingMode scan at `:1345`. `api/models.go` folds this as `row.priceModel` (`models.go:66-80`); `coverage` substitutes `row.priceModel` for the catalogue look-up (`models.go:96-104`) — `api/models.go` never names a `config` constant (enforced by `TestAPIWebImportGuard` at `importguard_test.go:36`). `cli/models.go` reads `s.PriceModel` directly to choose the catalogue key. No `BillingMode string` field on `ModelStats`, no `local bool` field on `modelCoverage`. **Mixed-provider model (decision, v8, carried from round-4/5/7 non-gating notes):** when one model name has both local and cloud rows, the Models tab keeps them as separate entries keyed by (model, billing mode) — `StatsByModel` already groups that way (`store.go:1334-1335`) — so `priceModel` is never folded across modes. Bead 04 reads the fold at `models.go:66-80` first and re-keys it on both if it collapses by model alone. |
 
 **Local pricing rule (user decision): every local token is charged at DeepSeek's base, cheapest
 rate.** `internal/config` holds `LocalPriceModel = "deepseek-flash"` ($0.15 in / $0.60 out / $0.003
@@ -286,9 +286,15 @@ New: `internal/consumer/retry.go`, `internal/store/retry.go`, `internal/proxy/ta
 
 ### 5.4 Negative control (required)
 Each test above is run once with its fix reverted and must fail: abort test fails with
-`CaptureComplete == true`; `TestBillingModeInvariants` (extended for the `local` shape) fails when
-the explicit `local` case is removed from `routed()` and `consumer.go`'s routing (the local figure
-then appears in `cost_usd`); `TestRepriceRoutesLocalToApiEquivalent` fails when the substitution is
+`CaptureComplete == true`; `TestBillingModeInvariants` (extended for the `local` shape) is a *store-level* check: it calls
+`InsertEvent` directly, which does no cost routing, so on its own it cannot fail when a routing site
+is reverted. The routing sites each get their own named cost-column test instead: a consumer test
+that feeds a local-provider capture through `processCall` and asserts `CostUSD == nil` and
+`ApiEquivalentCostUSD != nil` (fails when the explicit `local` case is removed from `consumer.go`'s
+switch, the figure then landing in `cost_usd`), the same assertion for the tailer
+(`jsonlogs.go:487-492`) via a `LocalModelPrefixes` model, and `TestRepriceRoutesLocalToApiEquivalent`
+for `routed()`; the invariant test then pins the stored shape (a `local` row has `cost_usd` NULL and
+`api_equivalent_cost_usd` set) for rows built by those routing paths; `TestRepriceRoutesLocalToApiEquivalent` fails when the substitution is
 removed (it exercises `routed()` directly); `TestMergeKeepsLocalSticky` fails when the guarded reassignment is absent (proxy-source-wins condition removed); `TestMergeLocalModeMismatch` negative control: remove the identity override so JSONL `local` mode leaks through — the test fails on `BillingMode=="local"` (real account erased) or `cost_usd==nil` (real spend erased) depending on the order. For the incomplete/zero-usage proxy api case: remove the cost-alignment step — the test fails on a non-`"unpriced"` CostSource with nil cost (invariant mismatch). `TestMergeLocalAccountInvariant` negative control: remove the account invariant post-condition — account stays `Max` when mode is `local` (both-JSONL order); the quota-burn test sees the row. The unconditional-reassignment control (overrides usageObserved/completeness guards) applies to the two zero-usage and incomplete-capture tests (see §5.2 `TestMergeLocalZeroUsageTokensSurvive` and `TestMergeLocalIncompleteTokensSurvive`); the retry test fails with one attempt instead of
 four; `TestWriteGroupedLocalBucket` fails when the `local` bucket is absent from `writeGrouped` or when the nil-cost local row panics instead of falling to `unpriced`.
 
@@ -384,7 +390,7 @@ file holds one non-secret word. Local bodies are captured under the same redacti
 - `docs/context/security-and-permissions.md` — loopback-guarded routes two → three; credential-redirection note; toggle loopback-only consequence.
 - `docs/context/storage-schema.md` — `billing_mode` vocabulary gains `local`.
 - `docs/context/workflows.md` — flow 1 gains the abort path (`:52-55` currently describes `CaptureComplete` from the two buffer truncated bits alone; add the read-error path); flow 7 notes provider switch needs no restart.
-- `docs/context/build-and-run.md`, `cli-and-tooling.md` — three new config keys; store-error counters in `/api/health` (not `doctor`).
+- `docs/context/build-and-run.md`, `cli-and-tooling.md` — two new config keys (`LocalUpstreamURL`, `LocalModelPrefixes`); store-error counters in `/api/health` (not `doctor`).
 - `docs/context/storage-schema.md:118-128` — "computed from the two buffers' truncated bits alone … `proxy.go:107`" becomes false; update the definition and the line cite.
 - `docs/context/dashboard.md` — the header toggle and the local tile; update the `CaptureComplete=false` meaning at `:61`.
 - `docs/context/glossary.md` — `local`, `provider`; update `CaptureComplete=false` definition at `:45`.
@@ -392,6 +398,21 @@ file holds one non-secret word. Local bodies are captured under the same redacti
 - `docs/context/data-privacy-and-compliance.md:62-64` ("records whether what was stored is the whole thing or was narrowed … covers both bodies") and `:102-103` ("That flag is about the two *teed* bodies") — after this change the flag also reflects an upstream stream abort; update both to "see `sink.CapturedCall.CaptureComplete`" rather than restating the definition.
 
 ## Change History
+
+### v8 (post-convergence edit, not a review round)
+Applied by the author after the user accepted the converged v7, so no review round has read it. It
+fixes the loop's three unapplied round-7 MINOR findings and records one decision; nothing else moved.
+- **F7.1** — §5.4: `TestBillingModeInvariants` calls `InsertEvent`, which does no cost routing, so it
+  cannot fail on a reverted routing site; the consumer, tailer and `routed()` routing sites now each
+  have a named cost-column test, and the invariant test pins only the stored shape.
+- **F7.2** — §3.2: the merge path is `INSERT` first, then on a unique-constraint error a load and
+  `applyMergeTx`, all on one `tx` (`merge.go:115-134`), not "UPDATE before INSERT".
+- **F7.3** — §11: two new config keys, not three.
+- **R2a** — `clens purge --vacuum` exists; the claim is now "`serve` never runs a `VACUUM`".
+- **Decision (my recommendation, stated to the user alongside the converged-plan checkpoint; not separately confirmed)** — a model with both local and cloud rows stays two
+  entries keyed by (model, billing mode) in the Models tab (§3.4, `ModelStats.PriceModel` row).
+- Not applied, carried to beads: add `sink.go` and `doctor.go` to bead 04's file list; four small
+  tests (empty-stateDir no-I/O, `/api/provider` happy path, nil-seam 503, bad-value status code).
 
 ### v7 (round-6 triage)
 One JUSTIFIED finding plus three implementer-discretion clarifications from carried items.
