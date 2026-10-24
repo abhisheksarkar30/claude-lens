@@ -100,6 +100,9 @@ func newTailer(cfg *config.Config, root string, st collectorStore, recorder json
 	// the value the consumer path already permits. The column invariant 5 keys
 	// off is billing_mode, not account.
 	t.SetModelBilling(resolvedAPIPrefixes(cfg), firstAccount(cfg, "api").Name, "api")
+	// No shipped default, unlike the api list: unset means no transcript row is
+	// classified local.
+	t.SetLocalPrefixes(cfg.LocalModelPrefixes)
 	// The transcript collector's content columns are governed by the same
 	// --body-policy/--body-cap-bytes the proxy's are, and this is the one place
 	// both jsonl callers build a tailer, so `clens ingest`, `clens serve` and

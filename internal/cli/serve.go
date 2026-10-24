@@ -117,7 +117,13 @@ func Serve(args []string) error {
 	// nothing starts and the listener set is unchanged.
 	startPprof(cfg.PprofAddr)
 
-	proxySrv, err := proxy.NewServer(cfg, sk)
+	// The provider choice persists beside the database, which is a directory
+	// that exists by now: the store opened it.
+	targets, err := proxy.NewTargets(cfg, filepath.Dir(cfg.DBPath))
+	if err != nil {
+		return fmt.Errorf("serve: build provider targets: %w", err)
+	}
+	proxySrv, err := proxy.NewServer(cfg, sk, targets)
 	if err != nil {
 		return fmt.Errorf("serve: build proxy: %w", err)
 	}

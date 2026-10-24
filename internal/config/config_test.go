@@ -464,3 +464,67 @@ func TestValidateRejectsLocalAsAccountName(t *testing.T) {
 		t.Fatal("Validate accepted an account named after the reserved local account")
 	}
 }
+
+func TestValidateLocalUpstreamLoopback(t *testing.T) {
+	for _, tc := range []struct {
+		url         string
+		allowRemote bool
+		ok          bool
+	}{
+		{"http://localhost:1234", false, true},
+		{"http://localhost", false, true},
+		{"http://127.0.0.1:1234", false, true},
+		{"http://[::1]:1234", false, true},
+		{"http://192.168.0.185:1234", false, false},
+		{"http://192.168.0.185:1234", true, true},
+		{"http://192.168.0.185", false, false},
+		{"ftp://localhost:1234", false, false},
+		{"http://", false, false},
+	} {
+		c := Default()
+		c.LocalUpstreamURL, c.AllowRemote = tc.url, tc.allowRemote
+		err := c.Validate()
+		if (err == nil) != tc.ok {
+			t.Errorf("Validate(%q, AllowRemote=%v) = %v, want ok=%v", tc.url, tc.allowRemote, err, tc.ok)
+		}
+	}
+	if err := Default().Validate(); err != nil {
+		t.Errorf("an unset LocalUpstreamURL must validate: %v", err)
+	}
+}
+
+func TestLocalKeysParseFromFileEnvAndFlag(t *testing.T) {
+	dir := withHome(t)
+	clensDir := filepath.Join(dir, ".clens")
+	if err := os.MkdirAll(clensDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(clensDir, "config.toml"), []byte(
+		"LocalUpstreamURL = http://localhost:1234\nLocalModelPrefixes = qwen,llama\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(nil)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LocalUpstreamURL != "http://localhost:1234" {
+		t.Errorf("LocalUpstreamURL from file = %q", cfg.LocalUpstreamURL)
+	}
+	if got := cfg.LocalModelPrefixes; len(got) != 2 || got[0] != "qwen" || got[1] != "llama" {
+		t.Errorf("LocalModelPrefixes from file = %#v", got)
+	}
+
+	t.Setenv("CLENS_LOCAL_UPSTREAM_URL", "http://localhost:5678")
+	if cfg, err = Load(nil); err != nil || cfg.LocalUpstreamURL != "http://localhost:5678" {
+		t.Errorf("env should beat file: %q, %v", cfg.LocalUpstreamURL, err)
+	}
+	if cfg, err = Load([]string{"--local-upstream-url", "http://localhost:9"}); err != nil || cfg.LocalUpstreamURL != "http://localhost:9" {
+		t.Errorf("flag should beat env: %q, %v", cfg.LocalUpstreamURL, err)
+	}
+
+	c := Default()
+	c.LocalModelPrefixes = []string{"qwen", " "}
+	if err := c.Validate(); err == nil {
+		t.Error("Validate accepted a whitespace-only LocalModelPrefixes entry")
+	}
+}

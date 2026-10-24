@@ -106,3 +106,11 @@ Stamping the provider on the request at `Rewrite` time and carrying it through t
 - `internal/cli/ingest.go` (modify — `newTailer` calls `t.SetLocalPrefixes(cfg.LocalModelPrefixes)`)
 
 ## Review Notes
+
+Implemented. `go build ./...`, `go vet ./...` and `go test ./...` green; the TTFB gate is unchanged and green. `TestTargetsSwitchIsLiveAndTagged` passes under `-race`; negative control (Rewrite re-reading `Active()` instead of using the request's stamp) fails it with rows stamped for the wrong upstream.
+
+**Pre-flight (plan section 7), run against LM Studio at 192.168.0.185:1234 before any bead was written: all three passed.** (a) The response body carries a `msg_...` message id, so the cross-source dedup key exists and a local call merges into one row. (b) The stream carries usage frames in `message_start` and `message_delta`, the shape `parse.ExtractUsage` reads. (c) A Claude model id is accepted unchanged (200); the response `model` field reports the local model's own name, which is what `ModelResolved` keeps.
+
+Design notes. The provider is read once, in the handler, and carried on `captureState`; `Rewrite` resolves the upstream from that stamp rather than calling `Active()` again, so the serving upstream and the row's `Provider` cannot disagree. `Targets.Set` writes the temp file and renames it before moving the pointer, so a failed write leaves both unchanged. The state file is `<dir of DBPath>/provider`. `LocalUpstreamURL` is checked with `IsLoopbackHost(u.Hostname())` so a portless URL validates; the LAN LM Studio address needs `AllowRemote = true`, which also widens the listener checks, so an operator who wants only the local upstream remote has no narrower switch. Left as is: relaxing the rule is a spec change.
+
+Deferred to br-GI-25-06: the `dashAPI.SetProvider(...)` line in `serve.go` (its type does not exist yet) and `TestProviderEndpointRejectsNonLoopbackAndForeignOrigin` (needs the route). Tests added beyond the bead: `TestLocalKeysParseFromFileEnvAndFlag`, a reject-unknown-provider case, and a no-leftover-temp-file check.

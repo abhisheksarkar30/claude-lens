@@ -11,12 +11,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"strconv"
 	"time"
 
@@ -24,24 +22,37 @@ import (
 	"github.com/abhisheksarkar30/claude-lens/internal/sink"
 )
 
-// New builds the reverse proxy handler for cfg.UpstreamURL. Every request
-// and response is teed into sk — bodies capped at cfg.BodyCapBytes,
-// sensitive headers redacted — without ever delaying the client: the hot
-// path copies bytes and does nothing else. Any error on the capture side
-// is recorded on the submitted call and the response is returned
-// unmodified (invariant 6, fail open).
+// New builds the reverse proxy handler for cfg.UpstreamURL alone, with no
+// local provider and no persisted provider choice. See NewWithTargets.
 func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
-	target, err := url.Parse(cfg.UpstreamURL)
+	t, err := NewTargets(cfg, "")
 	if err != nil {
-		return nil, fmt.Errorf("proxy: invalid upstream URL %q: %w", cfg.UpstreamURL, err)
+		return nil, err
 	}
+	return NewWithTargets(cfg, sk, t)
+}
 
+// NewWithTargets builds the reverse proxy handler for whichever upstream t
+// names as active. Every request and response is teed into sk — bodies
+// capped at cfg.BodyCapBytes, sensitive headers redacted — without ever
+// delaying the client: the hot path copies bytes and does nothing else. Any
+// error on the capture side is recorded on the submitted call and the
+// response is returned unmodified (invariant 6, fail open).
+func NewWithTargets(cfg *config.Config, sk *sink.Sink, t *Targets) (http.Handler, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConnsPerHost = 100
 
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.SetURL(target)
+			// The provider was read once, in the handler, and rides on the
+			// capture state: the upstream that serves the request and the
+			// provider stamped on its row cannot disagree, whatever Set does
+			// in between.
+			which := t.Active()
+			if st, ok := pr.In.Context().Value(stateKey{}).(*captureState); ok {
+				which = st.provider
+			}
+			pr.SetURL(t.resolve(which))
 		},
 		Transport: transport,
 		// The stdlib logs "read error during body copy" here for an upstream
@@ -143,6 +154,7 @@ func New(cfg *config.Config, sk *sink.Sink) (http.Handler, error) {
 			authKind:   authKind,
 			reqHeaders: redactHeaders(r.Header),
 			sk:         sk,
+			provider:   t.Active(),
 		}
 		if captureBodies {
 			reqBuf := newBoundedBuffer(bodyCap)
@@ -184,12 +196,12 @@ func WithReplay(r *http.Request, meta ReplayMeta) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), replayKey{}, meta))
 }
 
-// NewServer builds the http.Server that fronts New's handler, with the
-// timeouts the hot path requires: a bounded ReadHeaderTimeout, no
+// NewServer builds the http.Server that fronts NewWithTargets' handler, with
+// the timeouts the hot path requires: a bounded ReadHeaderTimeout, no
 // WriteTimeout (a streaming response can legitimately run for minutes), and
 // an IdleTimeout to reclaim idle keep-alive connections.
-func NewServer(cfg *config.Config, sk *sink.Sink) (*http.Server, error) {
-	h, err := New(cfg, sk)
+func NewServer(cfg *config.Config, sk *sink.Sink, t *Targets) (*http.Server, error) {
+	h, err := NewWithTargets(cfg, sk, t)
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +228,9 @@ type captureState struct {
 	reqHeaders http.Header
 	reqBody    *boundedBuffer
 	sk         *sink.Sink
+
+	// provider is the Targets.Active value this request was routed by.
+	provider string
 
 	noCapture bool
 
@@ -261,6 +276,7 @@ func (st *captureState) submit(status int, respHeaders http.Header, respBody []b
 		ReplayOf:        st.replayOf,
 		ReplayEdits:     st.replayEdits,
 		RequestIDHeader: requestIDHeader(respHeaders),
+		Provider:        st.provider,
 		Err:             callErr,
 	}
 	if !st.sk.Submit(call) {

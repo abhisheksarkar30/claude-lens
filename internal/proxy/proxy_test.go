@@ -1030,3 +1030,86 @@ func TestCancelledClientIsNotAnAbort(t *testing.T) {
 		t.Errorf("CaptureComplete=%v Err=%v, want true and nil for a client cancel", call.CaptureComplete, call.Err)
 	}
 }
+
+// A switch lands on the next request, never mid-request: every captured row
+// carries the provider of the upstream that actually answered it, even while
+// Set flips the target underneath concurrent traffic. Run with -race.
+func TestTargetsSwitchIsLiveAndTagged(t *testing.T) {
+	upstreamNamed := func(name string) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(time.Millisecond) // widen the window a racing Set can land in
+			io.WriteString(w, name)
+		}))
+	}
+	cloud, local := upstreamNamed("cloud"), upstreamNamed("local")
+	defer cloud.Close()
+	defer local.Close()
+
+	cfg := testConfig(cloud.URL)
+	cfg.LocalUpstreamURL = local.URL
+	targets, err := NewTargets(cfg, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 200
+	sk := sink.New(2 * n)
+	h, err := NewWithTargets(cfg, sk, targets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := proxyServer(t, h)
+
+	stop := make(chan struct{})
+	flipped := make(chan struct{})
+	go func() {
+		defer close(flipped)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if i%2 == 0 {
+				targets.Set("local")
+			} else {
+				targets.Set("cloud")
+			}
+		}
+	}()
+
+	var mu sync.Mutex
+	served := map[string]string{} // path -> body of the upstream that answered
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			path := fmt.Sprintf("/req/%d", i)
+			resp, err := http.Get(srv.URL + path)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			defer resp.Body.Close()
+			b, _ := io.ReadAll(resp.Body)
+			mu.Lock()
+			served[path] = string(b)
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+	close(stop)
+	<-flipped
+
+	seen := map[string]bool{}
+	for i := 0; i < n; i++ {
+		call := captureOne(t, sk)
+		if want := served[call.Path]; call.Provider != want {
+			t.Errorf("%s: stamped provider %q, but the %q upstream answered", call.Path, call.Provider, want)
+		}
+		seen[call.Provider] = true
+	}
+	if !seen["cloud"] || !seen["local"] {
+		t.Errorf("only saw providers %v: the switch never took effect live", seen)
+	}
+}
