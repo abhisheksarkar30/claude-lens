@@ -34,8 +34,8 @@ type CapturedCall struct {
 	AuthKind string
 
 	// Provider names the upstream target that served the call: "local" for
-	// the operator's own model server, "" for the default cloud upstream. The
-	// proxy stamps it from the active target; the consumer reads it to bill
+	// the operator's own model server, "cloud" for the default cloud upstream.
+	// The proxy stamps it from the active target; the consumer reads it to bill
 	// the call as a projection instead of real spend.
 	Provider string
 
