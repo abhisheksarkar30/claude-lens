@@ -15,6 +15,25 @@ import (
 	"time"
 )
 
+// The local provider (a model served on the operator's own machine) is a
+// third billing lineage. Its traffic is never billed: every figure on a local
+// row is a projection, written to api_equivalent_cost_usd and kept out of
+// quota burn and out of every real-cost sum.
+const (
+	BillingLocal = "local"
+	// LocalAccount is the fixed account every local row carries. Validate
+	// reserves the name so a configured account can never collide with it.
+	LocalAccount = "local"
+	// LocalPriceModel is the shipped price row every local token is projected
+	// against: DeepSeek's cheapest model, the baseline the operator chose.
+	LocalPriceModel = "deepseek-flash"
+)
+
+// LocalPriceAt is the instant local rows are priced at, whatever their real
+// time: a Saturday, so the peak multiplier (a cloud demand concept) never
+// applies to a model running locally.
+var LocalPriceAt = time.Date(2026, time.October, 24, 12, 0, 0, 0, time.UTC)
+
 // Account is one configured account clens can attribute captured traffic to.
 // A user holding both a Claude subscription and a separate API key for the
 // same underlying account is two Accounts, one per BillingMode — never one
@@ -392,6 +411,11 @@ func (c *Config) Validate() error {
 	for _, p := range c.ApiModelPrefixes {
 		if strings.TrimSpace(p) == "" {
 			return fmt.Errorf("config: validate: ApiModelPrefixes: empty or whitespace-only prefix")
+		}
+	}
+	for _, a := range c.Accounts {
+		if a.Name == LocalAccount {
+			return fmt.Errorf("config: validate: Accounts: account name %q is reserved for local-provider traffic", LocalAccount)
 		}
 	}
 	if c.PprofAddr != "" {

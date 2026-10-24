@@ -83,8 +83,26 @@ func humanCost(c *float64) string {
 // together: an api dollar and a subscription api-equivalent dollar are
 // different units (invariant 5), and the `unpriced` column below says how
 // much of the row the figures do not cover.
-func costCell(api, sub *float64) string {
-	return fmt.Sprintf("api %s  sub %s", humanCost(api), humanCost(sub))
+//
+// local is a third unit, a projection of what a locally served call would have
+// cost at a cloud price, and appears only when there is one, so output for an
+// install with no local traffic is unchanged.
+func costCell(api, sub, local *float64) string {
+	cell := fmt.Sprintf("api %s  sub %s", humanCost(api), humanCost(sub))
+	if local != nil {
+		cell += fmt.Sprintf("  local (proj) %s", humanCost(local))
+	}
+	return cell
+}
+
+// rowCosts splits one row's figures into costCell's three units. A local row's
+// api-equivalent column holds a projection, not a subscription figure, so it
+// must be labelled local, not sub.
+func rowCosts(ev *store.EventSummary) (api, sub, local *float64) {
+	if ev.BillingMode == config.BillingLocal {
+		return ev.CostUSD, nil, ev.ApiEquivalentCostUSD
+	}
+	return ev.CostUSD, ev.ApiEquivalentCostUSD, nil
 }
 
 // costNote qualifies a cost figure with why it is what it is, for the sources

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
@@ -150,5 +151,54 @@ func TestModelsRendersNoCostColumn(t *testing.T) {
 	}
 	if !sawUnpriced {
 		t.Fatal("the unpriced model is missing from the raw response")
+	}
+}
+
+// A local model is covered by the row it is projected against, not by its own
+// name, so an unknown local model still reads as priced.
+func TestModelsCoverageShowsLocalPriced(t *testing.T) {
+	table := pricing.ShippedTable()
+	row := modelCoverage{Model: "qwen3.6-35b-a3b-mlx", PriceModel: "deepseek-flash", Requests: 1, PricedCount: 1}
+	if got, _ := coverage(table, row); got != pricingPriced {
+		t.Errorf("local model coverage = %q, want %q", got, pricingPriced)
+	}
+	row.PriceModel = ""
+	if got, _ := coverage(table, row); got != pricingUnpriced {
+		t.Errorf("same model without the substitution = %q, want %q", got, pricingUnpriced)
+	}
+}
+
+// One model name seen both locally and in the cloud is two entries: each is
+// priced against its own row. Folded together they would be priced against
+// whichever row the iteration happened to reach last.
+func TestModelsEndpointKeepsLocalAndCloudRowsSeparate(t *testing.T) {
+	st := newTestStore(t)
+	seedEvent(t, st, nil) // cloud claude-sonnet-5
+	seedEvent(t, st, func(e *store.Event) { // the same name, served locally
+		e.BillingMode, e.Account = "local", "local"
+		e.CostUSD = nil
+		api := 0.001
+		e.ApiEquivalentCostUSD = &api
+	})
+	handler, _, _, _ := newTestAPI(t, st)
+
+	got := decodeJSON[modelsResponse](t, getOK(t, handler, "/api/models").Body)
+	var entries []modelCoverage
+	for _, m := range got.Models {
+		if m.Model == "claude-sonnet-5" {
+			entries = append(entries, m)
+		}
+	}
+	if len(entries) != 2 {
+		t.Fatalf("claude-sonnet-5 has %d entries, want 2 (cloud and local): %+v", len(entries), entries)
+	}
+	// Sorted by price model: "" (itself) first, then the substitute.
+	if entries[0].PriceModel != "" || entries[1].PriceModel != "deepseek-flash" {
+		t.Errorf("price models = %q, %q, want \"\" then deepseek-flash", entries[0].PriceModel, entries[1].PriceModel)
+	}
+	for _, e := range entries {
+		if e.Requests != 1 {
+			t.Errorf("entry %+v folded the other mode's request in", e)
+		}
 	}
 }

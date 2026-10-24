@@ -1084,3 +1084,42 @@ func TestConsumerAbortedCallWarnings(t *testing.T) {
 		})
 	}
 }
+
+// A call served by the local provider is a projection: priced as the
+// cheapest DeepSeek model at an off-peak instant (so a peak-hour timestamp
+// and an unknown local model name change nothing), written to the
+// api-equivalent column, under the fixed local account, with no peak warning.
+func TestLocalRowIsPricedAsDeepseekFlashBase(t *testing.T) {
+	table := pricing.ShippedTable()
+	c := New(sink.New(1), nil, []config.Account{{Name: "Pro", BillingMode: "subscription", Plan: "pro"}})
+	c.SetPriceTable(table)
+	c.SetAnalyzers(analyze.Engine{})
+
+	call := basicCall("req-local")
+	call.Provider = config.BillingLocal
+	call.AuthKind = "oauth" // a subscription credential must not claim the row
+	call.ReqBody = []byte(`{"model":"qwen3.6-35b-a3b-mlx","messages":[]}`)
+	call.RespBody = nonStreamBody("qwen3.6-35b-a3b-mlx", 1_000_000, 1_000_000)
+	// Monday 02:00 UTC is inside deepseek-flash's peak window.
+	call.StartedAt = time.Date(2026, time.October, 26, 2, 0, 0, 0, time.UTC)
+
+	ev := c.processCall(call).ev
+	pe := c.processCall(call)
+
+	if ev.BillingMode != config.BillingLocal || ev.Account != config.LocalAccount {
+		t.Errorf("mode/account = %q/%q, want local/local", ev.BillingMode, ev.Account)
+	}
+	if ev.ModelResolved != "qwen3.6-35b-a3b-mlx" {
+		t.Errorf("ModelResolved = %q, the real local model name must be kept", ev.ModelResolved)
+	}
+	if ev.CostUSD != nil || ev.ApiEquivalentCostUSD == nil {
+		t.Fatalf("cost routed wrong: cost_usd=%v api_equivalent=%v", ev.CostUSD, ev.ApiEquivalentCostUSD)
+	}
+	want, source := table.Compute(config.LocalPriceModel, parse.Usage{InputTokens: 1_000_000, OutputTokens: 1_000_000}, "", "", config.LocalPriceAt)
+	if source == "unpriced" || want == nil || *ev.ApiEquivalentCostUSD != *want {
+		t.Errorf("projected cost = %v (source %q), want deepseek-flash off-peak %v", *ev.ApiEquivalentCostUSD, ev.CostSource, want)
+	}
+	if hasWarningKind(pe.warnings, "peak_pricing") {
+		t.Error("a local row carries a peak_pricing warning")
+	}
+}

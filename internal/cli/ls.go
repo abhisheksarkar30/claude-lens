@@ -92,7 +92,7 @@ func runLs(args []string, w io.Writer) error {
 			humanTokens(ev.InputTokens),
 			humanTokens(ev.OutputTokens),
 			humanTokens(ev.CacheReadTokens),
-			costCell(ev.CostUSD, ev.ApiEquivalentCostUSD) + costNote(ev.CostSource),
+			costCell(rowCosts(ev)) + costNote(ev.CostSource),
 			warnCount(len(warnings)),
 		})
 	}

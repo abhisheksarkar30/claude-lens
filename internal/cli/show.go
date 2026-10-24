@@ -69,7 +69,7 @@ func runShow(args []string, w io.Writer) error {
 		{"service", displayOrDash(ev.ServiceTier)},
 		{"speed", displayOrDash(ev.Speed)},
 		{"tokens", tokenLine(&ev.EventSummary)},
-		{"cost", costCell(ev.CostUSD, ev.ApiEquivalentCostUSD) + costNote(ev.CostSource)},
+		{"cost", costCell(rowCosts(&ev.EventSummary)) + costNote(ev.CostSource)},
 	}
 	if ev.ReplayOf != "" {
 		kv = append(kv, [2]string{"replay-of", ev.ReplayOf})

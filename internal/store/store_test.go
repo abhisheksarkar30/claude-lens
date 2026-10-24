@@ -248,6 +248,21 @@ func TestBillingModeInvariants(t *testing.T) {
 			wantApiNil:  true,
 		},
 		{
+			// A projection: stored in the api-equivalent column, never in
+			// cost_usd. InsertEvent does no routing, so this pins the shape.
+			name: "local priced",
+			ev: func() *Event {
+				e := fullEvent("req-local-priced")
+				e.BillingMode, e.Account = "local", "local"
+				e.CostUSD = nil
+				e.ApiEquivalentCostUSD = f64(0.10)
+				e.CostSource = "shipped"
+				return e
+			}(),
+			wantCostNil: true,
+			wantApiNil:  false,
+		},
+		{
 			name: "subscription unpriced",
 			ev: func() *Event {
 				e := fullEvent("req-sub-unpriced")

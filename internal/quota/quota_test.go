@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
 )
 
@@ -195,5 +196,61 @@ func TestProjectUnconfiguredReportsUnconfiguredNotZeroPercent(t *testing.T) {
 	}
 	if p.UtilizationPct != 0 {
 		t.Errorf("UtilizationPct = %v, want 0 -- but callers must check Configured, never read this as a real percentage", p.UtilizationPct)
+	}
+}
+
+// Local rows burn no subscription quota. Burn is keyed by account name alone,
+// so the guarantee rests on a local row (and a merged one) never carrying a
+// subscription account.
+func TestLocalRowsAreAbsentFromQuotaBurn(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	at := now.Add(-time.Hour)
+	burnFor := func(t *testing.T, st *store.Store) Burn {
+		t.Helper()
+		b, err := ComputeBurn(context.Background(), st, "Max", "", Window5h, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	localRow := func(id, source string) *store.Event {
+		return &store.Event{EventSummary: store.EventSummary{
+			RequestID: id, Source: source, FirstSource: source, StartedAt: at,
+			Account: config.LocalAccount, BillingMode: config.BillingLocal,
+			ModelResolved: "qwen", InputTokens: 1000, CaptureComplete: true}}
+	}
+	subRow := func(id, source string) *store.Event {
+		ev := localRow(id, source)
+		ev.Account, ev.BillingMode = "Max", "subscription"
+		return ev
+	}
+
+	t.Run("a local row", func(t *testing.T) {
+		st := newTestStore(t)
+		insertEvent(t, st, "real", "Max", "claude-sonnet-5", at, 100)
+		if _, _, err := st.InsertEvent(context.Background(), localRow("local", "proxy")); err != nil {
+			t.Fatal(err)
+		}
+		if b := burnFor(t, st); b.Tokens != 100 || b.Requests != 1 {
+			t.Errorf("burn = %d tokens / %d requests, want only the real 100 / 1", b.Tokens, b.Requests)
+		}
+	})
+	// The same call seen by the proxy (local) and by the transcript, which
+	// guesses subscription: the merged row must stay local in both orders.
+	for name, order := range map[string][2]*store.Event{
+		"merged, proxy first": {localRow("m1", "proxy"), subRow("m1", "jsonl")},
+		"merged, jsonl first": {subRow("m2", "jsonl"), localRow("m2", "proxy")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := newTestStore(t)
+			for _, ev := range order {
+				if _, _, err := st.InsertEvent(context.Background(), ev); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if b := burnFor(t, st); b.Tokens != 0 || b.Requests != 0 {
+				t.Errorf("a merged local row burned Max quota: %d tokens / %d requests", b.Tokens, b.Requests)
+			}
+		})
 	}
 }

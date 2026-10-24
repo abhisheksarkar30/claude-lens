@@ -26,6 +26,11 @@ const modelSourceObserved = "observed"
 type modelCoverage struct {
 	Model       string `json:"model"`
 	DisplayName string `json:"display_name,omitempty"`
+	// PriceModel is the rate row this entry is priced from when that is not
+	// the model itself: a locally served model is projected at a fixed cloud
+	// price, so it is covered by that row, not by its own name. Empty when the
+	// model prices as itself.
+	PriceModel string `json:"price_model,omitempty"`
 	// Source is where the model itself came from: "live" or "shipped" from
 	// the catalogue, "observed" for one only ever seen in traffic.
 	Source string `json:"source"`
@@ -59,24 +64,35 @@ func (a *api) models(w http.ResponseWriter, r *http.Request) {
 	}
 
 	table := a.priceTable()
-	byModel := make(map[string]modelCoverage, len(observed))
+	// Keyed by (model, price model): a model served both locally and from the
+	// cloud arrives as two rows with different price models, and folding them
+	// into one entry would price the pair against whichever row came last.
+	byModel := make(map[[2]string]modelCoverage, len(observed))
 	for _, e := range catalog.ShippedCatalog() {
-		byModel[e.ModelID] = modelCoverage{Model: e.ModelID, DisplayName: e.DisplayName, Source: e.Source}
+		byModel[[2]string{e.ModelID, e.ModelID}] = modelCoverage{Model: e.ModelID, DisplayName: e.DisplayName, Source: e.Source}
 	}
 	for _, s := range observed {
 		// StatsByModel carries one row per (model, billing_mode) -- invariant
 		// 5's split -- and they are folded here on purpose: coverage is a
 		// property of the model, and this route renders no cost column at
 		// all, so there are no two billing figures to mix.
-		row := byModel[s.Model]
+		priceModel := s.PriceModel
+		if priceModel == "" {
+			priceModel = s.Model
+		}
+		key := [2]string{s.Model, priceModel}
+		row := byModel[key]
 		row.Model = s.Model
+		if priceModel != s.Model {
+			row.PriceModel = priceModel
+		}
 		if row.Source == "" {
 			row.Source = modelSourceObserved
 		}
 		row.Requests += s.RequestCount
 		row.PricedCount += s.PricedCount
 		row.UnpricedCount += s.UnpricedCount
-		byModel[s.Model] = row
+		byModel[key] = row
 	}
 
 	models := make([]modelCoverage, 0, len(byModel))
@@ -84,7 +100,12 @@ func (a *api) models(w http.ResponseWriter, r *http.Request) {
 		row.Pricing, row.RateSource = coverage(table, row)
 		models = append(models, row)
 	}
-	sort.Slice(models, func(i, j int) bool { return models[i].Model < models[j].Model })
+	sort.Slice(models, func(i, j int) bool {
+		if models[i].Model != models[j].Model {
+			return models[i].Model < models[j].Model
+		}
+		return models[i].PriceModel < models[j].PriceModel
+	})
 	writeJSON(w, http.StatusOK, modelsResponse{Models: models})
 }
 
@@ -94,7 +115,11 @@ func (a *api) models(w http.ResponseWriter, r *http.Request) {
 // itself marks as not fully verified is a different answer from one it
 // shipped, and the dashboard has room to say so.
 func coverage(table pricing.Table, row modelCoverage) (string, string) {
-	rate, ok := table[row.Model]
+	priced := row.Model
+	if row.PriceModel != "" {
+		priced = row.PriceModel
+	}
+	rate, ok := table[priced]
 	if !ok || row.UnpricedCount > 0 {
 		return pricingUnpriced, ""
 	}

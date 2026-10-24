@@ -410,12 +410,24 @@ func (c *Consumer) processCall(call *sink.CapturedCall) *pendingEvent {
 	account, billingMode := c.resolveAccountNow(call.AuthKind)
 	ev.Account = account
 	ev.BillingMode = billingMode
+	if call.Provider == config.BillingLocal {
+		// Whatever credential the client sent, a call served locally is never
+		// billed to it: it is a projection under the fixed local account.
+		ev.Account = config.LocalAccount
+		ev.BillingMode = config.BillingLocal
+	}
 
 	if c.pricer != nil {
-		usd, costSource := c.pricer.Compute(ev.ModelResolved, usage, usage.Speed, ev.ServiceTier, call.StartedAt)
+		// A local call is priced as the cheapest DeepSeek model at an
+		// off-peak instant; ev.ModelResolved keeps the real local model name.
+		priceModel, priceAt := ev.ModelResolved, call.StartedAt
+		if ev.BillingMode == config.BillingLocal {
+			priceModel, priceAt = config.LocalPriceModel, config.LocalPriceAt
+		}
+		usd, costSource := c.pricer.Compute(priceModel, usage, usage.Speed, ev.ServiceTier, priceAt)
 		ev.CostSource = costSource
 		switch ev.BillingMode {
-		case "subscription":
+		case "subscription", config.BillingLocal:
 			ev.ApiEquivalentCostUSD = usd
 		default:
 			ev.CostUSD = usd
@@ -432,8 +444,11 @@ func (c *Consumer) processCall(call *sink.CapturedCall) *pendingEvent {
 		})
 	}
 	warnings = append(warnings, c.runAnalyzers(meta, usage, ev)...)
-	if w, ok := peakWarning(c.pricer, ev, call.StartedAt); ok {
-		warnings = append(warnings, w)
+	// A local row was never billed at a cloud peak rate.
+	if ev.BillingMode != config.BillingLocal {
+		if w, ok := peakWarning(c.pricer, ev, call.StartedAt); ok {
+			warnings = append(warnings, w)
+		}
 	}
 
 	return &pendingEvent{ev: ev, warnings: warnings}

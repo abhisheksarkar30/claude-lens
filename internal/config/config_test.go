@@ -456,3 +456,11 @@ func TestValidateHotDays(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateRejectsLocalAsAccountName(t *testing.T) {
+	c := Default()
+	c.Accounts = []Account{{Name: LocalAccount, BillingMode: "api"}}
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate accepted an account named after the reserved local account")
+	}
+}

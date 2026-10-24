@@ -33,6 +33,12 @@ type CapturedCall struct {
 	// the credential's value.
 	AuthKind string
 
+	// Provider names the upstream target that served the call: "local" for
+	// the operator's own model server, "" for the default cloud upstream. The
+	// proxy stamps it from the active target; the consumer reads it to bill
+	// the call as a projection instead of real spend.
+	Provider string
+
 	ReqHeaders  http.Header // already redacted by the caller
 	RespHeaders http.Header // already redacted by the caller
 	ReqBody     []byte      // body policy already applied by the caller

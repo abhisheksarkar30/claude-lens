@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/abhisheksarkar30/claude-lens/internal/store"
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 )
 
 // Stats is `clens stats`: window totals, a per-model split, and --by another
@@ -86,7 +87,7 @@ func runStats(args []string, w io.Writer) error {
 		ThinkingTokens:     summary.ThinkingTokens,
 		TotalPromptTokens:  summary.TotalPromptTokens,
 	}))
-	fmt.Fprintf(w, "cost:     %s\n", costCell(summary.TotalCostUSD, summary.TotalApiEquivalentCostUSD))
+	fmt.Fprintf(w, "cost:     %s\n", costCell(summary.TotalCostUSD, summary.TotalApiEquivalentCostUSD, summary.TotalLocalProjectedCostUSD))
 	fmt.Fprintf(w, "priced:   %d priced, %d unpriced\n", summary.PricedCount, summary.UnpricedCount)
 
 	switch by {
@@ -109,7 +110,7 @@ func runStats(args []string, w io.Writer) error {
 				strconv.Itoa(p.RequestCount),
 				humanTokens(p.TotalPromptTokens),
 				humanTokens(p.OutputTokens),
-				costCell(p.TotalCostUSD, p.TotalApiEquivalentCostUSD),
+				costCell(p.TotalCostUSD, p.TotalApiEquivalentCostUSD, p.TotalLocalProjectedCostUSD),
 				warnCount(p.UnpricedCount),
 			})
 		}
@@ -137,7 +138,7 @@ func writeByModel(w io.Writer, st *store.Store, ctx context.Context, filter stor
 			strconv.Itoa(m.RequestCount),
 			humanTokens(m.TotalPromptTokens),
 			humanTokens(m.OutputTokens),
-			costCell(m.TotalCostUSD, m.TotalApiEquivalentCostUSD),
+			costCell(m.TotalCostUSD, m.TotalApiEquivalentCostUSD, m.TotalLocalProjectedCostUSD),
 			warnCount(m.UnpricedCount),
 		})
 	}
@@ -165,14 +166,16 @@ func writeGrouped(w io.Writer, st *store.Store, ctx context.Context, filter stor
 	}
 
 	type group struct {
-		requests int
-		prompt   int
-		out      int
-		apiCost  float64
-		subCost  float64
-		hasAPI   bool
-		hasSub   bool
-		unpriced int
+		requests  int
+		prompt    int
+		out       int
+		apiCost   float64
+		subCost   float64
+		hasAPI    bool
+		hasSub    bool
+		localCost float64
+		hasLocal  bool
+		unpriced  int
 	}
 	groups := map[string]*group{}
 	for _, ev := range events {
@@ -195,6 +198,11 @@ func writeGrouped(w io.Writer, st *store.Store, ctx context.Context, filter stor
 		case ev.CostUSD != nil:
 			g.apiCost += *ev.CostUSD
 			g.hasAPI = true
+		// Before the subscription case: a local row also carries a non-nil
+		// api-equivalent figure and would otherwise be summed as sub.
+		case ev.BillingMode == config.BillingLocal && ev.ApiEquivalentCostUSD != nil:
+			g.localCost += *ev.ApiEquivalentCostUSD
+			g.hasLocal = true
 		case ev.ApiEquivalentCostUSD != nil:
 			g.subCost += *ev.ApiEquivalentCostUSD
 			g.hasSub = true
@@ -213,7 +221,11 @@ func writeGrouped(w io.Writer, st *store.Store, ctx context.Context, filter stor
 	rows := make([][]string, 0, len(keys))
 	for _, k := range keys {
 		g := groups[k]
-		var api, sub *float64
+		var api, sub, local *float64
+		if g.hasLocal {
+			v := g.localCost
+			local = &v
+		}
 		if g.hasAPI {
 			v := g.apiCost
 			api = &v
@@ -227,7 +239,7 @@ func writeGrouped(w io.Writer, st *store.Store, ctx context.Context, filter stor
 			strconv.Itoa(g.requests),
 			humanTokens(g.prompt),
 			humanTokens(g.out),
-			costCell(api, sub),
+			costCell(api, sub, local),
 			warnCount(g.unpriced),
 		})
 	}

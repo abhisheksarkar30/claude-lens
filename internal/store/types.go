@@ -221,11 +221,18 @@ type StatsSummary struct {
 
 	TotalCostUSD              *float64
 	TotalApiEquivalentCostUSD *float64
+	// TotalLocalProjectedCostUSD is the projected cost of local-provider rows.
+	// It is a third aggregate and is never added to either of the two above.
+	TotalLocalProjectedCostUSD *float64
 }
 
 // ModelStats is one StatsByModel row.
 type ModelStats struct {
 	Model string
+	// PriceModel is the shipped row this model's cost is computed from: Model
+	// itself, except for local rows, which are priced as config.LocalPriceModel.
+	// It differing from Model is the only local signal the coverage view needs.
+	PriceModel string
 	StatsSummary
 }
 

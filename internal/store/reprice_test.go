@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 )
 
@@ -474,5 +475,86 @@ func TestRepriceCostsErrorsOnAClosedStore(t *testing.T) {
 	}
 	if got.CostUSD == nil || *got.CostUSD != 0 {
 		t.Errorf("CostUSD = %v, want the stored 0: a failed reprice must leave nothing behind", got.CostUSD)
+	}
+}
+
+// A local row is priced as config.LocalPriceModel whatever its own model is
+// called, and its figure lands in the api-equivalent column. Without both, a
+// reprice would send a projection into cost_usd or price it as unknown.
+func TestRepriceRoutesLocalToApiEquivalent(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+
+	ev := repriceRow("req-reprice-local")
+	ev.ModelRequested, ev.ModelResolved = "qwen3.6-35b-a3b-mlx", "qwen3.6-35b-a3b-mlx"
+	ev.BillingMode, ev.Account = config.BillingLocal, config.LocalAccount
+	ev.CostUSD = nil
+	ev.ApiEquivalentCostUSD = f64(0)
+	id, _, err := st.InsertEvent(ctx, ev)
+	if err != nil {
+		t.Fatalf("InsertEvent: %v", err)
+	}
+
+	// The table knows only the substitute model, not the local one.
+	if _, err := st.RepriceCosts(ctx, repriceTable(config.LocalPriceModel, "shipped"), "", false); err != nil {
+		t.Fatalf("RepriceCosts: %v", err)
+	}
+
+	got, err := st.GetEvent(ctx, id)
+	if err != nil {
+		t.Fatalf("GetEvent: %v", err)
+	}
+	if got.ApiEquivalentCostUSD == nil || *got.ApiEquivalentCostUSD != 0.006 {
+		t.Errorf("ApiEquivalentCostUSD = %v, want the exact 0.006", got.ApiEquivalentCostUSD)
+	}
+	if got.CostUSD != nil {
+		t.Errorf("CostUSD = %v, want nil: a projection never lands in the real-cost column", *got.CostUSD)
+	}
+}
+
+// The three cost sums are separate lineages: a local row is counted only in
+// the local aggregate, never in api or subscription, and never the reverse.
+func TestLocalSumIsNeverMergedIntoApiOrSub(t *testing.T) {
+	st := newTestStore(t)
+	ctx := context.Background()
+	for _, ev := range []*Event{
+		mergeSide("r-api", "proxy", "api", "payg", 1.0),
+		mergeSide("r-sub", "proxy", "subscription", "Max", 10.0),
+		mergeSide("r-local", "proxy", config.BillingLocal, config.LocalAccount, 100.0),
+	} {
+		ev.SessionID = ""
+		if _, _, err := st.InsertEvent(ctx, ev); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sum, err := st.StatsSummary(ctx, EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, c := range map[string]struct {
+		got  *float64
+		want float64
+	}{
+		"api":          {sum.TotalCostUSD, 1.0},
+		"subscription": {sum.TotalApiEquivalentCostUSD, 10.0},
+		"local":        {sum.TotalLocalProjectedCostUSD, 100.0},
+	} {
+		if c.got == nil || *c.got != c.want {
+			t.Errorf("%s sum = %v, want %v", name, c.got, c.want)
+		}
+	}
+
+	byModel, err := st.StatsByModel(ctx, EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range byModel {
+		if m.TotalLocalProjectedCostUSD != nil && m.PriceModel != config.LocalPriceModel {
+			t.Errorf("model %q row has a local sum but PriceModel %q", m.Model, m.PriceModel)
+		}
+		if m.TotalLocalProjectedCostUSD == nil && m.PriceModel != m.Model {
+			t.Errorf("non-local row %q has PriceModel %q", m.Model, m.PriceModel)
+		}
 	}
 }

@@ -908,3 +908,58 @@ func TestShowBodyDecodesResponse(t *testing.T) {
 		t.Errorf("show --body did not print the truncation marker:\n%s", buf.String())
 	}
 }
+
+func localRow(requestID string, projected float64) *store.Event {
+	ev := subRow(requestID, projected)
+	ev.BillingMode, ev.Account = config.BillingLocal, config.LocalAccount
+	return ev
+}
+
+// A local row's projection gets its own column and is never folded into sub,
+// even though it sits in the same api-equivalent column. A local row that is
+// unpriced falls through to the unpriced count instead of being miscounted.
+func TestWriteGroupedLocalBucket(t *testing.T) {
+	home := withHome(t)
+	st := openTestStore(t, home)
+
+	seedEvent(t, st, withSession(subRow("req_sub", 9.5), "sess_mixed"))
+	seedEvent(t, st, withSession(localRow("req_local", 3.25), "sess_mixed"))
+	unpriced := localRow("req_local_unpriced", 0)
+	unpriced.ApiEquivalentCostUSD = nil
+	unpriced.CostSource = "unpriced"
+	seedEvent(t, st, withSession(unpriced, "sess_mixed"))
+
+	var buf bytes.Buffer
+	if err := runStats([]string{"--by", "session"}, &buf); err != nil {
+		t.Fatalf("runStats: %v\noutput:\n%s", err, buf.String())
+	}
+	out := buf.String()
+	if !strings.Contains(out, "sub $9.5000") || !strings.Contains(out, "local (proj) $3.2500") {
+		t.Errorf("grouped stats missing the separate sub and local figures:\n%s", out)
+	}
+	if strings.Contains(out, "$12.7500") {
+		t.Errorf("grouped stats added a local projection to sub:\n%s", out)
+	}
+	if !strings.Contains(out, "1 unpriced") {
+		t.Errorf("the unpriced local row was not counted as unpriced:\n%s", out)
+	}
+}
+
+func TestCostCellLocalLabel(t *testing.T) {
+	x := 1.5
+	if got := costCell(nil, nil, &x); !strings.Contains(got, "local (proj) $1.5000") {
+		t.Errorf("costCell with a local figure = %q", got)
+	}
+	if got := costCell(&x, nil, nil); strings.Contains(got, "local") {
+		t.Errorf("costCell without a local figure mentioned local: %q", got)
+	}
+
+	loc := localRow("r", x)
+	if api, sub, local := rowCosts(&loc.EventSummary); api != nil || sub != nil || local == nil || *local != x {
+		t.Errorf("rowCosts(local) = %v/%v/%v, want nil/nil/%v", api, sub, local, x)
+	}
+	sub := subRow("r", x)
+	if api, s, local := rowCosts(&sub.EventSummary); api != nil || s == nil || local != nil {
+		t.Errorf("rowCosts(subscription) = %v/%v/%v, want nil/%v/nil", api, s, local, x)
+	}
+}

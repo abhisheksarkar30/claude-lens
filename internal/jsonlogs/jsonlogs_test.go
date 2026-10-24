@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/parse"
 	"github.com/abhisheksarkar30/claude-lens/internal/pricing"
 	"github.com/abhisheksarkar30/claude-lens/internal/session"
@@ -873,5 +874,53 @@ func TestTailFileSkipsVanishedFileQuietly(t *testing.T) {
 	tailer.tailFile(context.Background(), walkedFile{Path: filepath.Join(root, "bad\x00name.jsonl")})
 	if !bytes.Contains(buf.Bytes(), []byte("jsonlogs: open")) {
 		t.Errorf("a non-ENOENT open error no longer logs: %q", buf.String())
+	}
+}
+
+// A model matching only the local prefixes is a local row, only the api
+// prefixes an api row, and a model both lists claim stays api so real spend is
+// never hidden. Local rows are a projection: priced as deepseek-flash at an
+// off-peak instant, into the api-equivalent column, under the local account.
+func TestTailerLocalPrefixClassification(t *testing.T) {
+	root := t.TempDir()
+	peakHour := time.Date(2026, time.October, 26, 2, 0, 0, 0, time.UTC) // Monday, inside deepseek's peak window
+	writeLines(t, filepath.Join(root, "log.jsonl"),
+		assistantLineAt("req_local", "s", "qwen3.6-35b-a3b-mlx", peakHour),
+		assistantLineAt("req_api", "s", "deepseek-flash", peakHour),
+		assistantLineAt("req_both", "s", "deepseek-lm-local", peakHour),
+		assistantLineAt("req_cloud", "s", "claude-sonnet-5", peakHour),
+	)
+	st := newTestStore(t)
+	tailer := New(root, st)
+	tailer.SetPriceTable(pricing.ShippedTable())
+	tailer.SetModelBilling([]string{"deepseek-"}, "payg", "api")
+	tailer.SetLocalPrefixes([]string{"qwen", "deepseek-lm-"})
+	if _, err := tailer.Poll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	evs := eventsByRequestID(t, st)
+
+	local := evs["req_local"]
+	if local.BillingMode != config.BillingLocal || local.Account != config.LocalAccount {
+		t.Errorf("local row = %q/%q, want local/local", local.BillingMode, local.Account)
+	}
+	if local.CostUSD != nil || local.ApiEquivalentCostUSD == nil {
+		t.Fatalf("local cost routed wrong: cost_usd=%v api_equivalent=%v", local.CostUSD, local.ApiEquivalentCostUSD)
+	}
+	if local.ModelResolved != "qwen3.6-35b-a3b-mlx" {
+		t.Errorf("ModelResolved = %q, the real model name must be kept", local.ModelResolved)
+	}
+	// 1000 input tokens at deepseek-flash's off-peak $0.15/MTok.
+	if got, want := *local.ApiEquivalentCostUSD, 0.15*1000/1e6; got < want*0.999 || got > want*1.001 {
+		t.Errorf("local projected cost = %v, want %v (off-peak base rate)", got, want)
+	}
+	if evs["req_api"].BillingMode != "api" {
+		t.Errorf("api-only model = %q, want api", evs["req_api"].BillingMode)
+	}
+	if evs["req_both"].BillingMode != "api" {
+		t.Errorf("model in both lists = %q, want api (precedence)", evs["req_both"].BillingMode)
+	}
+	if evs["req_cloud"].BillingMode != "subscription" {
+		t.Errorf("unlisted model = %q, want subscription", evs["req_cloud"].BillingMode)
 	}
 }

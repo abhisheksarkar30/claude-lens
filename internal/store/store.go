@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/abhisheksarkar30/claude-lens/internal/config"
 	"github.com/abhisheksarkar30/claude-lens/internal/decode"
 	"github.com/abhisheksarkar30/claude-lens/internal/parse"
 	"github.com/abhisheksarkar30/claude-lens/internal/proxy"
@@ -1346,6 +1347,12 @@ func (s *Store) StatsByModel(ctx context.Context, filter EventFilter) ([]ModelSt
 		if err := scanStatsRow(rows, &m.StatsSummary, &m.Model, &billingMode); err != nil {
 			return nil, fmt.Errorf("store: StatsByModel: %w", err)
 		}
+		// A local row is priced as LocalPriceModel whatever it is called, so
+		// the coverage view must look that row up, not the local model name.
+		m.PriceModel = m.Model
+		if billingMode == config.BillingLocal {
+			m.PriceModel = config.LocalPriceModel
+		}
 		out = append(out, m)
 	}
 	return out, rows.Err()
@@ -1672,21 +1679,22 @@ const statsSelectColumnsInner = `
 	COALESCE(SUM(CASE WHEN cost_source != '' AND cost_source != 'unpriced' THEN 1 ELSE 0 END), 0),
 	COALESCE(SUM(CASE WHEN cost_source = 'unpriced' THEN 1 ELSE 0 END), 0),
 	SUM(CASE WHEN billing_mode = 'api' THEN cost_usd END),
-	SUM(CASE WHEN billing_mode = 'subscription' THEN api_equivalent_cost_usd END)
+	SUM(CASE WHEN billing_mode = 'subscription' THEN api_equivalent_cost_usd END),
+	SUM(CASE WHEN billing_mode = 'local' THEN api_equivalent_cost_usd END)
 `
 
 const statsSelectColumns = "SELECT" + statsSelectColumnsInner
 
 func scanStatsSummary(row rowScanner) (StatsSummary, error) {
 	var s StatsSummary
-	var totalCostUSD, totalApiEquivCostUSD sql.NullFloat64
+	var totalCostUSD, totalApiEquivCostUSD, totalLocalCostUSD sql.NullFloat64
 	err := row.Scan(
 		&s.RequestCount,
 		&s.InputTokens, &s.OutputTokens,
 		&s.CacheWrite5mTokens, &s.CacheWrite1hTokens, &s.CacheReadTokens,
 		&s.ThinkingTokens, &s.TotalPromptTokens,
 		&s.PricedCount, &s.UnpricedCount,
-		&totalCostUSD, &totalApiEquivCostUSD,
+		&totalCostUSD, &totalApiEquivCostUSD, &totalLocalCostUSD,
 	)
 	if err != nil {
 		return StatsSummary{}, err
@@ -1699,6 +1707,10 @@ func scanStatsSummary(row rowScanner) (StatsSummary, error) {
 		v := totalApiEquivCostUSD.Float64
 		s.TotalApiEquivalentCostUSD = &v
 	}
+	if totalLocalCostUSD.Valid {
+		v := totalLocalCostUSD.Float64
+		s.TotalLocalProjectedCostUSD = &v
+	}
 	return s, nil
 }
 
@@ -1707,14 +1719,14 @@ func scanStatsSummary(row rowScanner) (StatsSummary, error) {
 // &billingMode), scanned in the order the query selects them, ahead of the
 // shared aggregate columns into into.
 func scanStatsRow(rows *sql.Rows, into *StatsSummary, leading ...any) error {
-	var totalCostUSD, totalApiEquivCostUSD sql.NullFloat64
+	var totalCostUSD, totalApiEquivCostUSD, totalLocalCostUSD sql.NullFloat64
 	dest := append(leading,
 		&into.RequestCount,
 		&into.InputTokens, &into.OutputTokens,
 		&into.CacheWrite5mTokens, &into.CacheWrite1hTokens, &into.CacheReadTokens,
 		&into.ThinkingTokens, &into.TotalPromptTokens,
 		&into.PricedCount, &into.UnpricedCount,
-		&totalCostUSD, &totalApiEquivCostUSD,
+		&totalCostUSD, &totalApiEquivCostUSD, &totalLocalCostUSD,
 	)
 	if err := rows.Scan(dest...); err != nil {
 		return err
@@ -1726,6 +1738,10 @@ func scanStatsRow(rows *sql.Rows, into *StatsSummary, leading ...any) error {
 	if totalApiEquivCostUSD.Valid {
 		v := totalApiEquivCostUSD.Float64
 		into.TotalApiEquivalentCostUSD = &v
+	}
+	if totalLocalCostUSD.Valid {
+		v := totalLocalCostUSD.Float64
+		into.TotalLocalProjectedCostUSD = &v
 	}
 	return nil
 }
@@ -2201,7 +2217,9 @@ func (c repriceCandidate) usage() parse.Usage {
 // the reverse. It is the same split as the insert-time switch in
 // internal/consumer and reconcileSessionTx's SUM(CASE ...) pair.
 func (c repriceCandidate) routed() (sql.NullFloat64, bool) {
-	if c.billingMode == "subscription" {
+	// A local row's figure is a projection, so it lives in the
+	// api-equivalent column exactly as a subscription row's does.
+	if c.billingMode == "subscription" || c.billingMode == config.BillingLocal {
 		return c.apiEquivalentCostUSD, true
 	}
 	return c.costUSD, false
@@ -2297,7 +2315,13 @@ func (s *Store) RepriceCosts(ctx context.Context, table PriceComputer, model str
 			continue
 		}
 
-		usd, source := table.Compute(c.model, c.usage(), c.speed, c.serviceTier, c.startedAt)
+		// A local row is priced as the cheapest DeepSeek model at an off-peak
+		// instant, never against its own (usually unpriced) local model name.
+		priceModel, priceAt := c.model, c.startedAt
+		if c.billingMode == config.BillingLocal {
+			priceModel, priceAt = config.LocalPriceModel, config.LocalPriceAt
+		}
+		usd, source := table.Compute(priceModel, c.usage(), c.speed, c.serviceTier, priceAt)
 		if usd == nil {
 			// The model no longer resolves against this table. The stored
 			// figure and label are kept rather than nulled, so --yes is not
@@ -2306,7 +2330,7 @@ func (s *Store) RepriceCosts(ctx context.Context, table PriceComputer, model str
 			continue
 		}
 
-		stored, subscription := c.routed()
+		stored, apiEquivalent := c.routed()
 		if stored.Valid && stored.Float64 == *usd && source == c.costSource {
 			counts.Unchanged++
 			continue
@@ -2319,7 +2343,7 @@ func (s *Store) RepriceCosts(ctx context.Context, table PriceComputer, model str
 		// Invariant 5, both directions: the new figure goes to the column the
 		// row's billing mode routes to and the other column is left NULL, so a
 		// row cannot end up carrying two billing models at once.
-		if subscription {
+		if apiEquivalent {
 			_, err = tx.ExecContext(ctx, `
 				UPDATE events SET api_equivalent_cost_usd = ?, cost_usd = NULL, cost_source = ?
 				WHERE id = ?
